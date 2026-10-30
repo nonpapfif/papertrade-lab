@@ -243,14 +243,12 @@ class Simulation:
         self.store.put_cache("simulation_watches", initialized, now_utc())
 
     def propose(self, market: str | None = None, *, enqueue: bool = True) -> list[dict[str, Any]]:
-        if (
-            enqueue
-            and self.store.db.execute(
-                "SELECT 1 FROM jobs WHERE status IN ('queued','reviewing')"
-            ).fetchone()
-        ):
+        if self.store.db.execute(
+            "SELECT 1 FROM jobs WHERE status IN ('queued','reviewing')"
+        ).fetchone():
             return []
         initial = self.store.cache("simulation_initialized")
+        bootstrap = bool(initial and not self.store.cache("simulation_discovery_initialized"))
         latest_review = self.store.db.execute(
             "SELECT MAX(id) FROM events WHERE kind='paper_trade_review'"
         ).fetchone()[0]
@@ -265,7 +263,7 @@ class Simulation:
         )
         cached_watches = self.store.cache("simulation_watches")
         watches = cached_watches[1] if cached_watches else []
-        triggered = set()
+        triggered: set[str] = set()
         triggered_ids = []
         for watch in watches:
             if watch.get("used"):
@@ -286,24 +284,22 @@ class Simulation:
                     watch["used"] = True
             if enqueue:
                 watch["was_true"] = bool(matches)
-        if initial and not closed_changed and not manual_changed and not triggered:
-            if enqueue:
-                self.store.put_cache("simulation_watches", watches, now_utc())
-            return []
-        if self.store.db.execute(
-            "SELECT 1 FROM jobs WHERE status IN ('queued','reviewing')"
-        ).fetchone():
-            return []
-        query = "SELECT data FROM simulation_quotes" + (" WHERE market=?" if market else "")
+        query = (
+            "SELECT q.data,s.key FROM simulation_quotes q LEFT JOIN simulation_seen s "
+            "ON s.key=json_extract(q.data,'$.proposal.signal_key')"
+            + (" WHERE q.market=?" if market else "")
+        )
         rows = self.store.db.execute(query, (market,) if market else ()).fetchall()
         result = []
+        seen_keys = set()
+        historical_keys = set()
         context = encode(
-            [latest_review, manual[1] if manual else None, sorted(triggered_ids), not bool(initial)]
+            [latest_review, manual[1] if manual else None, sorted(triggered_ids), bool(initial), bootstrap]
         )
-        outcome_only = closed_changed and not manual_changed and not triggered
+        broad_review = not initial or bootstrap or closed_changed or manual_changed
         review_symbols = {watch["symbol"] for watch in watches}
         review_symbols.update(position["symbol"] for position in self.store.positions())
-        if outcome_only:
+        if closed_changed:
             for row in self.store.db.execute(
                 "SELECT data FROM events WHERE kind='paper_trade_review' AND id>?",
                 (previous_review[1] if previous_review and previous_review[1] else 0,),
@@ -311,27 +307,35 @@ class Simulation:
                 symbol = json.loads(row[0]).get("symbol")
                 if symbol:
                     review_symbols.add(symbol)
+        new_symbols = []
         for row in rows:
             quote = json.loads(row[0])
             proposal = quote.get("proposal")
-            if triggered and quote["symbol"] not in triggered:
-                continue
-            if outcome_only:
-                if quote["symbol"] not in review_symbols and not quote.get("ranking_evidence"):
-                    continue
-            elif not triggered and not proposal:
-                continue
-            key = (
-                "simulation-review:"
-                + hashlib.sha256(encode([context, quote["symbol"]]).encode()).hexdigest()
+            proposal_key = proposal["signal_key"] if proposal else None
+            if bootstrap and proposal_key:
+                historical_keys.add(proposal_key)
+            new_proposal = bool(proposal_key and row[1] is None and not bootstrap)
+            relevant = broad_review and (
+                (not initial and proposal)
+                or quote["symbol"] in review_symbols
+                or quote.get("ranking_evidence")
             )
+            if not new_proposal and quote["symbol"] not in triggered and not relevant:
+                continue
+            if new_proposal:
+                new_symbols.append(quote["symbol"])
+            key = "simulation-review:" + hashlib.sha256(
+                encode([context, quote["symbol"], proposal_key]).encode()
+            ).hexdigest()
             candidate = {
                 "symbol": quote["symbol"],
                 "market": quote["market"],
                 "signal_key": key,
                 "observed_at": now_utc().isoformat(),
-                "hypothesis": "price_crossing"
-                if triggered
+                "hypothesis": "new_market_observation"
+                if new_proposal
+                else "price_crossing"
+                if quote["symbol"] in triggered
                 else "closed_trade_review"
                 if closed_changed
                 else "requested_strategy_review",
@@ -340,6 +344,8 @@ class Simulation:
                 "relative_return": quote.get("last_return", "0"),
                 "reference": quote,
             }
+            if proposal_key:
+                seen_keys.add(proposal_key)
             result.append(candidate)
         if enqueue and result:
             with self.store.transaction(write=True):
@@ -349,24 +355,34 @@ class Simulation:
                     return []
                 for candidate in result:
                     self.store.enqueue(candidate)
+                self.store.db.executemany(
+                    "INSERT OR IGNORE INTO simulation_seen VALUES (?,?)",
+                    [(key, now_utc().isoformat()) for key in seen_keys | historical_keys],
+                )
                 self.store.put_cache("simulation_watches", watches, now_utc())
                 self.store.put_cache("simulation_initialized", True, now_utc())
+                self.store.put_cache("simulation_discovery_initialized", True, now_utc())
                 self.store.put_cache("simulation_consulted_outcome", latest_review, now_utc())
                 if manual:
                     self.store.put_cache("simulation_consulted_request", manual[1], now_utc())
                 self.store.event(
                     "simulation_consultation_trigger",
                     {
-                        "trigger": "price_crossing"
+                        "trigger": "new_market_observation"
+                        if new_symbols
+                        else "price_crossing"
                         if triggered
                         else "closed_trade"
                         if closed_changed
                         else "explicit_or_initial_review",
                         "proposals": len(result),
                         "symbols_triggered": sorted(triggered),
+                        "new_symbols": sorted(new_symbols),
                         "timer_only": False,
                     },
                 )
+        elif enqueue:
+            self.store.put_cache("simulation_watches", watches, now_utc())
         return result
 
     def quote(self, symbol: str, market: str, *, refresh: bool = True) -> dict[str, Any]:
@@ -454,8 +470,12 @@ class Simulation:
                     "hypothesis": "existing_position_context",
                 }
             model_inputs = []
+            reviewed_keys = set()
             for candidate in by_symbol.values():
                 reference = self.quote(candidate["symbol"], candidate["market"], refresh=False)
+                proposal = reference.get("proposal")
+                if proposal:
+                    reviewed_keys.add(proposal["signal_key"])
                 model_inputs.append(
                     {
                         "symbol": candidate["symbol"],
@@ -479,6 +499,11 @@ class Simulation:
                             )
                         },
                     }
+                )
+            with self.store.transaction(write=True):
+                self.store.db.executemany(
+                    "INSERT OR IGNORE INTO simulation_seen VALUES (?,?)",
+                    [(key, now_utc().isoformat()) for key in reviewed_keys],
                 )
             decisions = self.reviewer.review(model_inputs, now_utc())
             call = self.store.db.execute("SELECT MAX(id) FROM ai_calls").fetchone()[0]
