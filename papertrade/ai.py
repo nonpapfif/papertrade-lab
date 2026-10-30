@@ -166,10 +166,11 @@ Historical v1/v2 reviews used different execution and cost assumptions.
 Use prior outcomes to change hypotheses, direction, sizing, or exit plans rather than to
 default to inactivity. Stop levels are optional hypothesis-invalidation or profit-redeployment
 choices, not a required loss-minimization policy. Do not count a ledger reset as profit.
-AI calls consume tokens. In review_when, define concrete reference-price crossings that
-would justify spending tokens to reconsider the portfolio. Empty review_when means wait
-for a closed trade or explicit human request. Do not ask for another call merely because
-more time, samples, or a broad rising/falling/mixed label changed.
+AI calls consume tokens. New market observations across the entire observed universe can
+trigger a review, including instruments you have never held or mentioned. review_when adds
+optional reference-price crossings; it does not restrict discovery or future reviews.
+Empty review_when does not disable new-opportunity reviews. Do not ask for another call merely
+because more time, samples, or a broad rising/falling/mixed label changed.
 Specify useful price crossings for the next decision rather than requesting clock-only polling.
 Record an English strategy and reason. Return only the supplied JSON schema.
 """

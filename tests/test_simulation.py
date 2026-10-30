@@ -15,7 +15,7 @@ from papertrade.simulation import Simulation
 
 
 class SimulationTests(BaseCase):
-    def test_repeated_regime_changes_do_not_spend_tokens(self) -> None:
+    def test_repeated_regime_changes_without_new_prices_do_not_spend_tokens(self) -> None:
         self.sim.save_quote(
             "US",
             {"symbol": "TEST", "lastPrice": "100"},
@@ -31,7 +31,7 @@ class SimulationTests(BaseCase):
             )
             self.sim.save_quote(
                 "US",
-                {"symbol": "TEST", "lastPrice": str(100 + index)},
+                {"symbol": "TEST", "lastPrice": "100"},
                 decimal(1),
                 "observed_reference",
             )
@@ -55,13 +55,80 @@ class SimulationTests(BaseCase):
         self.sim.save_quote(
             "US", {"symbol": "TEST", "lastPrice": "102"}, decimal(1), "observed_reference"
         )
+        self.store.db.execute(
+            "INSERT OR IGNORE INTO simulation_seen SELECT "
+            "json_extract(data,'$.proposal.signal_key'),'already_reviewed' "
+            "FROM simulation_quotes WHERE symbol='TEST'"
+        )
         self.assertEqual(self.sim.propose(), [])
         self.sim.save_quote(
             "US", {"symbol": "TEST", "lastPrice": "104"}, decimal(1), "observed_reference"
         )
+        self.store.db.execute(
+            "INSERT OR IGNORE INTO simulation_seen SELECT "
+            "json_extract(data,'$.proposal.signal_key'),'already_reviewed' "
+            "FROM simulation_quotes WHERE symbol='TEST'"
+        )
         self.assertEqual(len(self.sim.propose()), 1)
         self.store.db.execute("UPDATE jobs SET status='reviewed'")
         self.assertEqual(self.sim.propose(), [])
+
+    def test_new_us_signal_is_reviewed_while_korean_watches_are_unchanged(self) -> None:
+        self.sim.save_quote(
+            "KR", {"symbol": "KOREAN", "lastPrice": "1000"}, decimal(1330), "observed", lead=True
+        )
+        self.sim.save_quote(
+            "US", {"symbol": "NEW_US", "lastPrice": "100"}, decimal(1), "observed"
+        )
+        self.sim.propose()
+        self.store.db.execute("UPDATE jobs SET status='reviewed'")
+        self.sim.set_watches(
+            [{"symbol": "KOREAN", "above": "1100", "below": "900", "reason": "KR watch"}]
+        )
+        self.sim.save_quote(
+            "US", {"symbol": "NEW_US", "lastPrice": "105"}, decimal(1), "observed"
+        )
+        result = self.sim.propose()
+        self.assertEqual([row["symbol"] for row in result], ["NEW_US"])
+        self.assertEqual(result[0]["hypothesis"], "new_market_observation")
+        self.store.db.execute("UPDATE jobs SET status='reviewed'")
+        self.assertEqual(self.sim.propose(), [])
+        self.sim.save_quote(
+            "US", {"symbol": "NEW_US", "lastPrice": "95"}, decimal(1), "observed"
+        )
+        self.assertEqual([row["symbol"] for row in self.sim.propose()], ["NEW_US"])
+
+    def test_empty_model_watches_do_not_disable_discovery(self) -> None:
+        self.sim.save_quote(
+            "US", {"symbol": "TEST", "lastPrice": "100"}, decimal(1), "observed", lead=True
+        )
+        self.sim.propose()
+        self.store.db.execute("UPDATE jobs SET status='reviewed'")
+        self.sim.set_watches([])
+        self.sim.save_quote(
+            "US", {"symbol": "TEST", "lastPrice": "110"}, decimal(1), "observed"
+        )
+        self.assertEqual(len(self.sim.propose()), 1)
+
+    def test_reopening_discovery_does_not_replay_the_entire_historical_universe(self) -> None:
+        for symbol in ("RANKED", "HISTORICAL"):
+            self.sim.save_quote(
+                "US",
+                {"symbol": symbol, "lastPrice": "100"},
+                decimal(1),
+                "observed",
+                lead=True,
+                ranking_evidence={"TOP_GAINERS": {"rank": 1}} if symbol == "RANKED" else {},
+            )
+        self.store.put_cache("simulation_initialized", True, AT)
+        result = self.sim.propose()
+        self.assertEqual([row["symbol"] for row in result], ["RANKED"])
+        self.store.db.execute("UPDATE jobs SET status='reviewed'")
+        self.assertEqual(self.sim.propose(), [])
+        self.sim.save_quote(
+            "US", {"symbol": "HISTORICAL", "lastPrice": "90"}, decimal(1), "observed"
+        )
+        self.assertEqual([row["symbol"] for row in self.sim.propose()], ["HISTORICAL"])
 
     def test_closed_outcome_allows_one_new_consultation(self) -> None:
         self.sim.save_quote(
@@ -310,7 +377,7 @@ class SimulationTests(BaseCase):
         self.assertEqual(self.store.positions(), [])
         self.assertEqual(self.store.total_cash(), 1010)
 
-    def test_same_context_does_not_create_repeated_model_work(self) -> None:
+    def test_new_information_waits_for_active_work_without_replaying_old_information(self) -> None:
         self.store.put_cache("simulation_regime:US", "mixed", AT)
         self.sim.save_quote(
             "US",
@@ -327,6 +394,8 @@ class SimulationTests(BaseCase):
         self.assertEqual(self.sim.propose(), [])
         self.store.db.execute("UPDATE jobs SET status='reviewed'")
         self.store.put_cache("simulation_regime:US", "rising", AT)
+        self.assertEqual(len(self.sim.propose()), 1)
+        self.store.db.execute("UPDATE jobs SET status='reviewed'")
         self.assertEqual(self.sim.propose(), [])
         self.sim.set_watches(
             [{"symbol": "TEST", "above": "103", "below": None, "reason": "New price breakout"}]
@@ -337,6 +406,18 @@ class SimulationTests(BaseCase):
         self.assertEqual(len(self.sim.propose()), 1)
         self.assertEqual(self.sim.propose(), [])
         self.sim.reviewer.review.assert_not_called()
+
+    def test_review_consumes_the_latest_signal_actually_sent_to_the_model(self) -> None:
+        self.sim.save_quote(
+            "US", {"symbol": "TEST", "lastPrice": "100"}, decimal(1), "observed", lead=True
+        )
+        self.sim.propose()
+        self.sim.save_quote(
+            "US", {"symbol": "TEST", "lastPrice": "105"}, decimal(1), "observed"
+        )
+        self.sim.reviewer.review.return_value = {}
+        self.assertEqual(self.sim.review(), 1)
+        self.assertEqual(self.sim.propose(), [])
 
     def test_simulation_schema_allows_short_fractional_and_plan_actions(self) -> None:
         actions = [
