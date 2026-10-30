@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
-from unittest.mock import MagicMock
+import sqlite3
+from unittest.mock import MagicMock, patch
 
 from test_framework import AT, ROOT, BaseCase
 
@@ -72,10 +73,70 @@ class SimulationTests(BaseCase):
         )
         self.sim.propose()
         self.store.db.execute("UPDATE jobs SET status='reviewed'")
-        self.store.event("paper_trade_review", {"net_pnl_usd": "-1"})
+        self.store.event("paper_trade_review", {"symbol": "TEST", "net_pnl_usd": "-1"})
         self.assertEqual(len(self.sim.propose()), 1)
         self.store.db.execute("UPDATE jobs SET status='reviewed'")
         self.assertEqual(self.sim.propose(), [])
+
+    def test_closed_review_uses_current_opportunities_instead_of_old_proposals(self) -> None:
+        for symbol in ("CLOSED", "RANKED", "WATCHED", "UNRELATED"):
+            self.sim.save_quote(
+                "US",
+                {"symbol": symbol, "lastPrice": "100"},
+                decimal(1),
+                "observed_reference",
+                lead=True,
+                ranking_evidence={"TOP_GAINERS": {"rank": 1}} if symbol == "RANKED" else {},
+            )
+        self.sim.propose()
+        self.store.db.execute("UPDATE jobs SET status='reviewed'")
+        self.sim.set_watches(
+            [{"symbol": "WATCHED", "above": "110", "below": None, "reason": "Continuation"}]
+        )
+        self.store.event("paper_trade_review", {"symbol": "CLOSED", "net_pnl_usd": "-1"})
+        result = self.sim.propose()
+        self.assertEqual({row["symbol"] for row in result}, {"CLOSED", "RANKED", "WATCHED"})
+
+    def test_review_batch_is_not_visible_to_another_worker_until_committed(self) -> None:
+        for symbol in ("FIRST", "SECOND"):
+            self.sim.save_quote(
+                "US", {"symbol": symbol, "lastPrice": "100"}, decimal(1), "observed", lead=True
+            )
+        reader = sqlite3.connect(self.store.path)
+        original = self.store.enqueue
+
+        def enqueue(candidate: dict) -> bool:
+            inserted = original(candidate)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+            return inserted
+
+        try:
+            with patch.object(self.store, "enqueue", side_effect=enqueue):
+                self.assertEqual(len(self.sim.propose()), 2)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+        finally:
+            reader.close()
+
+    def test_failed_batch_rolls_back_jobs_and_keeps_the_event_unconsumed(self) -> None:
+        for symbol in ("FIRST", "SECOND"):
+            self.sim.save_quote(
+                "US", {"symbol": symbol, "lastPrice": "100"}, decimal(1), "observed", lead=True
+            )
+        original = self.store.enqueue
+
+        def enqueue(candidate: dict) -> bool:
+            if candidate["symbol"] == "SECOND":
+                raise sqlite3.OperationalError("Injected enqueue failure")
+            return original(candidate)
+
+        with (
+            patch.object(self.store, "enqueue", side_effect=enqueue),
+            self.assertRaises(sqlite3.OperationalError),
+        ):
+            self.sim.propose()
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+        self.assertIsNone(self.store.cache("simulation_initialized"))
+        self.assertEqual(len(self.sim.propose()), 2)
 
     def test_observation_ignores_calendar_status_and_does_not_call_a_model(self) -> None:
         self.sim.client.get.return_value = {"midRate": "1337.2"}
