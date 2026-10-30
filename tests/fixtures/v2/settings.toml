@@ -1,0 +1,33 @@
+[strategy]
+initial_usd = "1000"
+profile = "momentum-experiment-v2"
+bar_minutes = 5
+breakout_bars = 3
+relative_minutes = 15
+atr_period = 14
+atr_multiple = "1.5"
+reward_multiple = "2"
+volume_multiple = "1.0"
+chase_atr = "1.5"
+max_spread_fraction = "0.005"
+time_exit_minutes = 30
+time_exit_r = "0.5"
+entry_cutoff_minutes = 30
+flatten_minutes = 15
+
+[costs]
+# Explicit paper assumptions, not verified brokerage fees or tax rates.
+us_fee_bps = "10"
+kr_fee_bps = "1.5"
+kr_sell_tax_bps = "20"
+kr_fx_bps = "10"
+
+[limits]
+quote_age_seconds = 30
+minimum_request_interval = 0.6
+
+[ai]
+# Select a model locally from the live Codex catalog; keep ChatGPT authentication.
+enabled = true
+model_selection = "auto"
+binary = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"

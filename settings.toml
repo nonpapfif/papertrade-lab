@@ -1,0 +1,21 @@
+[simulation]
+enabled = true
+profile = "free-simulation-v3"
+initial_usd = "1000"
+objective = "maximize_simulated_profit_through_active_experiments"
+loss_tolerance = "entire_ledger_may_be_lost"
+
+[costs]
+# Historical trades retain their original costs. New simulation fills have zero costs.
+us_fee_bps = "0"
+kr_fee_bps = "0"
+kr_sell_tax_bps = "0"
+kr_fx_bps = "0"
+
+[limits]
+minimum_request_interval = 0.01
+
+[ai]
+enabled = true
+model_selection = "auto"
+binary = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
