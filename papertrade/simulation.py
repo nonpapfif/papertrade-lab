@@ -286,9 +286,9 @@ class Simulation:
                     watch["used"] = True
             if enqueue:
                 watch["was_true"] = bool(matches)
-        if enqueue:
-            self.store.put_cache("simulation_watches", watches, now_utc())
         if initial and not closed_changed and not manual_changed and not triggered:
+            if enqueue:
+                self.store.put_cache("simulation_watches", watches, now_utc())
             return []
         if self.store.db.execute(
             "SELECT 1 FROM jobs WHERE status IN ('queued','reviewing')"
@@ -300,12 +300,26 @@ class Simulation:
         context = encode(
             [latest_review, manual[1] if manual else None, sorted(triggered_ids), not bool(initial)]
         )
+        outcome_only = closed_changed and not manual_changed and not triggered
+        review_symbols = {watch["symbol"] for watch in watches}
+        review_symbols.update(position["symbol"] for position in self.store.positions())
+        if outcome_only:
+            for row in self.store.db.execute(
+                "SELECT data FROM events WHERE kind='paper_trade_review' AND id>?",
+                (previous_review[1] if previous_review and previous_review[1] else 0,),
+            ):
+                symbol = json.loads(row[0]).get("symbol")
+                if symbol:
+                    review_symbols.add(symbol)
         for row in rows:
             quote = json.loads(row[0])
             proposal = quote.get("proposal")
             if triggered and quote["symbol"] not in triggered:
                 continue
-            if not triggered and not proposal:
+            if outcome_only:
+                if quote["symbol"] not in review_symbols and not quote.get("ranking_evidence"):
+                    continue
+            elif not triggered and not proposal:
                 continue
             key = (
                 "simulation-review:"
@@ -326,27 +340,33 @@ class Simulation:
                 "relative_return": quote.get("last_return", "0"),
                 "reference": quote,
             }
-            if enqueue:
-                self.store.enqueue(candidate)
             result.append(candidate)
         if enqueue and result:
-            self.store.put_cache("simulation_initialized", True, now_utc())
-            self.store.put_cache("simulation_consulted_outcome", latest_review, now_utc())
-            if manual:
-                self.store.put_cache("simulation_consulted_request", manual[1], now_utc())
-            self.store.event(
-                "simulation_consultation_trigger",
-                {
-                    "trigger": "price_crossing"
-                    if triggered
-                    else "closed_trade"
-                    if closed_changed
-                    else "explicit_or_initial_review",
-                    "proposals": len(result),
-                    "symbols_triggered": sorted(triggered),
-                    "timer_only": False,
-                },
-            )
+            with self.store.transaction(write=True):
+                if self.store.db.execute(
+                    "SELECT 1 FROM jobs WHERE status IN ('queued','reviewing')"
+                ).fetchone():
+                    return []
+                for candidate in result:
+                    self.store.enqueue(candidate)
+                self.store.put_cache("simulation_watches", watches, now_utc())
+                self.store.put_cache("simulation_initialized", True, now_utc())
+                self.store.put_cache("simulation_consulted_outcome", latest_review, now_utc())
+                if manual:
+                    self.store.put_cache("simulation_consulted_request", manual[1], now_utc())
+                self.store.event(
+                    "simulation_consultation_trigger",
+                    {
+                        "trigger": "price_crossing"
+                        if triggered
+                        else "closed_trade"
+                        if closed_changed
+                        else "explicit_or_initial_review",
+                        "proposals": len(result),
+                        "symbols_triggered": sorted(triggered),
+                        "timer_only": False,
+                    },
+                )
         return result
 
     def quote(self, symbol: str, market: str, *, refresh: bool = True) -> dict[str, Any]:

@@ -77,6 +77,8 @@ class Store:
                 id TEXT PRIMARY KEY,symbol TEXT NOT NULL,market TEXT NOT NULL,status TEXT NOT NULL,
                 observed_at TEXT NOT NULL,owner TEXT,attempt INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0,data TEXT NOT NULL,result TEXT);
+            CREATE INDEX IF NOT EXISTS jobs_symbol_market_status_at
+                ON jobs(symbol,market,status,observed_at);
             CREATE TABLE IF NOT EXISTS corporate_actions (
                 event_key TEXT PRIMARY KEY,symbol TEXT NOT NULL,kind TEXT NOT NULL,
                 effective_date TEXT NOT NULL,source TEXT NOT NULL,data TEXT NOT NULL);
