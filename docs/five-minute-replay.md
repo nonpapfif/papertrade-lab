@@ -1,4 +1,4 @@
-# 5분 예측과 AI 호출 조건 재생
+# Five-minute forecasts and AI-call planning
 
 ```zsh
 python3 -m tools.replay_market_day \
@@ -6,66 +6,66 @@ python3 -m tools.replay_market_day \
   --output state/replays/2026-10-30-first
 ```
 
-실행마다 새 출력 폴더를 사용한다. 원본 DB는 읽기 전용이다.
-실시간 시세·계좌·주문·기존 가상 장부·AI 클라이언트를 호출하지 않는다.
-이번 단계는 예측 비교와 AI 호출 후보 측정이다. 실제 AI 판단과 매매 장부는 만들지 않는다.
+Use a new output directory for every replay. Open the source database read-only.
+Do not call live market data, account/order paths, the existing virtual ledger, or an AI client.
+This stage compares forecasts and measures planned calls; it creates no AI decisions or trade ledger.
 
-## 시간과 고립
+## Time and isolation
 
-가상 시계를 5분씩 진행한다. 시점 t까지의 분봉으로 입력을 만들고 예측을 DB에 커밋한다.
-그다음 t+5분까지 진행해 직전 예측을 채점한다. 다음 봉의 고가·저가·종가는 입력에 없다.
-시장 구간은 수집 DB의 범위를 따른다. 예측 대상 시각이 범위를 넘으면 신규 예측을 만들지 않는다.
-각 구간에 새 분봉이 있는 전체 종목을 본다. 후보 수나 종목 수에 상한은 없다.
+Advance virtual time by five minutes. Build inputs using only bars through time t, then commit
+the forecast. Advance to t+5 minutes to score it. Future OHLC values are not in the input.
+Use the collected market scope and stop creating forecasts whose targets extend beyond it.
+Inspect every symbol with new bars in the current interval. Do not cap the symbol or candidate count.
 
-계산기는 별도 프로세스다. macOS sandbox-exec로 네트워크·파일 쓰기·다른 프로그램 실행을 막는다.
-사용자 홈과 원본·결과 폴더 읽기를 막고 Python 런타임과 실행 파일만 예외로 허용한다.
-원본 DB·비공개 표식·결과 DB 읽기와 네트워크·프로그램 실행 차단을 실제 검사한다.
-검사가 실패하면 고립 없이 계속하지 않고 중단한다. 예측 입력은 표준입력으로만 전달한다.
-채점기만 원본을 읽으며 다음 시점 전에는 해당 데이터를 계산기에 전달하지 않는다.
+Run the predictor in a separate macOS sandbox-exec process. Deny network, file writes, and execution
+of other programs. Deny home/source/output reads, except the Python runtime and predictor script.
+Actually test source DB, private marker, and result DB reads plus network and program execution.
+Abort if any isolation check fails. Pass predictor inputs only through standard input.
+Only the scorer reads the source and exposes the next interval after forecasts have been committed.
 
-## 첫 비교 알고리즘
+## Initial forecast algorithms
 
-| 이름 | 다음 5분 수익률 예측 |
+| Name | Next-five-minute return forecast |
 |---|---|
-| flat | 0 |
-| up_10bp | 항상 +0.1%인 단순 비교 기준 |
-| momentum_5m | 직전 5분 관측 수익률 |
-| reversion_5m | 직전 5분 관측 수익률의 반대 |
-| trend_15m | 직전 15분 관측 수익률 / 3 |
-| acceleration | 최근 5분 수익률에서 앞선 10분의 5분당 수익률을 뺀 값 |
+| flat | Zero |
+| up_10bp | Constant +0.1% baseline |
+| momentum_5m | Previous five-minute observed return |
+| reversion_5m | Negative of the previous five-minute observed return |
+| trend_15m | Previous 15-minute observed return divided by three |
+| acceleration | Latest five-minute return minus the prior ten-minute return per five minutes |
 
-모든 계산식은 재생 전에 고정한다. 필요한 이력이 없으면 예측값은 null이다.
-과거 기준 시각에 봉이 없으면 그 이전 마지막 관측 가격을 사용하고 실제 기준 시각을 남긴다.
-이는 항상 정확한 5분·15분 간격의 체결 수익률이라는 뜻이 아니다.
-현재 가격의 원본 시각·경과 시간과 최근 5분에 받은 봉 수도 기록한다.
+Freeze formulas before replay. Return null when history is insufficient.
+If a reference bar is absent, use the last earlier observation and retain its actual timestamp.
+These references do not always represent exact five- or 15-minute trade intervals.
+Record the current price's source time, age, and count of recent minute observations.
 
-주요 채점은 현재와 5분 뒤의 정확한 종료 시각에 모두 가격이 관측됐을 때만 한다.
-끝점이 없으면 missing_exact_endpoint로 표시한다. 0%로 채우거나 보간하지 않는다.
-방향 정확도는 실제 수익률이 0이 아닌 표본을 기준으로 계산한다.
-예측 오차와 단위 노출 방향 수익률을 함께 기록한다. 이는 매매 계좌 수익률이 아니다.
-같은 날의 탐색 결과이며 미래 수익이나 검증되지 않은 최적 알고리즘으로 해석하면 안 된다.
+Score only when both current and target endpoint prices are observed at their exact timestamps.
+Mark absent endpoints `missing_exact_endpoint`; do not fill them with zero or interpolation.
+Directional accuracy uses cases with nonzero realized returns.
+Record forecast error and unit-exposure directional return; neither is a trading-account return.
+These are same-day exploratory scores, not validated future performance or a proven best algorithm.
 
-## AI 호출 후보
+## AI-call candidates
 
-- volume_breakout: 이전 15분 고가·저가 돌파와 관측 거래량 2배 이상.
-- unusual_move: 최근 움직임이 0.5% 이상이며 과거 분당 변동의 5분 환산값보다 3배 이상.
-- trend_reversal_conflict: 5분·15분 추세가 일치하지만 과거 평균 가격에서 3표준편차 이상 이탈.
-  최근 움직임 0.5% 이상과 거래량 2배 이상도 요구한다.
+- `volume_breakout`: break the earlier 15-minute high/low with at least twice observed volume.
+- `unusual_move`: a move of at least 0.5% and three times the earlier minute-noise five-minute scale.
+- `trend_reversal_conflict`: aligned five-/15-minute trends with a three-standard-deviation price
+  displacement, at least 0.5% movement, and at least twice observed volume.
 
-같은 종목·사건·방향이 연속해서 유지되면 다시 보내지 않는다.
-조건이 해소됐다 다시 발생하거나 방향이 바뀌면 새 사건이다.
-한 시점에 발생한 후보를 하나의 AI 요청으로 묶는다. 후보가 없으면 요청도 없다.
-보유분의 근거 붕괴 조건은 매매 단계를 연결할 때 추가할 대상이다.
+Do not resend a continuously active symbol/event/direction combination.
+Rearm after the condition clears or direction changes. Batch a time step's candidates into one
+planned AI request; create no request when there are no candidates.
+Holding-hypothesis invalidation belongs to a later trading integration.
 
-지금은 모든 AI 요청의 상태가 planned_only다. 실제 모델은 부르지 않는다.
-요청 수·후보 수·입력 바이트를 측정한다. 토큰과 실제 모델 출력·추론량은 동일하지 않다.
-고정한 첫 기준의 호출량을 보고 다음 실험에서 기준을 변경할 수 있다.
-기준을 바꾸면 별도 버전·새 출력 폴더로 실행해 기존 결과를 보존한다.
+Every AI request here is `planned_only`; no model is called.
+Measure request count, candidates, and input bytes. Bytes are not token counts or reasoning/output use.
+Use those measurements to revise a later experiment. Changed criteria require a new version and
+output directory so the original result remains available.
 
-## 결과
+## Outputs
 
-- manifest.json: 원본·코드 해시, 계산식 목록, 고립 검사 결과.
-- replay.sqlite3: 시점별 입력·예측 해시, 종목별 예측과 뒤늦게 공개된 정답, AI 요청 후보.
-- report.json: 방향 정확도·예측 오차·호출 후보 수와 입력 크기.
+- `manifest.json`: source/code hashes, formula names, and isolation results.
+- `replay.sqlite3`: input/forecast hashes, symbol forecasts, later outcomes, and planned requests.
+- `report.json`: accuracy, errors, call candidates, and input sizes.
 
-결과는 state/ 아래에 저장하며 Git에 올리지 않는다. 전체 원본 파일 해시가 실행 전후 일치해야 한다.
+Store output under ignored `state/`. The source file hash must match before and after replay.

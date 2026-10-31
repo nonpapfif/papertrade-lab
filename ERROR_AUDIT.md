@@ -1,50 +1,48 @@
-# 오류 감사와 자동 복구 검증
+# Error audit and recovery history
 
-2026-10-30 한국 시간 기준이다. 확인한 코드 오류를 수정하고 네 개의 독립 서비스를 활성화했다.
-모든 체결은 가상 장부에만 기록한다. 실제 주문 경로는 허용하지 않는다.
+This is a technical history of fixes recorded on October 30-31, 2026 KST.
+It is not a statement that any service is currently running. Early sections describe superseded
+v1/v2 behavior; the free simulation contract in [AGENTS.md](AGENTS.md) takes precedence.
+All fills are virtual. Real brokerage order paths remain outside the HTTP allowlist.
 
-## 수정한 실패 지점
+Operational ledgers, individual trades, balances, token-use snapshots, backups, and verification
+artifacts belong under ignored `state/`. The original documents are preserved locally under
+`state/archives/repository-language-*/` with a source commit and SHA-256 manifest.
+Published Git history has not been rewritten.
 
-| 문제 | 수정 결과 |
+## Initial failure points and fixes
+
+| Failure | Technical fix |
 |---|---|
-| AI 대기가 보유분 점검을 막음 | scan·risk·review·supervise를 별도 프로세스로 실행 |
-| 한 종목의 API 오류로 보유분 전체 점검 중단 | 종목별 오류 기록 후 나머지 점검. 결제 대금도 건별 처리 |
-| 429 반복과 진행 위치 유실 | API 그룹별 공유 상태·서버 대기 시간·후보 진행 위치 저장 |
-| 실패한 15분 슬롯 재실행 불가 | 시작·완료·실패 상태와 중단 슬롯 회수 |
-| 토큰 만료·401 후 복구 불가 | 메모리 만료 확인·잠금 기반 재발급·401 한 번 재조회 |
-| 국내 종가 단일가에 즉시 체결 가정 | 실제 캘린더의 단일가 시작 시각부터 즉시 체결 금지 |
-| 조회 중 장부가 바뀌어 잔고가 섞임 | 하나의 읽기 트랜잭션으로 상태 조회 |
-| 종목·기준 ETF의 상대 강도 비교 시각 불일치 | 마지막 봉 시각과 60분 전 기준을 정확히 일치 |
-| 최신 봉이 있으면 오래된 구멍을 채우지 않음 | 빠진 분봉 위치를 찾아 다시 조회 |
-| 만료 환율·조회 대기 전 시각으로 체결 허용 | validUntil과 실제 호가 관측 시각을 체결 직전에 확인 |
-| 최우선 매수 호가로 전체 평가·익절 가정 | 전체 수량의 호가 평균과 비용으로 평가·판단·체결 |
-| 잘못된 AI 자료가 검증 코드를 깨뜨림 | 자료형·심볼·행동·정수 수량·사용량 검증 |
-| 중단된 AI 사용량이 0으로 보임 | JSONL과 중간 기록 복구. 불명확하면 null·usage_known=false |
-| 재로그인 뒤 실행 누락 | 표준 LaunchAgents 위치·RunAtLoad·KeepAlive 설치 |
-| 기업행사 이후 가격·수량 불일치 | 매일 조정 이력 재조회·기준 비율 변화 감지·출처 기반 멱등 처리 |
-| 분봉 종료 시각을 시작으로 해석 | 공식 명세대로 1분을 빼서 내부 시작 시각으로 정규화. 원래 시각 보존 |
-| 실제 조회가 복구됐는데 신호가 없어 오류가 열린 채 남음 | 매수 신호 유무와 별개로 성공한 재조회의 복구 상태 기록 |
-| 정상적인 매수 거절이 장애로 보임 | rejected_observation으로 구분하고 열린 장애에서 제외 |
-| DB 오류로 감사 기록도 사라짐 | 별도 비상 JSONL. DB 없이 읽는 audit --emergency 제공 |
-| 장부 손상 뒤 새 초기 자금이 생길 위험 | 누락·손상된 기존 장부는 초기화하지 않고 복원 확인 요구 |
+| AI waiting blocked position checks | Separate scan, risk, review, and supervise processes |
+| One symbol's error stopped all checks | Record each failure and continue other symbols and settlements |
+| Repeated 429 responses lost progress | Shared API-group pacing, server cooldowns, and durable cursors |
+| Failed scan slots could not resume | Started/completed/failed states and interrupted-slot recovery |
+| Token expiry or 401 could not recover | Expiry checks, locked token refresh, and one 401 retry |
+| Legacy fills ignored the KR closing auction | Honor calendar auction timestamps in the legacy strategy |
+| Concurrent changes mixed balance snapshots | Read status in one transaction |
+| Relative-strength references had mismatched times | Align symbol, benchmark, and lookback timestamps |
+| Recent bars hid earlier cache gaps | Identify and fetch missing minute intervals |
+| Legacy fills used expired FX or old observations | Check validUntil and actual quote time before filling |
+| Top-of-book price marked the whole position | Use depth-weighted prices and costs in the legacy strategy |
+| Malformed AI output broke validation | Validate types, symbols, actions, quantities, and usage |
+| Interrupted AI usage appeared as zero | Recover JSONL/intermediate records; retain null when unknown |
+| Workers did not resume after login | Standard LaunchAgents, RunAtLoad, and KeepAlive installation |
+| Corporate actions broke quantity/price consistency | Recheck adjustment ratios and apply evidenced actions idempotently |
+| Minute-bar end time was treated as start time | Preserve source time and normalize the legacy internal start by one minute |
+| Successful requests left incidents open without a signal | Recover incidents on verified request success, independent of entry signals |
+| Ordinary entry rejection looked like an outage | Separate rejected_observation from open incidents |
+| Database errors also lost audit records | Separate emergency JSONL and DB-independent emergency reading |
+| Ledger damage could recreate starting capital | Refuse to initialize a missing/damaged existing ledger; require recovery verification |
 
-## 확인한 결과
+Initial verification covered regression tests, Ruff, mypy, observed market-data responses,
+server-directed retry/recovery, worker restart, AI schema/usage collection, and preserved backups.
+Passing these checks established technical behavior, not strategy profitability.
+Actual run measurements and request identifiers remain in local verification artifacts.
 
-- 회귀 검사 91개 통과.
-- Ruff 정적 검사 통과. mypy의 11개 모듈 검사 통과.
-- 실제 캘린더·시세·환율·분봉·기업행사 기준 일봉 조회 성공.
-- 실제 분봉 자료에서 이전 두 거래일이 각각 390분으로 맞는 것을 확인.
-- 실제 429 이후 같은 종목의 분봉 조회 200과 다음 종목 분석 진행 확인. 서버 요청 ID와 복구 이력 저장.
-- 보유분이 없는 대기 상태의 risk 프로세스를 종료한 뒤 launchd의 자동 재시작과 복구 기록 확인.
-- 실제 AI 연결 테스트 1회 성공. 가상 종목 SKIP. 10,599 입력 + 44 출력 = 10,643토큰.
-- 해당 테스트 직후 계정 한도 97% 남음. 정확한 남은 토큰 수는 서비스가 제공하지 않음.
-- 기존 1,000달러 가상 자금과 거래 이력 보존. 분석용 캐시만 새 시각 해석으로 재생성.
-- 수리 전 백업과 수리 후 무결성 확인 백업 보존.
-
-## 확인 명령
+## Diagnostic commands
 
 ```zsh
-cd /Users/elsholtzia/Projects/Finance
 python3 -m papertrade health
 python3 -m papertrade audit --open
 python3 -m papertrade audit --events
@@ -53,117 +51,80 @@ python3 -m papertrade audit --output state/audit-export.json
 python3 -m papertrade audit --emergency
 ```
 
-내보내기에는 오류와 복구의 시각·원인·종목·경로·서버 코드·요청 ID·재시도 시점이 남는다.
-키와 인증 헤더는 기록하지 않는다. 실패 시 호출 사용량을 임의로 0으로 만들지 않는다.
-현재 운영 상태는 명령으로 확인한다. 이 문서의 검증 결과는 위 날짜의 기록이다.
+Exports include times, causes, symbols, paths, server codes, request IDs, retry times, and recoveries.
+Never log credentials or authentication headers. Never replace unknown inference usage with zero.
+Use current commands to inspect current state instead of treating historical checks as live status.
 
-## 외부 확인이 필요한 경우
+## One-minute observation and v2 experiments
 
-- IP 허용·자격 증명·계정 한도는 외부 서비스 상태다. 재확인하고 알리지만 임의로 권한을 바꾸지 않는다.
-- 분할·배당·상장 폐지는 확인한 공시와 지급 근거가 필요하다. URL을 넣는 것만으로 사실 검증이 끝나지는 않는다.
-- 기업행사 감지는 완전하지 않다. 근거가 부족하면 해당 보유분의 평가와 체결을 보류한다.
-- 장부 손상은 최신 거래 보존을 확인한 뒤 복원해야 한다. 과거 백업으로 자동 덮어쓰기하지 않는다.
-- 운영체제·네트워크 중단 기간의 체결을 나중에 만들지 않는다. 로그인 전 실행과 수익률을 보장하지 않는다.
+A separate `market` role was added for full-universe prices on a 60-second start cadence.
+Position checks also use a 60-second start cadence. These observation roles do not invoke AI.
+`scan` uses one-minute slots and resumes detailed analysis without overlapping runs.
+Shared snapshots reduce duplicate universe requests. Long requests can delay the next start;
+this is not a guarantee of completing detailed analysis of every symbol every minute.
+The full role set is market, scan, risk, review, and supervise.
 
-분봉 시각과 API 한도 응답 필드는 [토스 공식 OpenAPI 명세](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)를 확인했다.
+The historical `momentum-experiment-v2` replaced 30-minute/six-bar breakouts with five-minute/
+three-bar breakouts and average-or-higher volume. It used a 15-minute relative-strength window,
+a 0.5% spread threshold, a 1.5ATR entry range, and legacy time-based entry/exit rules.
+Entry and exit records retained strategy versions, plans, and observed valuation ranges.
+These rules are archived in [the v2 guide](docs/history/README-v2.md), not imposed on free v3.
 
-## 1분 점검으로 변경
+Unsettled sale proceeds were later made reusable for new virtual entries.
+`buying_power_usd` consistently represented unused virtual cash across filtering, sizing, input,
+and debiting. Position value was not counted again as cash; historical results were preserved.
 
-사용자 요청에 따라 전체 시세를 확인하는 `market` 프로세스를 추가했다.
-전체 시세와 보유분 점검은 각각 60초 시작 간격이다. 새 역할은 AI를 호출하지 않는다.
-`scan`의 실행 슬롯도 1분으로 바꿨다. 상세 분봉 분석은 중복 실행 없이 기존 위치에서 이어간다.
-새 시세 스냅샷은 상세 분석이 공유해서 불필요한 전체 시세 중복 조회를 줄인다.
-현재 역할은 `market`, `scan`, `risk`, `review`, `supervise` 다섯 개다.
-회귀 검사 94개와 Ruff·mypy 검사를 통과했다.
-조회나 API 대기가 길어지면 시작 간격은 늦어질 수 있다. 매분 전체 종목의 정밀 분석 완료를 뜻하지 않는다.
+## Free v3 and duplicate AI requests
 
-## 적극적인 모의 실험 v2 적용
+The free profile removed legacy session, settlement, margin, depth, quantity, and action checks
+from its fill prerequisites. It supports shorts, fractions, additions, partial exits, reversals,
+and virtual borrowing. New costs are zero; debt and short liabilities reduce equity.
+Historical fills, costs, and results were retained.
 
-2026-10-30 13:32 한국 시간부터 `momentum-experiment-v2`를 활성화했다.
-30분봉 6개 돌파·거래량 1.5배에서 5분봉 3개 돌파·거래량 평균 이상으로 변경했다.
-시장 대비 수익률 비교 구간은 15분, 허용 호가 차이는 0.5%, 진입 범위는 1.5ATR이다.
-ATR과 신호에 필요한 최근 약 80분을 먼저 조회한다. 장중에는 보통 한 페이지로 분석한다.
-진입 마감은 폐장 30분 전이고, 약한 흐름의 시간 청산은 진입 후 30분이다.
-확정된 매수가·손절·목표·시각과 전략 버전을 가상 장부에 저장한다.
-청산의 순손익과 점검 때 관측한 평가 범위를 다음 AI 판단에 전달한다.
-실행 권한과 현재 호가·현금·거래 상태 검증은 유지했다. 99개 회귀 검사와 Ruff·mypy를 통과했다.
-활성화 후 삼성전자 1주를 225,000원에 첫 모의매수했다. 이후 다른 후보의 모의매수도 진행됐다.
-최신 숫자는 `state/verification-experiment-v2.json`과 실행 중인 장부에서 확인한다.
+During migration, changing market-state classifications incorrectly triggered repeated AI reviews.
+The review/candidate workers were stopped while those triggers were removed.
+Time changes, sample counts, and broad rising/falling classifications no longer justify repeat calls.
+A watch condition already satisfied at registration does not fire immediately and is consumed once.
+Duplicate pending input and an uncomputed ATR placeholder were removed from review input.
+No arbitrary AI-call, token, reasoning-time, or candidate ceiling was introduced.
+Unknown usage and missing provider prices remain explicit audit records.
 
-## 미결제 매도대금 재사용
+The profit-first objective permits exploratory directional hypotheses and concentration.
+It does not treat capital preservation, loss minimization, or an old low win rate as automatic
+reasons to wait. Stops are optional. Existing losses are not erased by restarting an experiment.
 
-사용자의 명시적 요청으로 매수 기준을 인출 가능 현금에서 전체 미사용 현금으로 변경했다.
-기존 매도대금의 결제 시각은 인출 정보로 남기고, 결제 전에도 다음 모의 매수에 사용한다.
-종목 선별·수량 계산·AI 입력·장부 차감에 같은 `buying_power_usd` 기준을 적용했다.
-보유 주식 평가액을 현금으로 중복 계산하지 않고 과거 손익을 보존한다.
-즉시 재매수 회귀 검사를 포함한 100개 검사와 Ruff·mypy를 통과했다.
+## Queue contention and partial batches
 
-## 자유 모의실험 v3 적용과 AI 호출 오류
+A post-exit path resent old universe signals and generated oversized duplicate candidate batches.
+Per-symbol job updates repeatedly scanned an unindexed queue. Review could consume a partially
+published batch, producing contention and restarts.
 
-2026-10-30 한국 시간에 사용자 지시를 반영해 자유 모의실험으로 전환했다.
-위 v1·v2의 장 시간·결제·증거금·호가·정수 수량·기업행사 체결 조건은 현재 경로에 적용하지 않는다.
-공매도·소수점·추가매수·부분청산·방향 전환·가상 차입을 지원한다.
-신규 거래 비용은 0으로 가정한다. 차입과 공매도 부채는 순자산에서 차감한다.
-과거 거래·비용·손실과 순자산 983.2988331293227020556590155달러를 보존했다.
-실제 주문 경로는 계속 차단한다. 관측 가격과 가정한 체결을 구분해 기록한다.
+- Index jobs by symbol, market, status, and observation time.
+- Save the candidate batch and processed-event markers atomically; roll back the whole operation.
+- After exits, review held/exited/watched names and current ranked opportunities rather than every old signal.
+- Preserve fills, profit, and unknown usage; replace only interrupted pending work.
+- Test partial-batch visibility, storage rollback, and the indexed query plan.
 
-전환 초기에 시장 상태 분류 변화가 AI를 반복 호출하는 오류가 발생했다.
-호출 36~44의 9회에서 입력·출력 합계 1,377,117토큰을 사용했다. 모두 HOLD였고 새 체결은 없었다.
-검토와 후보 생성 프로세스를 중단한 뒤 반복 호출 조건을 제거했다.
-이제 첫 검토 이후에는 AI가 정한 가격의 새 돌파·청산 결과·명시적 검토 요청에만 호출한다.
-가격 조건이 등록 시 이미 충족돼 있으면 즉시 호출하지 않는다. 같은 조건은 한 번만 소비한다.
-시각·표본 수·상승/하락 분류 변화만으로 다시 호출하지 않는다.
-호출·토큰·추론 시간·후보 수의 자체 상한을 추가하지 않았다.
+The implementation was checked against the local ledger and backed up before recovery.
+Performance measurements and backup identifiers remain in local verification records.
 
-호출 45는 새 감시 가격 계획을 위한 전환 검토다. 17,867토큰을 사용했다.
-입력에서 중복 대기열 자료와 미계산 ATR 0을 제거하고 실제 참조 가격과 순위 자료를 전달했다.
-이후 여러 1분 점검에서 추가 호출 없이 다섯 프로세스의 실행을 확인했다.
-117개 검사와 Ruff·12개 모듈 mypy 검사를 통과했다.
-실행 검증 수치와 호출 이력은 `state/verification-free-simulation.json`에 보존한다.
-API가 가격을 제공하지 않는 종목은 오류 감사에 남긴다. 이를 실제 체결 가격으로 꾸며내지 않는다.
+## Universe-wide new signals
 
-## 수익 우선 실험 목표 적용
+A later review gate incorrectly depended only on watch prices, exits, and user requests.
+New signals now trigger review across the observed universe regardless of holdings, watches,
+or country. Watch prices are additional conditions, not eligibility gates.
+Apply the same signal-generation rules to new symbols and directions.
+Consume each signal once, including the latest observation actually delivered to AI.
+Baseline existing observations at migration and review current ranking/holding/watch candidates.
+Tests cover a new US signal while KR watch prices remain unchanged, plus duplicate observations.
 
-2026-10-30 사용자는 거래 시도와 장부 전체 손실을 허용하고 수익 최대화를 요청했다.
-AI 지시와 설정에 이 목표를 명시했다. 현금 보존·손실 최소화·과거 저승률을 관망 이유로 삼지 않는다.
-불확실한 방향 가설도 매수·공매도·집중 투자로 시험할 수 있다. 손절은 선택 사항이다.
-현재 순위 자료가 있는 종목과 기존 감시·보유 종목 567개를 새 목표로 한 번 검토하도록 요청했다.
-후보 수는 고정 상한이 아니라 해당 시점에 자료가 있는 대상 수다.
-실제 주문 금지와 사건 기반 AI 호출 조건을 유지했다. 과거 장부를 초기화하지 않았다.
-변경 후 117개 검사와 Ruff·12개 모듈 mypy 검사를 통과했다.
-검토 46은 151,880토큰을 사용했고 실제 가상 체결 4건을 만들었다.
-CISO 3,000주와 SOXL 8주를 매수했다. AXG 200주와 0015M0 40주는 공매도했다.
-2026-10-30 19:33:20 한국 시간 순자산은 953.9098996555094954531049717달러였다.
-손실을 포함한 장부와 근거는 `state/verification-profit-objective.json`에 보존했다.
+## External recovery boundaries
 
-## 청산 후 대기열 과다 생성과 장부 잠금 수정
+IP allowlists, credentials, and account quotas require external verification; do not change
+permissions without authorization. Corporate-action evidence requires verified facts, not only
+a syntactically valid URL. If evidence is insufficient in the legacy path, defer dependent work.
+Do not restore an old backup over newer trades without verifying their preservation.
+Do not invent fills for operating-system or network downtime or promise pre-login execution.
 
-2026-10-30 23:52 점검에서 마지막 정상 시세 수집이 23:39에 멈춘 것을 확인했다.
-청산 후 과거 신호가 남은 전 종목을 재전송하면서 후보가 한 번에 1만 개 이상 생성됐다.
-종목별 대기 작업 갱신에 색인이 없어 전체 대기열을 반복 검색했다. 실제 실행 계획은 `SCAN jobs`였다.
-후보가 하나씩 공개돼 검토 프로세스가 미완성 묶음을 가져갔고, 장부 잠금과 재시작이 반복됐다.
-
-- 대기열의 종목·시장·상태·시각 색인을 추가해 전체 검색을 제거했다.
-- 후보 묶음과 사건 처리 기록을 한 쓰기 작업으로 저장한다. 실패하면 모두 되돌린다.
-- 청산 후에는 보유·청산·감시 종목과 현재 순위 자료가 있는 기회를 재검토한다. 후보 수 상한은 없다.
-- 과거 체결·손익·미집계 AI 사용량 기록을 보존하고 중단된 일부 대기열만 대체했다.
-- 실제 운영 장부에서 578개 후보 생성은 0.073초였고 순자산은 변하지 않았다.
-- 부분 묶음 노출과 저장 실패를 재현한 검사를 포함해 120개 검사를 통과했다.
-
-복구 전 검증 백업은 `state/backups/ledger-20261030T145427-206a08de.sqlite3`다.
-
-## 전체 종목의 새 신호로 재검토 범위 확대
-
-2026-10-31 확인에서 한국 보유 종목의 감시 가격이 변하지 않아 AI 검토가 대기한 것을 확인했다.
-미국 시세는 수집했지만 기존 감시 가격·청산·사용자 요청만이 재검토를 열 수 있었다.
-사용자의 지시에 따라 이 범위 제한을 제거했다.
-
-- 전체 관측 종목의 새 시장 신호는 보유·감시 여부와 무관하게 검토한다.
-- 기존 신호 생성 기준을 사용한다. 새 종목이나 새 방향 신호도 동일하게 처리한다.
-- 기존 감시 가격은 추가 알림 조건이다. 빈 감시 목록도 새 종목 검토를 막지 않는다.
-- 동일 신호는 한 번만 전달한다. AI에 실제 전달한 최신 관측 신호도 중복 처리하지 않는다.
-- 첫 전환에서는 기존 자료를 기준 상태로 등록하고 현재 순위·보유·감시 후보를 검토한다.
-- 후보 수·호출 수·토큰·손실 한도를 추가하지 않는다. 실제 주문 경로는 계속 차단한다.
-
-한국 감시 가격이 그대로여도 미국의 새 종목이 검토되는 상황과 동일 자료 반복을 검사했다.
-124개 검사와 Ruff·12개 모듈 mypy 검사를 통과했다.
+The [official Toss specification](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)
+was the reference for candle timestamps and response-header pacing fields.

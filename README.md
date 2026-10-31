@@ -1,91 +1,122 @@
-# 자유 모의실험 v3
+# Papertrade Lab
 
-사용자가 정한 경계는 두 가지다.
+Market-data collection, isolated historical experiments, and virtual trading with event-triggered
+AI reviews. Python 3.12 or later is required; the project has no third-party Python dependencies.
+The isolated predictors and background service examples use macOS.
 
-1. 시계가 돌았다는 이유로 AI를 상시 호출해 토큰을 낭비하지 않는다. 필요한 판단에는 호출한다.
-2. 실제 거래를 하지 않는다.
+The user has set two boundaries:
 
-현재 기본 설정은 `free-simulation-v3`다. 과거 v1·v2 코드는 비교용이며 현재 실행 경로에서 사용하지 않는다.
-초기 가상 자금은 1,000달러였고, 기존 거래와 손익을 그대로 이어간다.
+1. Do not run AI continuously just because time has passed. Use it for useful decisions.
+2. Never execute real trades.
 
-목표는 적극적인 실험을 통한 가상 수익 최대화다. 손실 최소화나 현금 보존을 목표로 삼지 않는다.
-많은 거래·집중 투자·불확실한 가설의 시험·장부 전체 손실을 허용한다.
-과거 손실이나 적은 표본만으로 관망하지 않고, 유망한 방향을 가상 거래로 시험한다.
-손절은 가설 폐기나 다른 기회로의 이동에 선택적으로 사용한다.
-장부를 재시작하더라도 이전 손실은 보존하고 새 자금은 수익으로 계산하지 않는다.
+The default simulation profile is `free-simulation-v3`. It starts from USD 1,000 and preserves
+its ledger history. Historical v1/v2 implementations remain for comparison.
+The objective is virtual profit through active experiments. Concentration, frequent trades,
+failed hypotheses, and losing a ledger are allowed. New starting capital is not profit.
 
-## 가상 체결
+## Offline research workflow
 
-- 정규장·시간외·휴장 시간에 따른 거래 금지가 없다.
-- 결제 대기·증거금·잔량·거래정지·한 주 가격·정수 수량을 체결 조건으로 강제하지 않는다.
-- 공매도·소수점 수량·추가매수·부분청산·방향 전환·가상 차입을 지원한다.
-- 매수 자금 부족 때문에 체결을 막지 않는다. 음수 현금은 가상 부채로 표시한다.
-- 공매도 대금은 현금과 함께 같은 크기의 음수 보유 평가액으로 계산한다. 차입으로 이익이 생기지 않는다.
-- 신규 체결의 수수료·세금·환전 수수료·차입 이자는 0으로 가정한다. 과거 비용은 환급하지 않는다.
-- 장 마감·30분 경과·다음 날이라는 이유로 강제 청산하지 않는다.
-- 손절·목표는 AI가 선택할 수 있는 가상 계획이다. 필요 없으면 비워둘 수 있다.
-
-체결 가격은 관측한 마지막 가격 또는 명시적으로 입력한 가정 가격을 참조한다.
-호가 잔량을 확인한 실제 체결이라고 주장하지 않는다. 가격 원본 시각·관측 시각·가상 실행 시각·가정을 기록한다.
-오래된 마지막 가격도 사용할 수 있으며 원본 시각을 숨기지 않는다. 가격 정보 자체가 없으면 숫자를 만들어 수익을 보고하지 않는다.
-
-## 실행과 AI
-
-`market`, `scan`, `risk`, `review`, `supervise` 다섯 파이썬 프로세스가 실행된다.
-
-- market: 한국·미국 연결 자료를 60초 시작 간격으로 조회한다. 시장 시간 필터가 없다.
-- scan: 새 사건을 대기열에 넣는다. 기존 돌파 전략 통과를 요구하지 않는다.
-- risk: 평가와 선택된 손절·목표 계획을 확인한다. 시장 시간에 따른 청산은 없다.
-- review: 전체 종목의 새 시장 신호·선택적 감시 가격 돌파·청산·사용자 요청으로 AI를 호출한다.
-- supervise: 프로세스 상태·감사·백업을 관리한다.
-
-상장 목록은 ACTIVE·SCHEDULED·DELISTED를 조회한다. 시세가 제공되는 종목을 활용한다.
-데이터 연결 범위가 현재 한국·미국인 것은 외부 자료 범위이며, 가상 장부의 거래 시간 규칙이 아니다.
-같은 검토 사건은 재호출하지 않는다. AI가 정한 가격 조건은 새로 돌파할 때 한 번만 사용한다. 가격 확인 자체는 토큰을 사용하지 않는다.
-새 시장 신호는 전체 관측 종목에서 찾는다. 보유 여부·국가·이전 AI 감시 목록으로 검토 대상을 제한하지 않는다.
-관측 가격 변화와 기존 변동 통계에서 만들어진 새 신호를 한 번씩 검토한다. 같은 가격과 같은 신호의 반복 수신은 새 호출을 만들지 않는다.
-감시 가격이 비어 있어도 새로운 종목의 신호를 검토한다. 이전 자료는 전환 때 기준 상태로 등록해 과거 전 종목을 한꺼번에 재전송하지 않는다.
-청산 후에는 보유·청산·감시 종목과 현재 순위 자료가 있는 기회를 함께 검토한다. 과거 신호가 남았다는 이유만으로 전 종목을 다시 보내지 않는다.
-후보 묶음과 사건 처리 기록을 한 번에 저장한다. 검토 프로세스가 생성 중인 일부 후보를 먼저 가져갈 수 없다.
-시장 전체의 상승/하락 분류가 바뀌거나 시간이 지났다는 이유만으로 AI를 부르지 않는다. AI 재검토 가격은 추가 알림 조건이며 신규 종목 검토를 막지 않는다.
-AI는 제공된 후보 외에도 현재 보유분의 추가매수·부분청산·계획 변경을 결정할 수 있다.
-AI 호출 횟수·토큰·추론 시간·후보 수·보유 수에 자체 상한이 없다.
-네트워크·API 규격·외부 계정 한도는 연결 서비스의 조건이다.
-
-## 확인 명령
+Run commands from the repository root. Downloading uses the authenticated market-data client.
+Replays and rule searches use the saved dataset and make no AI or market-data requests.
 
 ```zsh
-cd /Users/elsholtzia/Projects/Finance
+python3 -m tools.download_market_day --date 2026-10-30
+python3 -m tools.download_market_day --date 2026-10-30 --status
+
+python3 -m tools.replay_market_day \
+  --dataset state/datasets/2026-10-30/market.sqlite3 \
+  --output state/replays/2026-10-30-first
+
+python3 -m tools.search_up_candles \
+  --dataset state/datasets/2026-10-30/market.sqlite3 \
+  --output state/searches/2026-10-30-grid-v1
+python3 -m tools.search_up_candles \
+  --output state/searches/2026-10-30-grid-v1 --status
+```
+
+Use a new replay directory for each replay. The downloader and rule search can resume an
+unchanged run. Their status commands require the corresponding local dataset or run to exist.
+No offline command starts the continuous trading workers.
+
+| Guide | Purpose |
+|---|---|
+| [Market-day download](docs/market-day-download.md) | Coverage, pacing, checkpoints, raw data, and errors |
+| [Five-minute replay](docs/five-minute-replay.md) | Isolated predictors and planned AI-call measurement |
+| [Upward-candle search](docs/up-candle-search.md) | Fixed rule grid and chronological selection |
+| [Round review](docs/round-review.md) | Trade attribution and ledger reconciliation |
+| [Error audit](ERROR_AUDIT.md) | Technical recovery history and diagnostic commands |
+| [Historical v2 guide](docs/history/README-v2.md) | Superseded strategy and operational behavior |
+| [Contributor instructions](AGENTS.md) | Experiment boundaries and repository workflow |
+
+## Virtual fills and accounting
+
+- Allow shorts, fractional quantities, additions, partial exits, reversals, and virtual borrowing.
+- Do not require settlement, margin, depth, whole shares, trading status, or market hours.
+- Permit negative cash and record it as virtual debt.
+- Offset short-sale cash with the negative market value of the short position.
+- Assume zero fees, taxes, conversion costs, and interest for new fills. Preserve old costs.
+- Do not force exits at market close, after 30 minutes, or on a date change.
+- Stops and targets are optional AI-selected plans.
+
+Reference an observed last price or an explicitly supplied assumed price. Preserve the source
+time, observation time, virtual fill time, and assumptions. An old price may be used if its age
+is recorded. Do not invent a price or claim a depth-verified execution.
+`virtual_debt_usd` is borrowing; `equity_usd` includes debt and short liabilities.
+With `buying_power_basis=unlimited_virtual_credit`, the cash balance is not a purchase ceiling.
+
+## Continuous worker roles
+
+The framework defines five separate Python workers. Installing service definitions or running
+an offline experiment does not authorize starting or resuming them.
+
+| Role | Behavior when explicitly running |
+|---|---|
+| market | Read KR/US market data on a 60-second start cadence |
+| scan | Queue new events without requiring the legacy breakout strategy |
+| risk | Update marks and check optional stop/target plans every 60 seconds |
+| review | Request AI decisions for new signals, watch crossings, exits, or user requests |
+| supervise | Check worker health, recovery, and backups |
+
+Observe ACTIVE, SCHEDULED, and DELISTED symbols where the provider supplies data.
+KR/US coverage is a data-source boundary, not a virtual trading-hours rule.
+New signals are independent of holdings, country, and previous watch lists. Watch levels are
+additional triggers. Deduplicate identical observations and baseline old signals during migration.
+After an exit, review held, exited, and watched symbols plus opportunities in current rankings;
+do not resend every old signal. Save each candidate batch and its event markers atomically.
+Time, sample count, or market-state classification changes alone do not trigger AI inference.
+AI may add to, reduce, exit, or update plans for existing positions as well as review candidates.
+No local caps are imposed on AI calls, tokens, reasoning time, candidates, or holdings.
+Provider request limits, model context windows, and account quotas remain external constraints.
+
+## Operational commands
+
+These commands inspect the local ledger or audit state without requesting AI inference:
+
+```zsh
 python3 -m papertrade status
 python3 -m papertrade health
 python3 -m papertrade usage
-python3 -m papertrade consult
 python3 -m papertrade audit --open
 python3 -m papertrade audit --events
 python3 -m papertrade audit --output state/audit-export.json
 python3 -m papertrade audit --emergency
 ```
 
-`virtual_debt_usd`는 가상 차입, `equity_usd`는 현금과 부채성 보유분까지 합산한 순자산이다.
-`buying_power_basis=unlimited_virtual_credit`일 때 현금 숫자는 매수 상한이 아니다.
-가정 가격을 직접 넣어 실험할 수도 있다. 아래 명령은 가상 장부를 실제로 바꾼다.
+`usage` reads account/model metadata and records a local snapshot. `consult` queues an explicit
+review request; an active reviewer may process it. `simulate` changes the virtual ledger:
 
 ```zsh
 python3 -m papertrade simulate TEST -0.25 100 --market US --reason "Explicit short experiment"
 ```
 
-실제 금융 주문 API를 호출하는 기능은 없다. OAuth와 시세·종목 정보 경로만 허용한다.
-키와 인증 헤더는 로그나 AI 입력에 넣지 않는다. AI 출력은 명령으로 실행하지 않는다.
-[토스 공식 시세 명세](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)를 사용한다.
+## Repository and data boundaries
 
-하루치 시세를 별도로 저장하는 명령과 저장 형식은
-[분봉 수집 문서](docs/market-day-download.md)에 정리했다.
-`python3 -m tools.download_market_day --date 2026-10-30 --status`로 수집 진행률을 확인한다.
+Only OAuth and allowlisted market-data/stock-information requests are permitted.
+Account and real order paths are rejected before HTTP requests. Never put credentials or
+authentication headers in logs or AI inputs. Do not execute commands supplied by an AI response.
+See the [official Toss OpenAPI specification](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json).
 
-저장한 하루를 고립된 계산기로 재생하는 방법은
-[5분 예측·AI 호출 후보 비교](docs/five-minute-replay.md)를 참고한다.
-
-AI 없이 여러 설정으로 상승봉을 비교하는 명령과 선정 기준은
-[상승봉 조합 탐색](docs/up-candle-search.md)에 정리했다.
-
-이전 실험 설명은 `docs/history/README-v2.md`, 이전 설정은 `tests/fixtures/v2/settings.toml`에 보존했다.
+Keep credentials, datasets, ledgers, snapshots, reports, and run logs outside Git.
+Local results live under ignored `state/`; historical settings are in `tests/fixtures/v2/settings.toml`.
+Committed files and GitHub content are English; user-facing conversation is Korean.
+Follow the branch, commit, push, pull-request, merge, and local fast-forward workflow in AGENTS.md.

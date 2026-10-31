@@ -1,4 +1,4 @@
-# 상승봉 알고리즘 조합 탐색
+# Upward-candle rule search
 
 ```zsh
 python3 -m tools.search_up_candles \
@@ -9,73 +9,72 @@ python3 -m tools.search_up_candles \
   --output state/searches/2026-10-30-grid-v1 --status
 ```
 
-실제 AI·시세·주문·기존 가상 장부를 호출하지 않는다. 별도 결과 DB에 예측과 채점만 저장한다.
-가격 원본은 읽기 전용이다. 예측 계산기는 기존 macOS sandbox와 접근 차단 검사를 재사용한다.
-현재 시점까지 계산한 지표만 전달하고, 예측 조건을 저장한 뒤 다음 5분 정답을 공개한다.
+Make no AI, market-data, order, or existing-ledger calls. Store forecasts and scores in a separate DB.
+Open the source read-only. Reuse the predictor sandbox and actual access-denial checks.
+Pass only indicators known at the current time. Save conditions before exposing the next outcome.
 
-## 고정한 탐색 공간
+## Fixed search space
 
-6개 계열 × 관찰 기간 5개 × 변화율 5개 × 거래량 배수 5개 × 변동폭 배수 4개다.
-3,000개 조합과 항상 상승·항상 비상승 비교 기준 2개를 평가한다.
-조합과 코드·원본 해시는 시작할 때 고정한다. 다른 설정으로 재개하면 중단한다.
+Use six families, five lookbacks, five movement thresholds, five volume thresholds, and four noise
+thresholds: 3,000 combinations plus always-up and never-up baselines.
+Freeze parameters and source/code hashes before processing. Reject a restart with changed inputs.
 
-| 구분 | 값 |
+| Dimension | Values |
 |---|---|
-| 계열 | 추세 지속·반전·상단 돌파·평균 회귀·추세 전환·거래량 가중 추세 |
-| 관찰 기간 | 5·10·15·30·60분 |
-| 상승 점수 기준 | 0% 초과·0.1%·0.3%·0.5%·1% 이상 |
-| 거래량 조건 | 없음·1배·1.5배·2배·3배 |
-| 변동폭 조건 | 없음·1배·2배·3배 |
-| 정답 상승폭 | 0% 초과·0.1%·0.3%·0.5%·1% 이상 |
+| Family | Momentum, reversal, upper breakout, mean reversion, transition, volume-weighted trend |
+| Lookback | 5, 10, 15, 30, 60 minutes |
+| Upward score threshold | Above 0%, or at least 0.1%, 0.3%, 0.5%, 1% |
+| Relative volume | No filter, 1x, 1.5x, 2x, 3x |
+| Relative noise | No filter, 1x, 2x, 3x |
+| Outcome threshold | Above 0%, or at least 0.1%, 0.3%, 0.5%, 1% |
 
-각 계열의 점수 계산:
+Score formulas:
 
-- 추세 지속: 관찰 기간 수익률을 5분 길이로 환산한다.
-- 반전: 추세 지속 점수의 부호를 바꾼다.
-- 상단 돌파: 현재 가격이 최근 5분을 제외한 이전 관찰 기간 고가를 얼마나 넘었는지 본다.
-- 평균 회귀: 관찰 기간 평균 종가보다 현재 가격이 낮은 정도를 5분 길이로 환산한다.
-- 추세 전환: 최근 5분 수익률에서 그 이전 구간의 5분당 수익률을 뺀다.
-- 거래량 가중 추세: 추세 지속 점수에 관측 거래량 증가분을 곱한다.
+- Momentum: scale the lookback return to five minutes.
+- Reversal: negate the momentum score.
+- Upper breakout: compare price with the prior lookback high, excluding the latest five minutes.
+- Mean reversion: scale the difference between mean lookback close and price to five minutes.
+- Transition: subtract the earlier period's return per five minutes from the latest five-minute return.
+- Volume-weighted trend: multiply momentum by the observed increase in relative volume.
 
-거래량은 최근 5분 합계를 그 이전 관찰 기간의 5분당 평균과 비교한다.
-변동폭은 과거 연속된 1분 관측의 절대 수익률 평균을 5분 길이로 환산해 비교한다.
-과거 변동이 정확히 0인 경우 분모에 1e-12 수치 바닥을 사용한다.
-관측값이 없으면 지표를 만들어 내지 않는다. 실제 가격 원본 시각과 기준 시각도 남긴다.
+Compare recent five-minute volume with the prior lookback's average per five minutes.
+Scale mean absolute returns between consecutive observed minute bars to five-minute noise.
+Use a 1e-12 denominator floor when historical noise is exactly zero.
+Do not invent absent indicators. Preserve actual quote and reference timestamps.
 
-## 표본과 선정
+## Samples and selection
 
-정답은 현재 종가에 비해 5분 뒤 종가가 목표 이상 올랐는지다. 중간 고가는 정답이 아니다.
-현재·미래 끝점에 모두 실제 가격이 있을 때만 채점한다. 누락 구간을 0%로 채우지 않는다.
-각 설정의 정보 부족은 비상승 예측으로 남고 eligible에 적용 가능 표본 수를 따로 기록한다.
+An outcome is the target close relative to the current close. An intervening high is not the label.
+Score only observed exact endpoints. Do not turn missing bars into zero returns.
+Insufficient indicators produce no upward prediction; `eligible` separately counts applicable cases.
 
-all은 채점 가능한 전체 표본이다. common은 모든 계열·기간의 지표가 있는 공통 표본이다.
-주요 비교·선정은 common으로 해 초기 준비 시간과 지표 부재가 서로 다른 설정을 공정하게 비교한다.
-관측되지 않은 분봉과 거래량이 존재할 수 있으므로 지표가 있다는 것이 원자료의 완전성을 뜻하지 않는다.
+`all` contains every scorable case. `common` requires indicators for every family/lookback.
+Use `common` for primary comparisons so different warmup periods and indicator availability do not
+confound selection. Available indicators do not prove that the underlying minute data are complete.
 
-시장별 캘린더 시간의 앞 60%를 탐색, 다음 20%를 선택, 마지막 20%를 평가에 사용한다.
-경계는 5분에 맞추고 예측 구간이 둘 이상의 구간에 걸치면 거부한다.
-탐색 구간에서 계열·관찰 기간별 최선 설정을 하나씩 고른다.
-선택 구간에서 그 후보들과 비교 기준 중 F1이 가장 높은 설정을 선택한다.
-동점은 정밀도·상승 적중 건수·설정 ID 순으로 결정한다. 마지막 구간 성적은 선정에 사용하지 않는다.
-긍정 정답이 없는 구간은 유효한 우승 결과를 만들지 않는다.
+Split each market's calendar time into 60% training, 20% validation, and 20% testing.
+Align boundaries to five minutes and reject forecasts crossing a split boundary.
+Select the best training parameters per family/lookback. On validation, choose the highest-F1
+candidate or baseline. Break ties by precision, true-positive count, then configuration ID.
+Never use test scores to select parameters. Do not claim a valid winner without positive outcomes.
 
-시간순 최종 설정은 한국·미국 각각 선택한다. 두 시장의 구간 시각이 다르므로
-시장별 탐색·선택·평가 구간을 섞어 전체 합산의 시간순 검증으로 사용하지 않는다.
-전체 합산은 하루 전체의 탐색 순위만 만든다. 표본별 분류 점수이며 계좌 수익 합산이 아니다.
-정밀도·재현율·F1·TP·FP·FN·TN과 표본 수를 저장한다.
-선택된 설정은 마지막 구간의 시간대별 점수와 틀린 사례도 남긴다.
-한국의 마지막 구간과 미국의 마지막 구간이 서로 다른 장 구간일 수 있으므로 표본 수와 세션을 확인한다.
-신호 뒤 평균 수익률은 관측된 결과 평균이며 실제 매매 계좌 수익률이 아니다.
-하루 전체 상위 순위는 탐색 결과로 별도 표시한다. 다음 거래일 검증 성적으로 주장하지 않는다.
+Select chronological winners separately for KR and US. Their split times differ, so do not merge
+market-specific folds into a pooled chronological test. Pool only full-day exploratory rankings.
+Pooled scores classify samples; they are not combined account returns.
+Store precision, recall, F1, TP/FP/FN/TN, and sample counts.
+For selected configurations, include test-session scores and chronological error examples.
+Inspect session composition: KR and US test periods may represent different trading sessions.
+Mean return after an upward signal is an observed conditional mean, not trading-account profit.
+Full-day rankings are exploratory and do not represent next-day validation.
 
-## 저장과 재개
+## Storage and restart
 
-search.sqlite3에 예측 시점별 봉인된 지표·조건, 이후 정답, 모든 조합의 점수를 저장한다.
-예측과 미래 정답은 분리된 단계에서 기록한다. 고립된 계산기는 이 DB를 읽을 수 없다.
-지표를 한 번 계산하고 고정된 조건의 비트 집합을 조합해 수천 설정을 비교한다.
-원본을 각 설정마다 다시 읽지 않는다. 새 미래 정보를 지표 계산에 넣지 않는다.
+`search.sqlite3` stores sealed per-step features/conditions, later outcomes, and all configuration scores.
+The isolated predictor cannot read this DB. Compute features once and combine fixed predicate
+bitmaps instead of rereading the source for every setting. Never incorporate future observations.
 
-중단 후 동일 명령으로 재개한다. 지표 생성 도중이면 과거 이력을 재구성하고 봉인된 프레임을 재사용한다.
-설정별 점수는 트랜잭션으로 저장하며 완료된 설정은 건너뛴다. 중복 실행은 파일 잠금으로 막는다.
-status.json과 --status에서 단계·진행량·오류를 확인한다. report.json은 전체 평가와 무결성 검사 후 생성한다.
-실행 로그·원본·결과는 state/ 아래에만 두고 Git에 올리지 않는다.
+Resume with the same command. Rebuild past history and reuse sealed frames after an extraction
+interruption. Commit each configuration's scores atomically and skip finished configurations.
+Use a file lock to prevent duplicate runs.
+`status.json` and `--status` show progress and errors. Write `report.json` only after scoring and
+integrity verification. Keep logs, source data, and results under ignored `state/`.
