@@ -32,6 +32,13 @@ python3 -m tools.search_up_candles \
   --output state/searches/2026-10-30-grid-v1
 python3 -m tools.search_up_candles \
   --output state/searches/2026-10-30-grid-v1 --status
+
+python3 -m tools.search_portfolios \
+  --dataset state/datasets/2026-10-30/market.sqlite3 \
+  --features state/searches/2026-10-30-grid-v1/search.sqlite3 \
+  --output state/portfolios/2026-10-30-diverse-v1
+python3 -m tools.search_portfolios \
+  --output state/portfolios/2026-10-30-diverse-v1 --status
 ```
 
 Use a new replay directory for each replay. The downloader and rule search can resume an
@@ -43,6 +50,7 @@ No offline command starts the continuous trading workers.
 | [Market-day download](docs/market-day-download.md) | Coverage, pacing, checkpoints, raw data, and errors |
 | [Five-minute replay](docs/five-minute-replay.md) | Isolated predictors and planned AI-call measurement |
 | [Upward-candle search](docs/up-candle-search.md) | Fixed rule grid and chronological selection |
+| [Portfolio return search](docs/portfolio-search.md) | Diverse virtual accounts, return rankings, and trade evidence |
 | [Round review](docs/round-review.md) | Trade attribution and ledger reconciliation |
 | [Error audit](ERROR_AUDIT.md) | Technical recovery history and diagnostic commands |
 | [Historical v2 guide](docs/history/README-v2.md) | Superseded strategy and operational behavior |
