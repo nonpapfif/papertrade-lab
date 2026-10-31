@@ -307,20 +307,21 @@ class Downloader:
             if at > before or at.second or at.microsecond:
                 raise ValueError("Candle timestamp violates the requested minute range")
             timestamps.append(at)
+            if not start < at <= end:
+                continue
             o, h, low, c, volume = (decimal(row[k]) for k in FIELDS[:-1])
             if min(o, h, low, c) <= 0 or not low <= o <= h or not low <= c <= h or volume < 0:
                 raise ValueError("Invalid OHLCV values")
             if row["currency"] != ("KRW" if job["market"] == "KR" else "USD"):
                 raise ValueError("Unexpected candle currency")
-            if start < at <= end:
-                outside = not any(stamp(w["start"]) < at <= stamp(w["end"])
-                                  for w in scope["sessions"])
-                fields = tuple(str(row[k]) for k in FIELDS)
-                key = at.isoformat()
-                if key in values and values[key][4:10] != fields:
-                    raise ValueError("Conflicting candles within a page")
-                values[key] = (job["market"], job["symbol"], key, row["timestamp"],
-                               *fields, int(outside))
+            outside = not any(stamp(w["start"]) < at <= stamp(w["end"])
+                              for w in scope["sessions"])
+            fields = tuple(str(row[k]) for k in FIELDS)
+            key = at.isoformat()
+            if key in values and values[key][4:10] != fields:
+                raise ValueError("Conflicting candles within a page")
+            values[key] = (job["market"], job["symbol"], key, row["timestamp"],
+                           *fields, int(outside))
         if timestamps != sorted(timestamps, reverse=True):
             raise ValueError("Candle page is not in descending timestamp order")
         finished = not rows or min(timestamps) <= start or next_before is None
