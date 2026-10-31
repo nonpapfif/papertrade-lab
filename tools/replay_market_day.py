@@ -21,6 +21,20 @@ STEP = 300
 ALGORITHMS = (
     "flat", "up_10bp", "momentum_5m", "reversion_5m", "trend_15m", "acceleration",
 )
+GRID_LOOKBACKS = (5, 10, 15, 30, 60)
+GRID_FAMILIES = (
+    "momentum", "reversal", "breakout", "mean_reversion", "transition", "volume_trend",
+)
+GRID_MOVES = (0.0, 0.001, 0.003, 0.005, 0.01)
+GRID_VOLUMES = (0.0, 1.0, 1.5, 2.0, 3.0)
+GRID_NOISES = (0.0, 1.0, 2.0, 3.0)
+GRID_SCORE_READY = 150
+GRID_VOLUME = 180
+GRID_VOLUME_READY = 205
+GRID_NOISE = 210
+GRID_NOISE_READY = 230
+GRID_COMMON = 235
+GRID_BITS = 236
 SCHEMA = """
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE ticks (
@@ -120,12 +134,45 @@ def probe(paths: list[str]) -> dict[str, bool]:
     return result
 
 
+def grid_mask(row: dict[str, Any]) -> int:
+    scores, volumes, noises = row["scores"], row["volumes"], row["noises"]
+    if len(scores) != 30 or len(volumes) != 5 or len(noises) != 5:
+        raise ValueError("Invalid grid feature dimensions")
+    if any(value is not None and not math.isfinite(value)
+           for value in [*scores, *volumes, *noises]):
+        raise ValueError("Grid features must be finite or null")
+    result = 0
+    for index, value in enumerate(scores):
+        if value is None:
+            continue
+        result |= 1 << (GRID_SCORE_READY + index)
+        for threshold_index, threshold in enumerate(GRID_MOVES):
+            if value > 0 if threshold == 0 else value >= threshold:
+                result |= 1 << (index * 5 + threshold_index)
+    for values, thresholds, offset, ready in (
+        (volumes, GRID_VOLUMES, GRID_VOLUME, GRID_VOLUME_READY),
+        (noises, GRID_NOISES, GRID_NOISE, GRID_NOISE_READY),
+    ):
+        for index, value in enumerate(values):
+            if value is not None:
+                result |= 1 << (ready + index)
+            for threshold_index, threshold in enumerate(thresholds):
+                if threshold == 0 or value is not None and value >= threshold:
+                    result |= 1 << (offset + index * len(thresholds) + threshold_index)
+    if all(value is not None for value in [*scores, *volumes, *noises]):
+        result |= 1 << GRID_COMMON
+    return result
+
+
 def worker_loop(source: TextIO, target: TextIO) -> None:
     previous: dict[tuple[str, str], tuple[str, set[tuple[str, int]]]] = {}
     for line in source:
         request = json.loads(line)
         if request["kind"] == "probe":
             response: Any = probe(request["paths"])
+        elif request["kind"] == "grid":
+            response = [{"market": row["market"], "symbol": row["symbol"],
+                         "mask": hex(grid_mask(row))} for row in request["rows"]]
         else:
             response = []
             at = request["at"]
