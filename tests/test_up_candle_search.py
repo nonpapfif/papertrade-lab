@@ -181,11 +181,14 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(result["configuration_count"], 4)
         self.assertEqual(result["forecast_cases"], 35)
         self.assertEqual(result["ai_calls"], 0)
+        self.assertEqual({w["market"] for w in result["winners"]}, {"KR", "US"})
         self.assertEqual(dataset.read_bytes(), original)
         db = sqlite3.connect(folder / "search.sqlite3")
         self.addCleanup(db.close)
         self.assertEqual(db.execute("SELECT COUNT(*) FROM finished").fetchone()[0], 4)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM scores").fetchone()[0], 4 * 120)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM scores").fetchone()[0], 4 * 90)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM scores WHERE market='ALL' "
+                                    "AND phase!='full'").fetchone()[0], 0)
 
     def test_bitmap_counts_match_direct_labels(self) -> None:
         maps = Bitmaps()

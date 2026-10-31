@@ -412,6 +412,8 @@ def score_grid(db: sqlite3.Connection, folder: Path, maps: Bitmaps,
     for market, phase, cohort in product(
         ("KR", "US", "ALL"), ("train", "validation", "test", "full"), ("all", "common"),
     ):
+        if market == "ALL" and phase != "full":
+            continue
         mask = maps.group_bits["observed"]
         mask &= maps.group_bits[market] if market != "ALL" else all_bits
         mask &= maps.group_bits[phase] if phase != "full" else all_bits
@@ -538,9 +540,10 @@ def report(db: sqlite3.Connection, folder: Path, maps: Bitmaps) -> dict[str, Any
     winners = []
     exploratory = []
     for market, goal in product(("KR", "US", "ALL"), GOALS):
-        winner = selection(db, market, goal)
-        annotate_winner(db, maps, winner)
-        winners.append(winner)
+        if market != "ALL":
+            winner = selection(db, market, goal)
+            annotate_winner(db, maps, winner)
+            winners.append(winner)
         rows = db.execute(
             "SELECT s.*,c.data FROM scores s JOIN configurations c ON c.id=s.configuration "
             "WHERE market=? AND goal=? AND phase='full' AND cohort='common' ORDER BY "
