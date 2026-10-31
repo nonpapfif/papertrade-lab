@@ -85,4 +85,7 @@ python3 -m papertrade simulate TEST -0.25 100 --market US --reason "Explicit sho
 저장한 하루를 고립된 계산기로 재생하는 방법은
 [5분 예측·AI 호출 후보 비교](docs/five-minute-replay.md)를 참고한다.
 
+AI 없이 여러 설정으로 상승봉을 비교하는 명령과 선정 기준은
+[상승봉 조합 탐색](docs/up-candle-search.md)에 정리했다.
+
 이전 실험 설명은 `docs/history/README-v2.md`, 이전 설정은 `tests/fixtures/v2/settings.toml`에 보존했다.
