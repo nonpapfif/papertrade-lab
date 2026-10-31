@@ -1,73 +1,71 @@
-# 하루치 분봉 수집
+# Downloading a market day
 
-`tools/download_market_day.py`는 기존 `MarketClient`의 인증·허용 경로를 재사용한다.
-실제 계좌·주문 경로와 AI 호출은 없다. 실시간 운용과 별도 프로세스·데이터베이스다.
+`tools/download_market_day.py` reuses the existing `MarketClient` authentication and allowlist.
+It has no account, order, or AI calls. Its process and database are separate from continuous trading.
 
 ```zsh
-cd /Users/elsholtzia/Projects/Finance
 python3 -m tools.download_market_day --date 2026-10-30
 python3 -m tools.download_market_day --date 2026-10-30 --status
 ```
 
-기본 저장 위치는 `state/datasets/2026-10-30/`다. 실제 데이터는 Git에 올리지 않는다.
-동일 명령을 다시 실행하면 완료된 종목과 페이지를 건너뛰고 이어받는다.
-중복 실행은 데이터셋별 파일 잠금으로 차단한다. SIGTERM과 Ctrl-C는 체크포인트를 유지한다.
+The default directory is `state/datasets/2026-10-30/`. Keep actual data outside Git.
+Rerun the same command to skip completed symbols and pages and resume the checkpoint.
+A dataset file lock prevents duplicate workers. SIGTERM and Ctrl-C preserve checkpoints.
 
-## 범위
+## Coverage
 
-- 한국 KOSPI·KOSDAQ·KR_ETC, 미국 NYSE·NASDAQ·AMEX·US_ETC 목록을 조회한다.
-- ACTIVE·SCHEDULED·DELISTED와 모든 증권 유형을 포함한다. 현재 제공 목록을 동결한다.
-- 현재 목록이 과거 당시의 전체 목록과 동일하다고 보장하지 않는다.
-- 당일 시장 캘린더와 종목 목록 원본을 저장한다.
-- 한국은 캘린더의 첫 세션부터 마지막 세션까지 수집한다.
-- 미국은 첫 세션부터 최소 24시간을 받는다. 캘린더보다 늦은 분봉도 보존한다.
-  2026-10-30은 한국 시간 10/30 09:00부터 10/31 09:00까지다.
-- 분봉은 종료 시각 기준 `(시작, 종료]`로 선택한다. 수정주가를 적용하지 않는다.
-- 시각·시가·고가·저가·종가·거래량·통화를 원래 숫자 문자열로 보존한다.
-- 캘린더 세션 밖 봉은 `outside_calendar=1`로 표시한다.
-- 빈 분을 생성하거나 가격을 보간하지 않는다. 무체결과 원본 누락을 단정하지 않는다.
-- 서버가 더 오래된 페이지를 제공하지 않으면 그 범위에서 종료한다.
-  완료는 API의 제공 범위를 받았다는 뜻이며 거래소 원장의 완전성을 보증하지 않는다.
+- Query KOSPI, KOSDAQ, KR_ETC, NYSE, NASDAQ, AMEX, and US_ETC.
+- Include ACTIVE, SCHEDULED, DELISTED, and all security types. Freeze the currently supplied list.
+- The current list is not a guaranteed reconstruction of the historical listing universe.
+- Save the original market calendars and listing records.
+- For KR, collect from the first calendar session to the final session end.
+- For US, collect at least 24 hours from the first session, preserving bars beyond the calendar end.
+  The 2026-10-30 example spans October 30 09:00 to October 31 09:00 KST.
+- Select minute bars by end time in `(start, end]`. Request unadjusted prices.
+- Preserve timestamps, OHLC, volume, and currency, including original numeric strings.
+- Mark bars outside calendar sessions with `outside_calendar=1`.
+- Do not generate bars or interpolate prices. Do not infer whether gaps mean no trades or missing data.
+- Stop when the provider has no older page. Completion means the available API range was received,
+  not that the dataset is a complete exchange transaction record.
 
-## 호출 간격과 중단
+## Pacing and stopping
 
-기본 요청 간격은 최소 0.6초다. 응답 한도의 절반보다 빠르게 요청하지 않는다.
-목록 한도가 초당 1회면 최소 2초를 기다린다. 잔여량 0이면 reset 시간도 기다린다.
-429는 최소 60초와 서버가 지정한 시간 중 더 긴 시간을 기다린다.
-이후 기본 간격도 늦춘다. 네트워크·5xx 오류는 대기 후 같은 페이지를 재시도한다.
-대기 시각과 낮춘 속도는 재시작 뒤에도 유지한다.
+The default minimum request interval is 0.6 seconds. Stay at or below half the response-header
+rate limit. A one-request-per-second listing limit produces at least a two-second delay.
+Wait for reset when the remaining allowance reaches zero.
+For HTTP 429, wait at least 60 seconds or the server-directed delay, whichever is longer, and slow
+the subsequent request interval. Retry network/5xx failures after waiting on the same page.
+Persist cooldown timestamps and slower pacing across restarts.
 
-401·403과 예상하지 못한 요청 거부는 `blocked`로 멈춘다.
-접근 거부를 반복 요청하지 않는다. 한도를 지켜도 서비스 측 차단이 없다고 보장할 수는 없다.
-차단 원인을 해결한 뒤 `--resume-blocked`를 붙여 수동으로 재개할 수 있다.
-이미 차단된 실행은 로그인이나 오류 재시작으로 API에 다시 접근하지 않는다.
+Stop in `blocked` on 401, 403, or an unexpected client rejection. Do not repeatedly request
+access after rejection. Respecting the rate limit cannot guarantee the provider will never block access.
+After resolving the cause, use `--resume-blocked` for manual recovery.
+Login and automatic restarts do not resume a blocked dataset without that flag.
 
-## 저장 형식과 확인
+## Storage and inspection
 
-`market.sqlite3`의 주요 테이블:
-
-| 테이블 | 내용 |
+| Table | Contents |
 |---|---|
-| metadata | 날짜·캘린더·수집 범위·실행 상태·대기 시각 |
-| listings / listing_jobs | 종목 목록 원본과 목록 수집 완료 여부 |
-| symbols | 종목별 완료 상태·다음 커서·봉 수·오류 |
-| pages | API 결과 JSON의 gzip·SHA-256·조회 커서·수집 시각 |
-| candles | 중복 제거한 당일 분봉과 원본 페이지 연결 |
-| requests / events | 인증 값을 제외한 HTTP 감사와 실행 이력 |
+| metadata | Date, calendars, scope, state, and cooldown |
+| listings / listing_jobs | Original listing records and listing progress |
+| symbols | Symbol state, next cursor, bar count, and errors |
+| pages | Gzipped API result JSON, SHA-256, query cursor, and retrieval time |
+| candles | Deduplicated in-scope minute bars and source-page references |
+| requests / events | HTTP and execution audit without authentication values |
 
-원본 페이지·분봉·다음 커서는 하나의 SQLite 트랜잭션으로 저장한다.
-겹치는 봉의 값이 다르거나 가격·시각·커서가 잘못되면 해당 페이지 원본을 보존하고
-종목을 `failed`로 표시한다. 이미 저장한 가격은 덮어쓰지 않는다.
-한 페이지에 섞여 온 수집일 밖 봉은 원본에 보존하되 당일 가격 검증에는 포함하지 않는다.
-범위 밖 봉의 시각은 페이지 순서·커서 진행·수집 종료를 확인하는 데만 사용한다.
-404 등은 `unavailable`, 정상 응답에 당일 봉이 없으면 `no_data`로 구분한다.
-`failed`와 `unavailable`은 자동으로 완료 처리해 숨기지 않고 최종 `complete_with_errors`에 포함한다.
-종목별 상태가 최종 결과의 기준이며 일부 페이지만 있는 실패 종목은 완전한 하루로 사용하면 안 된다.
+Save the original page, normalized bars, and next cursor in one SQLite transaction.
+Preserve invalid raw pages and mark the symbol `failed` if prices, timestamps, cursors, or overlap
+values conflict. Never overwrite an already saved price.
+Preserve out-of-day bars in raw pages but exclude them from target-day price validation.
+Use their timestamps only for pagination order, cursor progress, and stopping.
 
-`status.json`은 약 60초마다 갱신한다. `--status`는 DB를 읽기 전용으로 열어 최신 수치를 출력한다.
-전체 종료 시 SQLite `quick_check`를 실행한다.
-실패 종목과 빈 시간의 해석은 이후 데이터 검수 단계에서 확인한다.
+Distinguish `unavailable` for responses such as 404 from `no_data` for valid empty target days.
+Keep `failed` and `unavailable` visible in `complete_with_errors`; do not hide them as successful
+symbols. A partially downloaded failed symbol is not a complete market day.
 
-macOS 백그라운드 실행은 별도의 날짜별 LaunchAgent를 사용한다.
-오류 종료 시 5분 이상 간격으로 재시작한다. 접근 거부·정상 완료·사용자 중단은 재시작하지 않는다.
-로그인 시 같은 명령을 실행해 미완료 분량을 이어받는다. 실시간 운용 서비스는 재개하지 않는다.
+Update `status.json` about once per minute. `--status` reads the current database in read-only mode.
+Run SQLite `quick_check` at completion. Review gaps and failed symbols before interpreting coverage.
+
+The macOS background job uses a separate date-specific LaunchAgent. Error exits restart after
+at least five minutes; access rejection, normal completion, and handled user interruption do not.
+At login, the same command resumes unfinished work. It does not resume continuous trading services.

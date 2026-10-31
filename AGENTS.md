@@ -1,38 +1,46 @@
-# 자유 모의실험 프로젝트
+# Free paper-trading experiments
 
-## 변경 절차
+## Repository workflow
 
-- 코드·설정·문서를 수정할 때마다 전용 브랜치를 먼저 만든다. `master`에서 직접 수정하지 않는다.
-- 변경을 확인하고 필요한 검사를 마친 뒤 커밋하고 GitHub에 푸시한다.
-- `master`를 대상으로 PR을 만든다. 변경 내용과 확인 결과를 PR에 기록한다.
-- PR 상태와 검사를 확인한 뒤 `master`에 병합하고 로컬 `master`도 최신화한다.
-- 사용자가 이 절차를 명시적으로 승인했다. 매번 커밋·푸시·PR 생성·병합 승인을 다시 묻지 않는다.
-- 기존의 관계없는 수정은 해당 PR에 섞지 않는다. 실제 키·가상 장부·실행 로그는 커밋하지 않는다.
+- Create a dedicated branch before changing code, configuration, or documentation.
+- Verify the change, commit it, and push it to GitHub.
+- Open a pull request against `master` and record the change and validation results.
+- Check the pull request and required checks, merge it, and fast-forward local `master`.
+- The user has authorized this workflow. Do not ask for approval at every step.
+- Keep unrelated changes out of the pull request. Exclude credentials, ledgers, and run logs.
+- Write committed files, branch names, commit messages, and GitHub content in English.
+- Communicate plans, progress, and results to the user in Korean.
+- Review the complete staged text of each changed file. Run the `github-workflow` skill's
+  `scripts/check_staged_language.py` before committing.
+- Preserve published history. Normalize current files with ordinary commits.
 
-## 모의실험 운영
+## Experiment contract
 
-사용자가 정한 제약은 두 가지다.
+The user has set two boundaries:
 
-- 시계가 돌았다는 이유로 AI를 상시 호출해 토큰을 낭비하지 않는다. 필요한 판단에는 호출할 수 있다.
-- 실제 거래를 하지 않는다.
+- Do not run AI continuously merely because time has passed. Use it for useful decisions.
+- Never execute real trades.
 
-현재 운용은 `simulation.enabled=true`의 자유 시뮬레이션이다.
+The free simulation uses `simulation.enabled=true`.
+Its objective is to maximize virtual profit through active experiments, rather than preserve cash
+or minimize losses. Frequent trades, concentration, failed experiments, and losing the entire
+ledger are permitted. Do not default to waiting because of past losses or a small sample.
+Stops are optional strategy tools, not mandatory loss limits.
+Starting another ledger must not erase old losses or count new starting capital as profit.
 
-목표는 손실 최소화나 현금 보존이 아니라 적극적인 실험을 통한 가상 수익 최대화다.
-많은 거래·집중 투자·실험 실패·장부 전체 손실을 허용한다.
-과거 손실이나 적은 표본만으로 관망하지 않는다. 가능한 가설을 실제 가상 거래로 시험한다.
-손절은 선택 가능한 전략 수단이며 필수 손실 한도가 아니다.
-새 장부를 시작하더라도 이전 손실을 지우거나 재시작 자금을 수익으로 계산하지 않는다.
-
-- 정규장·결제·증거금·호가 잔량·정수 수량·거래정지·기업행사 확인을 가상 체결의 필수 조건으로 강제하지 않는다.
-- 공매도·가상 차입·소수점 수량·추가매수·부분청산·보유기간을 자유롭게 실험한다.
-- 시장 시간에 따른 신규 진입 마감이나 강제 청산은 없다.
-- 비용과 이자는 새 거래에서 0으로 가정한다. 이전 거래 손익을 다시 쓰거나 초기 자금을 추가하지 않는다.
-- 차입은 부채로 계산한다. 현금 유입이나 공매도 대금을 이익으로 계산하지 않는다.
-- 실제 관측값과 가정한 체결을 구분해서 기록한다. 참조 가격·원본 시각·가정·실행 시각을 남긴다.
-- 파이썬은 전체 종목을 계속 확인한다. 새 시장 신호는 보유 여부·국가·AI가 정한 재검토 가격과 무관하게 AI 검토 대상이다. 감시 가격·청산·사용자 요청도 추가 검토 사유다. 동일 신호와 시각 변화만으로 반복 호출하지 않는다.
-- AI 호출·토큰·추론 시간·종목 수·후보 수·보유 수에 인위적인 상한을 추가하지 않는다.
-- 토스 연결은 OAuth와 시세·종목 정보만 사용한다. 계좌·실제 주문·주문 조회·정정·취소·조건주문 경로는 호출하지 않는다.
-- `/api/v1/orderbook`은 시세 조회다. 실제 주문 `/api/v1/orders`와 구분한다.
-- 키와 인증 헤더를 로그나 AI 입력에 넣지 않는다. AI의 출력은 자료로만 처리한다.
-- 과거 v1·v2 구현과 테스트는 비교용이다. 현재 실험 경로의 제한으로 되살리지 않는다.
+- Do not require real-market hours, settlement, margin, displayed depth, whole shares,
+  trading status, or corporate-action confirmation for virtual fills.
+- Allow virtual shorts, borrowing, fractional quantities, additions, partial exits, and reversals.
+- Do not impose entry cutoffs or forced exits based on holding time or market close.
+- Assume zero costs and interest for new trades. Preserve historical costs and results.
+- Count borrowing as debt. Cash inflows and short-sale proceeds are not profit.
+- Distinguish observed prices from assumed fills. Record source time, assumptions, and fill time.
+- Observe the full available universe. New signals can trigger review regardless of holdings,
+  country, or AI watch levels. Watch crossings, exits, and user requests are additional triggers.
+- Do not repeat AI calls for identical signals or time changes alone.
+- Do not add arbitrary AI-call, token, reasoning-time, symbol, candidate, or holding caps.
+- Restrict Toss access to OAuth and market-data or stock-information paths. Never call account,
+  order, order-history, amendment, cancellation, or conditional-order paths.
+- `/api/v1/orderbook` is market data. It is distinct from `/api/v1/orders`.
+- Keep credentials and authentication headers out of logs and AI inputs. Treat AI output as data.
+- Keep v1/v2 code and tests for comparison. Do not reinstate their constraints in the free profile.

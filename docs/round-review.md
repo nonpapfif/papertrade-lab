@@ -1,47 +1,45 @@
-# 모의 거래 회차 검토 방법
+# Reviewing a virtual trading round
 
-`tools/review_round.py`는 고정한 스냅샷을 읽어 체결과 진입 회차를 연결한다.
-운영 장부에 접속하거나 시세·주문 API를 호출하지 않는다. 운용 전략을 변경하지 않는다.
+`tools/review_round.py` connects fills to entry episodes in a frozen snapshot.
+It does not open the operating ledger, call market-data/order APIs, or change the strategy.
 
 ```zsh
 python3 tools/review_round.py state/reviews/round/snapshot.json state/reviews/round/analysis.json
 ```
 
-## 입력
+## Input
 
-스냅샷은 하나의 읽기 트랜잭션에서 추출한다. 이후 거래를 같은 분석에 섞지 않는다.
-`trades`, `ai_calls`, `positions`, `cash`, `events`의 원본 행을 보존한다.
-종목명 `names`, 관측값 `quotes`, 후보 등록 자료 `job_evidence`, 기준 시각 `cutoff_utc`를 함께 둔다.
-행의 JSON `data`와 실제 체결 번호·사건 키를 유지한다.
+Extract the snapshot in one read transaction. Do not mix later trades into that analysis.
+Preserve raw `trades`, `ai_calls`, `positions`, `cash`, and `events` rows, plus `names`, `quotes`,
+`job_evidence`, and `cutoff_utc`. Keep row JSON `data`, fill IDs, and event keys intact.
 
-## 체결과 손익 연결
+## Fills, episodes, and profit attribution
 
-- 실제 체결 한 건은 출력에서도 한 행이다. 신규 진입·추가·청산·방향 전환을 구분한다.
-- 같은 종목의 같은 방향 보유가 끝날 때까지를 한 진입 회차로 묶는다.
-- 방향 전환 체결은 기존 회차 청산과 새 반대 회차 진입에 각각 연결한다.
-- 청산 수량을 열린 진입분에 잔여 수량 비율로 나눠 진입분별 실현손익을 계산한다.
-- 미청산 진입분은 원장의 기준 시점 평가액으로 평가손익을 계산한다.
-- 비례배분은 평균원가 장부와 일치하며 선입선출 손익이라고 주장하지 않는다.
-- 체결 자체의 실현손익과 진입분 배분 실현손익은 같은 손익의 다른 표현이다. 더하지 않는다.
-- 비용·환율 손익과 현지 주가 방향을 구분한다. 가격 상승만으로 순이익을 추정하지 않는다.
+- Emit one output row per recorded fill. Distinguish entries, additions, exits, and reversals.
+- Group a symbol's same-direction position until it closes into one entry episode.
+- Link a reversal to the old episode's exit and the new opposite episode's entry.
+- Allocate closing quantities to open entry lots in proportion to remaining quantities.
+- Mark open lots using the ledger's valuation at the snapshot cutoff.
+- Proportional attribution matches average-cost accounting; it is not FIFO accounting.
+- Fill realized profit and entry-attributed realized profit describe the same profit. Do not sum them.
+- Separate fees and currency effects from local price direction. A price rise need not be profitable.
 
-## 판단 자료와 계획 변경
+## Decisions and plan changes
 
-실행 사건 키로 AI 매매 지시와 실제 체결을 연결한다. 체결되지 않은 지시는 별도 기록한다.
-자동 청산은 진입 계획과 계획 변경 사건을 시각 순으로 적용해 당시 유효한 가격을 사용한다.
-후보 등록 자료는 AI 호출 직전의 전체 입력 원문과 동일하다고 가정하지 않는다.
-원래 판단 문장과 실제 체결 기록을 분리해서 보존한다.
+Use execution event keys to connect AI instructions with recorded fills.
+Record unexecuted instructions separately. Apply entry plans and later plan changes in time order
+when reviewing automatic exits. Candidate records are not necessarily the complete prompt sent
+to AI. Preserve the original decision text separately from the execution record.
 
-손절선과 체결가의 차이는 같은 수량으로 계산한 가정 비교다.
-다른 전략을 썼을 때의 실제 손실 절감액이나 놓친 수익으로 단정하지 않는다.
-미청산 평가손익과 확정 손익을 구분하고, 미청산 회차를 청산 승률에서 제외한다.
+The difference between a stop line and a fill is a same-quantity counterfactual comparison,
+not a verified loss saving or missed profit under a different strategy.
+Keep unrealized and realized results separate. Exclude open episodes from closed-trade win rates.
 
-## 검증과 보관
+## Verification and storage
 
-모든 체결 번호가 한 번씩 포함됐는지 확인한다.
-재계산한 현금·수량·순자산·체결 손익·진입분 배분 손익을 원본과 대조한다.
-달러 손익 차이가 `0.000000001`을 넘으면 오류를 내고 결과를 맞추기 위한 금액을 추가하지 않는다.
-미집계 AI 토큰을 0으로 추정하지 않는다.
+Check that every fill ID occurs once. Reconcile cash, quantities, equity, fill profit, and
+entry-attributed profit with the source. Raise an error if the USD difference exceeds
+`0.000000001`; do not add a balancing adjustment. Unknown AI usage is not zero usage.
 
-실제 장부·스냅샷·검토 결과는 Git에서 제외된 `state/reviews/`에 보관한다.
-저장소에는 분석 코드·합성 자료 검사·방법만 커밋한다.
+Keep ledgers, snapshots, and review output under ignored `state/reviews/`.
+Commit only the analyzer, synthetic tests, and methodology.
