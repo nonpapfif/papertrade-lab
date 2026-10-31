@@ -171,6 +171,27 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(self.job()["status"], "failed")
         self.assertEqual(self.job()["bars"], 0)
 
+    def test_outside_day_zero_bar_does_not_reject_valid_target_bar(self) -> None:
+        older = candle("2025-06-06T05:01:00Z", "0")
+        for field in ("openPrice", "highPrice", "lowPrice", "volume"):
+            older[field] = "0"
+        page = self.page([candle("2026-10-30T13:01:00Z"), older], None)
+        self.save(page)
+        self.assertEqual((self.job()["status"], self.job()["bars"]), ("done", 1))
+        row = self.downloader.db.execute("SELECT result_gzip FROM pages").fetchone()
+        self.assertEqual(json.loads(gzip.decompress(row[0])), page)
+
+    def test_only_outside_day_zero_bars_is_no_data(self) -> None:
+        older = candle("2025-06-06T05:01:00Z", "0")
+        for field in ("openPrice", "highPrice", "lowPrice", "volume"):
+            older[field] = "0"
+        self.save(self.page([older], None))
+        self.assertEqual((self.job()["status"], self.job()["bars"]), ("no_data", 0))
+
+    def test_zero_bar_inside_target_day_is_still_rejected(self) -> None:
+        self.save(self.page([candle("2026-10-30T13:01:00Z", "0")], None))
+        self.assertEqual((self.job()["status"], self.job()["bars"]), ("failed", 0))
+
     def test_database_failure_rolls_back_page_and_cursor_together(self) -> None:
         self.downloader.db.execute(
             "CREATE TRIGGER fail_second BEFORE INSERT ON candles "
