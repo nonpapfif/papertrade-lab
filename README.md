@@ -78,4 +78,8 @@ python3 -m papertrade simulate TEST -0.25 100 --market US --reason "Explicit sho
 키와 인증 헤더는 로그나 AI 입력에 넣지 않는다. AI 출력은 명령으로 실행하지 않는다.
 [토스 공식 시세 명세](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)를 사용한다.
 
+하루치 시세를 별도로 저장하는 명령과 저장 형식은
+[분봉 수집 문서](docs/market-day-download.md)에 정리했다.
+`python3 -m tools.download_market_day --date 2026-10-30 --status`로 수집 진행률을 확인한다.
+
 이전 실험 설명은 `docs/history/README-v2.md`, 이전 설정은 `tests/fixtures/v2/settings.toml`에 보존했다.
