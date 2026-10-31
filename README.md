@@ -82,4 +82,7 @@ python3 -m papertrade simulate TEST -0.25 100 --market US --reason "Explicit sho
 [분봉 수집 문서](docs/market-day-download.md)에 정리했다.
 `python3 -m tools.download_market_day --date 2026-10-30 --status`로 수집 진행률을 확인한다.
 
+저장한 하루를 고립된 계산기로 재생하는 방법은
+[5분 예측·AI 호출 후보 비교](docs/five-minute-replay.md)를 참고한다.
+
 이전 실험 설명은 `docs/history/README-v2.md`, 이전 설정은 `tests/fixtures/v2/settings.toml`에 보존했다.
