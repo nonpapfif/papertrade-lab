@@ -49,6 +49,7 @@ No offline command starts the continuous trading workers.
 |---|---|
 | [Market-day download](docs/market-day-download.md) | Coverage, pacing, checkpoints, raw data, and errors |
 | [Reverse monthly collection](docs/month-download.md) | Shared-rate parallel downloads, descending dates, and independent holidays |
+| [Event-source archive](docs/event-sources.md) | Macro/earnings schedules, numerical results and source provenance |
 | [Five-minute replay](docs/five-minute-replay.md) | Isolated predictors and planned AI-call measurement |
 | [Upward-candle search](docs/up-candle-search.md) | Fixed rule grid and chronological selection |
 | [Portfolio return search](docs/portfolio-search.md) | Diverse virtual accounts, return rankings, and trade evidence |
