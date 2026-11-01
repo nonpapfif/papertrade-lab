@@ -52,6 +52,7 @@ No offline command starts the continuous trading workers.
 | [Event-source archive](docs/event-sources.md) | Macro/earnings schedules, numerical results and source provenance |
 | [Five-minute replay](docs/five-minute-replay.md) | Isolated predictors and planned AI-call measurement |
 | [Upward-candle search](docs/up-candle-search.md) | Fixed rule grid and chronological selection |
+| [Weekly hypothesis experiment](docs/week-hypotheses.md) | Parallel fixed, cold-start and cumulative selectors over October 26-30 |
 | [Portfolio return search](docs/portfolio-search.md) | Diverse virtual accounts, return rankings, and trade evidence |
 | [Round review](docs/round-review.md) | Trade attribution and ledger reconciliation |
 | [Error audit](ERROR_AUDIT.md) | Technical recovery history and diagnostic commands |
