@@ -85,7 +85,13 @@ class RateGate:
             limit = float(headers.get("X-RateLimit-Limit") or 0)
             if math.isfinite(limit) and limit > 0:
                 self.intervals[group] = max(self.intervals.get(group, 0), 2 / limit)
-            if record.get("status") in (401, 403):
+            refreshing = (
+                record.get("status") == 401
+                and record.get("method") == "GET"
+                and record.get("attempt") == 1
+                and record.get("code") in ("token-revoked", "expired-token", "invalid-token")
+            )
+            if record.get("status") in (401, 403) and not refreshing:
                 self.blocked = f"Access rejected with HTTP {record['status']}"
             if record.get("status") == 429:
                 self.intervals[group] = self.interval(group) * 2

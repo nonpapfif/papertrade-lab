@@ -283,9 +283,9 @@ class MarketClient:
         )
         for attempt in range(2):
             headers = {"Accept": "application/json", "Accept-Encoding": "gzip"}
+            self._reserve(group)
             if method == "GET":
                 headers["Authorization"] = "Bearer " + self.access_token()
-            self._reserve(group)
             query = "?" + urllib.parse.urlencode(parameters) if parameters else ""
             body = urllib.parse.urlencode(form).encode() if form is not None else None
             if body is not None:
@@ -429,8 +429,6 @@ class MarketClient:
         return locked()
 
     def access_token(self) -> str:
-        if self.token and self.expires_at > time.time() + 120:
-            return self.token
         with self._token_lock():
             directory = self.settings.secrets_dir
             client_id = secret_file(directory / "TOSS_CLIENT_ID")
