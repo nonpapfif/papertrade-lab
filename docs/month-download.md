@@ -53,12 +53,19 @@ remain stopped; this in-process limiter does not coordinate unrelated programs.
 - HTTP 429 globally pauses the affected group for at least 60 seconds or the server's longer
   cooldown and doubles its interval. Persist the slowdown and cooldown across restarts.
 - Transport/5xx failures retain the same symbol cursor and wait at least 15 seconds.
-- HTTP 401/403 stops new dispatches. Do not repeatedly retry rejected access.
+- The first GET 401 for a revoked, expired, or invalid token permits the client's existing single
+  authentication retry. A second 401, any other 401, or a 403 stops new dispatches.
 - Unexpected client rejections stop for inspection. Symbol-level 404/unavailable responses remain
   visible as unavailable coverage.
 - Invalid raw pages remain in the audit as failures. They are not marked as valid bars.
 - `--resume-blocked` is required after inspecting and resolving a blocked job.
 - SIGTERM/Ctrl-C cancels waiting workers, drains request audits, and preserves committed cursors.
+
+Each request reads the shared token cache under the existing file lock after waiting for its
+dispatch slot. Workers therefore pick up another worker's refreshed token instead of continuing
+to trust their own in-memory copy. Token issuance remains serialized by that lock. In-flight
+requests can still encounter revocation during a refresh; their one authentication retry adopts
+the latest cache without deleting a replacement written by another worker.
 
 At most one page per symbol is in flight. Page persistence rechecks its cursor, then reuses the
 existing atomic raw-page, normalized-bar, and continuation-cursor transaction. An interruption
