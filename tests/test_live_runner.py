@@ -73,7 +73,7 @@ class LiveRunnerTests(unittest.TestCase):
                         self.assertFalse(engine.shadows[0].positions)
                         self.assertEqual(engine.states[0]["book"].cash, 100)
                         self.assertFalse(engine.states[0]["book"].trades)
-                    feed.orderbooks.assert_not_called()
+                    feed.orderbook_batch.assert_not_called()
                     feed.fx.assert_not_called()
                 return [
                     {
@@ -97,6 +97,7 @@ class LiveRunnerTests(unittest.TestCase):
 
             feed.snapshot.side_effect = snapshot
             feed.orderbooks.side_effect = orderbooks
+            feed.orderbook_batch.side_effect = orderbooks
             with (
                 patch("tools.run_live_parallel.LiveFeed", return_value=feed),
                 patch("tools.run_live_parallel.datetime", FrozenDateTime),
@@ -266,6 +267,9 @@ class LiveRunnerTests(unittest.TestCase):
                         "bids": [{"price": price - 0.01, "volume": 100}],
                     }
                 }
+
+            def orderbook_batch(self, symbols: list[str]) -> dict:
+                return self.orderbooks(symbols)
 
         specs = signals()
         config = {**configurations(len(specs))[32400]}

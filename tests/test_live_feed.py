@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import copy
 import pickle
+import threading
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 from papertrade.api import ApiError, MarketClient
 from papertrade.core import Settings
-from tools.live_feed import LiveFeed, SnapshotHistory
+from tools.live_feed import LiveFeed, SnapshotHistory, _PacedClient
 
 
 def at(minute: int, seconds: int = 0) -> str:
@@ -26,6 +28,90 @@ def quote(minute: int, price: float = 100, symbol: str = "TEST") -> dict[str, An
 
 
 class LiveFeedTests(unittest.TestCase):
+    def test_worker_reservations_and_rate_updates_share_one_lock_and_private_transports(self) -> None:
+        active = [0]
+        maximum = [0]
+
+        def critical(*args: object) -> float:
+            active[0] += 1
+            maximum[0] = max(maximum[0], active[0])
+            time.sleep(0.01)
+            active[0] -= 1
+            return 0.0
+
+        self.client._reserve.side_effect = critical
+        self.client._rate_result.side_effect = critical
+        lock = threading.Lock()
+        first = _PacedClient(self.feed.settings, self.client, lock, lambda _: None)
+        second = _PacedClient(self.feed.settings, self.client, lock, lambda _: None)
+        threads = [
+            threading.Thread(target=first._reserve, args=("MARKET_DATA",)),
+            threading.Thread(target=second._rate_result, args=("MARKET_DATA", {}, False)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(maximum[0], 1)
+        self.assertIsNot(first.opener, second.opener)
+        first.token = "synthetic-token"
+        self.assertIsNone(second.token)
+
+    def test_parallel_books_keep_transport_private_and_sqlite_callbacks_on_main_thread(
+        self,
+    ) -> None:
+        main_thread = threading.get_ident()
+        barrier = threading.Barrier(2)
+        clients = []
+
+        class Client:
+            def __init__(
+                self, settings: object, primary: object, lock: object, audit: object
+            ) -> None:
+                self.audit = audit
+                clients.append(self)
+
+            def book(self, symbol: str) -> dict:
+                barrier.wait(timeout=3)
+                self.audit({"path": "/api/v1/orderbook", "status": 200})
+                return {"symbol": symbol, "timestamp": at(0), "currency": "USD"}
+
+        def record(kind: str, payload: dict) -> None:
+            self.assertEqual(threading.get_ident(), main_thread)
+            self.events.append((kind, payload))
+
+        self.feed.record = record
+        with patch("tools.live_feed._PacedClient", Client):
+            result = self.feed.orderbook_batch(["A", "B", "A"])
+        self.assertEqual(list(result), ["A", "B"])
+        self.assertEqual(len(clients), 2)
+        self.assertTrue(all("received_at" in row for row in result.values()))
+        self.assertEqual(sum(k == "http" for k, _ in self.events), 2)
+        self.assertEqual(sum(k == "orderbook" for k, _ in self.events), 2)
+
+    def test_parallel_batch_cancels_pending_work_on_provider_rate_rejection(self) -> None:
+        calls = []
+
+        class Client:
+            def __init__(self, *args: object) -> None:
+                pass
+
+            def book(self, symbol: str) -> dict:
+                calls.append(symbol)
+                if symbol == "A":
+                    raise ApiError("Provider limit", status=429, code="rate-limit", retry_at=123)
+                time.sleep(0.1)
+                return {"symbol": symbol}
+
+        symbols = ["A", *[f"B{i}" for i in range(63)]]
+        with patch("tools.live_feed._PacedClient", Client):
+            result = self.feed.orderbook_batch(symbols)
+        self.assertEqual(len(result), len(symbols))
+        self.assertLess(len(calls), len(symbols))
+        self.assertTrue(
+            any(isinstance(r, ApiError) and r.code == "batch_cancelled" for r in result.values())
+        )
+
     def setUp(self) -> None:
         self.client = Mock(spec=MarketClient)
         self.events: list[tuple[str, dict[str, Any]]] = []

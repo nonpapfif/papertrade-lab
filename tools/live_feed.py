@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections import deque
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
+from queue import SimpleQueue
 from typing import Any
 
 from papertrade.api import SYMBOL, ApiError, MarketClient
@@ -17,6 +20,22 @@ LOOKBACKS = (5, 10, 15, 30, 60)
 MAX_AGE_SECONDS = 90
 
 
+class _PacedClient(MarketClient):
+    """Keep transport/token state private while sharing one provider rate controller."""
+
+    def __init__(self, settings: Settings, primary: MarketClient, lock: Any, audit: Any) -> None:
+        super().__init__(settings, audit=audit)
+        self.primary, self.rate_lock = primary, lock
+
+    def _reserve(self, group: str) -> None:
+        with self.rate_lock:
+            self.primary._reserve(group)
+
+    def _rate_result(self, group: str, headers: Any, failed: bool) -> float:
+        with self.rate_lock:
+            return self.primary._rate_result(group, headers, failed)
+
+
 class LiveFeed:
     """Use only current market data; rate limits remain owned by MarketClient."""
 
@@ -24,6 +43,8 @@ class LiveFeed:
         self, settings: Settings, record: Record, *, client: MarketClient | None = None
     ) -> None:
         self.record = record
+        self.settings = settings
+        self.rate_lock = threading.Lock()
         self.client = client or MarketClient(settings)
         self.client.audit = lambda event: self.record("http", event)
         self.symbols: list[str] | None = None
@@ -76,6 +97,62 @@ class LiveFeed:
             self.record("orderbook", {"symbol": symbol, "result": book})
             result[symbol] = book
         return result
+
+    def orderbook_batch(self, symbols: list[str]) -> dict[str, dict[str, Any] | ApiError]:
+        symbols = list(dict.fromkeys(symbols))
+        events: SimpleQueue[tuple[str, dict[str, Any]]] = SimpleQueue()
+        results: dict[str, dict[str, Any] | ApiError] = {}
+        stopped: ApiError | None = None
+
+        def drain() -> None:
+            while not events.empty():
+                kind, payload = events.get()
+                self.record(kind, payload)
+
+        def fetch(symbol: str) -> dict[str, Any] | ApiError:
+            client = _PacedClient(
+                self.settings,
+                self.client,
+                self.rate_lock,
+                lambda event: events.put(("http", event)),
+            )
+            try:
+                book = client.book(symbol)
+            except ApiError as error:
+                return error
+            received = datetime.now(UTC).isoformat()
+            events.put(("orderbook", {"symbol": symbol, "result": book, "received_at": received}))
+            return {**book, "received_at": received}
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(fetch, symbol): symbol for symbol in symbols}
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        result = future.result()
+                    except CancelledError:
+                        if stopped is None:
+                            raise
+                        result = ApiError(
+                            "Quote batch stopped by provider limits",
+                            code="batch_cancelled",
+                            status=stopped.status,
+                            retry_at=stopped.retry_at,
+                        )
+                    results[symbol] = result
+                    drain()
+                    if (
+                        stopped is None
+                        and isinstance(result, ApiError)
+                        and (result.status in (401, 403, 429) or result.code == "cooldown")
+                    ):
+                        stopped = result
+                        for pending in futures:
+                            pending.cancel()
+        finally:
+            drain()
+        return {symbol: results[symbol] for symbol in symbols}
 
     def fx(self) -> dict[str, Any]:
         result = self.client.get("/api/v1/exchange-rate", baseCurrency="USD", quoteCurrency="KRW")
