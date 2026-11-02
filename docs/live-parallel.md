@@ -6,22 +6,19 @@ continuous workers, call AI, or request real account or order endpoints.
 ```zsh
 python3 -m tools.run_live_parallel \
   --date 2026-11-02 --capital 100 --prior-realized-krw 0 \
-  --output state/live/2026-11-02-us-parallel-v1
+  --trade-from-regular --output state/live/2026-11-02-us-parallel-v3
 python3 -m tools.run_live_parallel \
-  --output state/live/2026-11-02-us-parallel-v1 --status
+  --output state/live/2026-11-02-us-parallel-v3 --status
 ```
 
 ## Comparison design
 
-The 59 policies each receive an independent virtual USD 100 in two execution models:
+The 59 policies each receive an independent virtual USD 100 in one quote-based execution model.
+The ideal last-price, zero-fee comparison is excluded from live runs. Its implementation remains
+available only for historical module tests.
 
-| Model | Actual account execution | Shadow learning execution |
-|---|---|---|
-| `last` | Observed last price; zero trading fees | Last price; zero trading fees |
-| `quotes` | Observed ask/bid depth; trading fees | Last price plus the same fee schedule |
-
-The 118 books use long positions, integer shares and cash-funded purchases. Policy selectors
-compare 2,178 configurations. They include momentum, mean reversion, sampled breakout,
+The 59 evaluation books use long positions, integer shares and cash-funded purchases.
+Policy selectors compare 2,178 configurations. They include momentum, mean reversion, sampled breakout,
 deviation and acceleration signals, multiple lookbacks, exits, sizing and session settings.
 Each policy owns its cash and positions. Visible depth is consumed within one account and
 observation; separate research accounts independently reuse the same depth. This does not
@@ -45,16 +42,35 @@ can enter a lookback. Price quotes older than 90 seconds are quarantined; gaps l
 four volume-only policies are excluded. Sampled highs and noise differ from historical
 candle features. Do not compare live and historical returns as identical input experiments.
 
-Actual quote accounts request depth only for needed candidates and held symbols. Quotes
-must be USD, no more than 60 seconds old and no later than the decision time. Purchases use
-fee-inclusive affordable quantities and ask depth. Exits need enough bid depth for the whole
-position; missing depth leaves the position open. Stops, targets and trailing checks use the
-executable bid, including held symbols whose last trade is stale. The initial affordability
-screen still uses the last price. There are no resting broker orders or intracheck target fills.
+Actual quote accounts request depth only for needed candidates and held symbols. Initial quotes
+must be USD, no more than 60 seconds old and no later than the decision time. The initial best
+ask sets a buy limit; the initial best bid sets a sell limit. After an assumed minimum latency
+of one second, the runner requests another quote. Both its receipt and its provider update must
+follow the decision. The one-second floor is a scenario assumption, not measured Toss latency.
+
+The local immediate-or-cancel model uses only the second quote's visible quantity within the
+initial limit. A worse price, absent update, invalid quote or missing depth leaves the request
+unfilled. Reduced depth can fill part of an entry or exit. Only filled shares change cash,
+fees, tax basis and positions. Remaining requested shares are canceled; no resting order is
+queued. Unsold holdings remain in the account for the next check. Partial exits allocate entry
+fees and KRW basis proportionally; a position counts as closed/won only after its final exit.
+Attempts record requested, filled and unfilled quantities separately from trades.
+
+Stops, targets and trailing checks use the initial bid, including held symbols whose last
+trade is stale. The initial affordability screen still uses the last price. There are no real
+order requests or intracheck target fills. IOC describes the local model, not verified broker
+order-type availability.
+
+These are conditional fill estimates, not actual execution confirmations. Two public quote
+snapshots cannot reconstruct queue priority, intervening cancellations, hidden liquidity,
+market impact, broker rejections or venue routing. No calibrated fill probability is claimed.
+See [SEC execution guidance](https://www.investor.gov/introduction-investing/investing-basics/how-stock-markets-work/executing-order)
+and [Alpaca's simulator limitations](https://docs.alpaca.markets/us/docs/paper-trading).
 
 Shadow learning uses the declared last-price fee proxy to avoid requesting depth for every
-configuration. It does not learn executable spreads. Raw observations and frozen source hashes
-make that distinction auditable. Rankings use current and prior received data, never a later
+configuration. These selector scores are approximations, not reported realizable profits. This
+remaining learning proxy does not model executable spreads or failed fills. Raw observations
+and frozen source hashes make that distinction auditable. Rankings use current and prior received data, never a later
 frame or end-of-session winner.
 
 ## Commissions and annual tax estimates
@@ -109,8 +125,8 @@ Artifacts remain under the ignored output directory:
 |---|---|
 | `manifest.json` | Universe, policies, capital, costs, assumptions, source hashes and sessions |
 | `live.sqlite3` | Compressed raw responses, HTTP audits, coverage, causal frames and checkpoint |
-| `comparison.csv` | Per-policy scalar results, costs, tax reserves and behavior groups |
-| `last-report.json.gz`, `quotes-report.json.gz` | Full trades, choices, positions and equity curves |
+| `comparison.csv` | Per-policy results; `evaluation_equity_usd` uses estimated after-tax bid liquidation and is unknown without full depth/FX coverage |
+| `quotes-report.json.gz` | Full attempts, partial fills, trades, choices, positions and equity curves |
 | `status.json` | Process state, progress, session end and zero AI-call count |
 
 Frames and account checkpoints commit in one SQLite transaction. A directory lock prevents

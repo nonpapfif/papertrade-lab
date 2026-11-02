@@ -92,6 +92,92 @@ class ExecutionBook(Book):
         self.depth_at: str | None = None
         self.depth_used: dict[tuple[int, str], int] = {}
         self.closed_net_usd = 0.0
+        self.order_attempts: list[dict[str, Any]] = []
+        self.position_net_usd: dict[int, float] = {}
+        self.entry_requested: dict[int, int] = {}
+
+    def _entry_intent_quantity(self, symbol: int, budget: float) -> int:
+        if self.training_proxy or self.context.probing:
+            return 0
+        initial = self.context.frame.get("decision_orderbooks", {}).get(symbol)
+        if initial is None:
+            return 0
+        try:
+            price = min(float(row["price"]) for row in initial["asks"] if float(row["volume"]) >= 1)
+            if not math.isfinite(price) or price <= 0:
+                return 0
+        except (KeyError, TypeError, ValueError):
+            return 0
+        budget = max(0.0, min(budget, self.cash))
+        low, high = 0, math.floor(budget / price)
+        while low < high:
+            quantity = (low + high + 1) // 2
+            cost = (
+                quantity * price
+                + transaction_fees(quantity * price, quantity, "BUY", self.context.schedule)[
+                    "total_usd"
+                ]
+            )
+            if cost <= budget:
+                low = quantity
+            else:
+                high = quantity - 1
+        return low
+
+    def _attempt(self, symbol: int, side: str, requested: int, filled: int) -> None:
+        if self.context.probing or not self.detailed:
+            return
+        self.order_attempts.append(
+            {
+                "symbol_id": symbol,
+                "side": side,
+                "requested_quantity": requested,
+                "filled_quantity": filled,
+                "unfilled_quantity": requested - filled,
+                "status": "filled" if requested == filled else "partial" if filled else "unfilled",
+                "at": self.context.frame["at"],
+                "decision_at": self.context.frame.get("decision_at"),
+                "fill_evidence": "conditional_quote_model_not_broker_confirmation",
+            }
+        )
+
+    def _confirmation_levels(
+        self, symbol: int, side: str, levels: list[tuple[float, int]], source: str
+    ) -> list[tuple[float, int]]:
+        frame = self.context.frame
+        delay = self.context.schedule.get("confirmation_delay_seconds", 0)
+        if not delay or self.context.probing or self.training_proxy:
+            return levels
+        try:
+            decision = datetime.fromisoformat(frame["decision_at"])
+            received = datetime.fromisoformat(frame["confirmation_received_at"][symbol])
+            if (received - decision).total_seconds() < delay:
+                raise ValueError("Confirmation arrived before the latency floor")
+            if not decision < datetime.fromisoformat(source) <= received:
+                raise ValueError("No post-decision quote update")
+            initial = frame["decision_orderbooks"][symbol]
+            age = (decision - datetime.fromisoformat(initial["timestamp"])).total_seconds()
+            if initial.get("currency") != "USD" or not 0 <= age <= 60:
+                raise ValueError("Invalid initial quote")
+            values = [
+                float(row["price"])
+                for row in initial["asks" if side == "BUY" else "bids"]
+                if float(row["volume"]) >= 1
+            ]
+            if not values or any(not math.isfinite(p) or p <= 0 for p in values):
+                raise ValueError("Invalid initial depth")
+            limit = min(values) if side == "BUY" else max(values)
+        except (KeyError, TypeError, ValueError):
+            self._failure("confirmation_unavailable")
+            return []
+        eligible = (
+            [(p, v) for p, v in levels if p <= limit]
+            if side == "BUY"
+            else [(p, v) for p, v in levels if p >= limit]
+        )
+        if not eligible:
+            self._failure("price_moved_beyond_limit")
+        return eligible
 
     def _failure(self, reason: str) -> None:
         if not self.context.probing:
@@ -128,7 +214,12 @@ class ExecutionBook(Book):
             try:
                 source = snapshot["timestamp"]
                 age = (datetime.fromisoformat(at) - datetime.fromisoformat(source)).total_seconds()
-                if age < 0:
+                received = frame.get("confirmation_received_at", {}).get(symbol)
+                if (
+                    age < 0
+                    or received is not None
+                    and datetime.fromisoformat(source) > datetime.fromisoformat(received)
+                ):
                     reason = "quote_future"
                 elif age > self.context.schedule["max_quote_age_seconds"]:
                     reason = "quote_stale"
@@ -146,7 +237,12 @@ class ExecutionBook(Book):
                             levels.append((price, math.floor(volume)))
                     levels.sort(reverse=side == "SELL")
                     if levels:
-                        return levels, source
+                        confirmed = (
+                            self._confirmation_levels(symbol, side, levels, source)
+                            if record_failure
+                            else levels
+                        )
+                        return (confirmed, source) if confirmed else None
                     reason = "quote_empty_depth"
             except (KeyError, TypeError, ValueError, OverflowError):
                 reason = "quote_invalid"
@@ -205,6 +301,12 @@ class ExecutionBook(Book):
         )
         budget = max(0.0, min(amount, self.cash))
         low, high = 0, min(available, math.floor(budget / levels[0][0]))
+        if (
+            self.context.frame.get("decision_orderbooks")
+            and not self.context.probing
+            and not self.training_proxy
+        ):
+            high = min(high, self._entry_intent_quantity(symbol, budget))
         while low < high:
             quantity = (low + high + 1) // 2
             execution = self._execution(symbol, "BUY", quantity, last)
@@ -240,6 +342,10 @@ class ExecutionBook(Book):
                     break
                 if self._quote(row[0], "BUY", prices[row[0]]) is not None:
                     selected.append(row)
+                else:
+                    requested = self._entry_intent_quantity(row[0], min(slot_budget, available))
+                    if requested:
+                        self._attempt(row[0], "BUY", requested, 0)
             if not selected:
                 return []
             spend = min(available, slot_budget * len(selected))
@@ -255,6 +361,11 @@ class ExecutionBook(Book):
             for row, weight in zip(selected, weights, strict=True):
                 amount = min(spend * weight / total, remaining_cash)
                 quantity = self._buy_quantity(row[0], amount, prices[row[0]])
+                requested = self._entry_intent_quantity(row[0], amount)
+                if requested:
+                    self.entry_requested[row[0]] = requested
+                    if not quantity:
+                        self._attempt(row[0], "BUY", requested, 0)
                 if quantity:
                     execution = self._execution(row[0], "BUY", quantity, prices[row[0]])
                     if execution is None:
@@ -310,24 +421,56 @@ class ExecutionBook(Book):
         if not math.isfinite(price) or price <= 0:
             raise ValueError("Virtual live execution requires positive finite last prices")
         entry = reason == "entry"
-        count, side = abs(int(quantity)), "BUY" if entry else "SELL"
+        requested, side = abs(int(quantity)), "BUY" if entry else "SELL"
+        if (
+            entry
+            and quantity < 0
+            or not entry
+            and (
+                quantity > 0
+                or symbol not in self.positions
+                or requested > self.positions[symbol].quantity
+            )
+        ):
+            raise ValueError("Live fills cannot short or sell more than the held quantity")
+        count = requested
+        if entry:
+            requested = max(count, self.entry_requested.pop(symbol, count))
+        if not entry and self.context.schedule.get("allow_partial_exits", 0):
+            quote = self._quote(symbol, side, price)
+            available = (
+                sum(volume for _, volume in quote[0]) - self.depth_used.get((symbol, side), 0)
+                if quote is not None
+                else 0
+            )
+            count = min(count, max(0, available))
+            if not count:
+                self._attempt(symbol, side, requested, 0)
+                return
         execution = self._execution(symbol, side, count, price)
         if execution is None:
             if entry:
                 raise RuntimeError("A virtual entry must be planned against executable depth")
+            self._attempt(symbol, side, requested, 0)
             return
         actual_price, fees, source = execution
         if entry and count * actual_price + fees["total_usd"] > self.cash:
             raise ValueError("Fee-inclusive virtual entry exceeds available cash")
-        gross_pnl = (
-            None
-            if entry
-            else self.positions[symbol].quantity * (actual_price - self.positions[symbol].entry)
-        )
-        entry_fee = 0.0 if entry else self.entry_fees.pop(symbol, 0.0)
-        entry_basis = None if entry else self.entry_cost_krw.pop(symbol, None)
+        original = None if entry else copy.copy(self.positions[symbol])
+        full_count = count if original is None else int(original.quantity)
+        gross_pnl = None if entry else count * (actual_price - self.positions[symbol].entry)
+        entry_fee = 0.0 if entry else self.entry_fees.get(symbol, 0.0) * count / full_count
+        basis = self.entry_cost_krw.get(symbol)
+        entry_basis = basis * count / full_count if not entry and basis is not None else None
         fx = self._current_fx()
-        super().fill(symbol, quantity, actual_price, at, tick, reason, strength)
+        if original is not None:
+            self.positions[symbol].quantity = count
+        super().fill(symbol, count if entry else -count, actual_price, at, tick, reason, strength)
+        if original is not None and count < full_count:
+            original.quantity -= count
+            self.positions[symbol] = original
+            self.cooldowns.pop(symbol, None)
+            self.closed -= 1
         self.cash -= fees["total_usd"]
         self.realized -= fees["total_usd"]
         for key, value in fees.items():
@@ -337,10 +480,22 @@ class ExecutionBook(Book):
             self.entry_cost_krw[symbol] = (
                 (count * actual_price + fees["total_usd"]) * fx if fx is not None else None
             )
+            self.position_net_usd[symbol] = 0.0
         else:
             assert gross_pnl is not None
             net_pnl = gross_pnl - entry_fee - fees["total_usd"]
-            self.wins += int(net_pnl > 0) - int(gross_pnl > 0)
+            cumulative = self.position_net_usd.get(symbol, 0.0) + net_pnl
+            self.wins += int(count == full_count and cumulative > 0) - int(gross_pnl > 0)
+            if count == full_count:
+                self.entry_fees.pop(symbol, None)
+                self.entry_cost_krw.pop(symbol, None)
+                self.position_net_usd.pop(symbol, None)
+            else:
+                self.entry_fees[symbol] -= entry_fee
+                self.entry_cost_krw[symbol] = (
+                    basis - entry_basis if basis is not None and entry_basis is not None else None
+                )
+                self.position_net_usd[symbol] = cumulative
             self.closed_net_usd += net_pnl
             self._record_tax(
                 (count * actual_price - fees["total_usd"]) * fx - entry_basis
@@ -348,6 +503,7 @@ class ExecutionBook(Book):
                 else None
             )
         self.depth_used[(symbol, side)] = self.depth_used.get((symbol, side), 0) + count
+        self._attempt(symbol, side, requested, count)
         if self.detailed:
             trade = self.trades[-1]
             trade.update(
@@ -364,6 +520,7 @@ class ExecutionBook(Book):
                 realized_pnl=None if entry else net_pnl,
                 observed_fx_krw_per_usd=fx,
                 entry_cost_basis_krw=self.entry_cost_krw[symbol] if entry else entry_basis,
+                position_closed=not entry and count == full_count,
             )
 
     def summary(self, prices: dict[int, float], times: dict[int, str], at: str) -> dict[str, Any]:
@@ -437,6 +594,9 @@ class ExecutionBook(Book):
             if bid_equity is not None and projected_reserve is not None and fx is not None
             else None,
             capital_tax_cash_deducted_usd=0.0,
+            order_attempts=len(self.order_attempts),
+            unfilled_orders=sum(row["status"] == "unfilled" for row in self.order_attempts),
+            partial_orders=sum(row["status"] == "partial" for row in self.order_attempts),
             tax_basis="Annual KRW sale proceeds net of exit fees at observed exit FX, minus "
             "purchase cost including entry fees at observed entry FX. Trade-time estimate "
             "only, not legal settlement FX or a per-trade cash withdrawal.",
@@ -512,11 +672,33 @@ class LiveWeekEngine(WeekEngine):
             for symbol, owner in owners.items():
                 if owner != identifier or symbol not in book.positions:
                     continue
-                execution = book._execution(
-                    symbol, "SELL", int(book.positions[symbol].quantity), self.prices[symbol]
-                )
-                if execution is not None:
-                    executable[symbol] = execution[0]
+                initial = frame.get("decision_orderbooks", {}).get(symbol)
+                if initial is None and self.execution.schedule.get("allow_partial_exits", 0):
+                    initial = frame.get("orderbooks", {}).get(symbol)
+                if initial is not None:
+                    try:
+                        age = (
+                            datetime.fromisoformat(frame.get("decision_at", frame["at"]))
+                            - datetime.fromisoformat(initial["timestamp"])
+                        ).total_seconds()
+                        bids = [
+                            float(r["price"]) for r in initial["bids"] if float(r["volume"]) >= 1
+                        ]
+                        if (
+                            initial.get("currency") == "USD"
+                            and 0 <= age <= 60
+                            and bids
+                            and all(math.isfinite(p) and p > 0 for p in bids)
+                        ):
+                            executable[symbol] = max(bids)
+                    except (KeyError, TypeError, ValueError):
+                        book._failure("decision_quote_invalid")
+                else:
+                    execution = book._execution(
+                        symbol, "SELL", int(book.positions[symbol].quantity), self.prices[symbol]
+                    )
+                    if execution is not None:
+                        executable[symbol] = execution[0]
             if not executable:
                 continue
             config = self.config_by_id[identifier]
@@ -575,18 +757,29 @@ class LiveWeekEngine(WeekEngine):
         )
         result["depth_assumption"] = (
             "Each virtual account independently uses the supplied visible depth; consumed "
-            "depth is shared within that account and frame. Partial exits are not fabricated. "
+            "depth is shared within that account and frame. Active live IOC estimates "
+            "require a post-decision quote update after a one-second assumed latency floor. "
+            "The initial best ask/bid sets a limit. Available confirmed depth can fill only "
+            "part of a request; the remainder is canceled, not queued. These are conditional "
+            "fill estimates, not broker-confirmed executions or calibrated fill probabilities. "
             "Missing, stale, future or non-USD books cannot execute actual trades. "
             "Last-price affordability screens define eligibility before requesting depth."
         )
         result["exit_decision_basis"] = (
-            "Whole-position executable bid depth for stops, targets, trailing and exits, "
+            "Initial best bid for confirmed live decisions; legacy books use executable depth, "
             "including held symbols whose last trade is stale. Entry eligibility retains "
             "the fresh last-price feature screen."
             if self.execution.mode == "quotes"
             else "Observed fresh last prices."
         )
+        result["realism_limits"] = (
+            "Queue priority, hidden liquidity, market impact, broker rejection and routing "
+            "are unobserved. Selector shadow scores retain the declared last-price fee proxy "
+            "and are not reported as executable profits."
+        )
         for hypothesis in result["hypotheses"]:
+            state = next(s for s in self.states if s["policy"]["id"] == hypothesis["id"])
+            hypothesis["order_attempts"] = list(state["book"].order_attempts)
             if hypothesis["policy"].get("reset_daily") and hypothesis["daily"]:
                 for key in (
                     "fees_usd",

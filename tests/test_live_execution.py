@@ -14,6 +14,7 @@ from tools.live_execution import (
     LiveWeekEngine,
     transaction_fees,
 )
+from tools.run_live_parallel import live_design
 from tools.run_week_experiment import long_policies
 from tools.search_portfolios import configurations, signals
 
@@ -80,6 +81,156 @@ def book(mode: str = "quotes", capital: float = 100) -> ExecutionBook:
 
 
 class LiveExecutionTests(unittest.TestCase):
+    def test_full_live_cohort_reconciles_with_confirmed_partial_exits(self) -> None:
+        configs, specs, policies = live_design()
+        target = LiveWeekEngine(
+            configs,
+            specs,
+            policies,
+            mode="quotes",
+            fee_schedule={"confirmation_delay_seconds": 1, "allow_partial_exits": 1},
+        )
+        target.day_start(DAY, scope())
+        for minute, bid, volume in ((0, 10, 100), (5, 9, 2), (10, 9, 100)):
+            sample = book()
+            self.confirmed(sample, minute, bid=bid, initial_bid=bid, volume=volume)
+            incoming = sample.context.frame
+            incoming["marks"] = {0: [10, incoming["at"]]}
+            incoming["ranks"] = [[[], [[0, 1, 0.01]]] for _ in specs]
+            target.step(incoming)
+            result = target.report()
+            self.assertEqual(len(result["hypotheses"]), 59)
+            self.assertTrue(all(row["summary"]["cash"] >= 0 for row in result["hypotheses"]))
+        self.assertTrue(any(row["summary"]["partial_orders"] for row in result["hypotheses"]))
+
+    def confirmed(
+        self,
+        target: ExecutionBook,
+        minute: int = 0,
+        *,
+        ask: float = 10,
+        bid: float = 10,
+        initial_ask: float = 10,
+        initial_bid: float = 10,
+        volume: int = 100,
+        delay: float = 1.1,
+    ) -> None:
+        target.context.schedule.update(confirmation_delay_seconds=1, allow_partial_exits=1)
+        arrival = (START + timedelta(minutes=minute, seconds=delay)).isoformat()
+        snapshot = orderbook(minute, ask=ask, bid=bid, volume=volume)
+        snapshot["timestamp"] = arrival
+        target.context.frame = {
+            **frame(minute),
+            "at": arrival,
+            "decision_at": stamp(minute),
+            "decision_orderbooks": {0: orderbook(minute, ask=initial_ask, bid=initial_bid)},
+            "confirmation_received_at": {0: arrival},
+            "orderbooks": {0: snapshot},
+            "fx_at": arrival,
+        }
+
+    def test_confirmed_buy_cancels_when_ask_moves_beyond_initial_limit(self) -> None:
+        target = book()
+        self.confirmed(target, ask=11)
+        self.assertEqual(target.whole_orders([[0, 1, 1]], {0: 10}, 1, 100, 100), [])
+        self.assertEqual(target.cash, 100)
+        self.assertFalse(target.positions)
+        self.assertEqual(target.order_attempts[-1]["status"], "unfilled")
+        self.assertEqual(target.order_attempts[-1]["requested_quantity"], 9)
+        self.assertEqual(target.fee_totals["total_usd"], 0)
+
+    def test_confirmed_buy_records_partial_quantity_when_visible_depth_shrinks(self) -> None:
+        target = book()
+        self.confirmed(target, volume=2)
+        orders = target.whole_orders([[0, 1, 1]], {0: 10}, 1, 100, 100)
+        self.assertEqual(orders[0][1], 2)
+        target.fill(0, 2, 10, target.context.frame["at"], 1, "entry")
+        self.assertEqual(target.positions[0].quantity, 2)
+        self.assertAlmostEqual(target.cash, 79.98)
+        self.assertEqual(target.order_attempts[-1]["status"], "partial")
+        self.assertEqual(target.order_attempts[-1]["unfilled_quantity"], 7)
+
+    def test_confirmation_requires_latency_floor_and_a_new_provider_update(self) -> None:
+        for cause in ("too_early", "old_provider_time"):
+            with self.subTest(cause=cause):
+                target = book()
+                self.confirmed(target, delay=0.5 if cause == "too_early" else 1.1)
+                if cause == "old_provider_time":
+                    target.context.frame["orderbooks"][0]["timestamp"] = stamp(0)
+                self.assertEqual(target.whole_orders([[0, 1, 1]], {0: 10}, 1, 100, 100), [])
+                self.assertEqual(target.cash, 100)
+                self.assertFalse(target.trades)
+
+    def test_later_frame_cannot_legitimize_a_quote_from_after_its_receipt(self) -> None:
+        target = book()
+        self.confirmed(target)
+        target.context.frame["orderbooks"][0]["timestamp"] = (
+            START + timedelta(seconds=2)
+        ).isoformat()
+        target.context.frame["at"] = (START + timedelta(seconds=10)).isoformat()
+        self.assertIsNone(target._quote(0, "SELL", 10, record_failure=False))
+
+    def test_partial_exits_preserve_basis_remaining_position_and_net_position_win(self) -> None:
+        target = book()
+        self.confirmed(target)
+        target.fill(0, 9, 10, target.context.frame["at"], 1, "entry")
+        self.confirmed(target, 5, bid=11, initial_bid=11, volume=4)
+        target.fill(0, -9, 11, target.context.frame["at"], 2, "holding_period")
+        self.assertEqual(target.positions[0].quantity, 5)
+        self.assertEqual(target.closed, 0)
+        self.assertEqual(target.wins, 0)
+        self.assertAlmostEqual(target.entry_fees[0], 0.05)
+        self.assertAlmostEqual(target.entry_cost_krw[0], 75075)
+        self.assertFalse(target.trades[-1]["position_closed"])
+        summary = target.summary(
+            {0: 11}, {0: target.context.frame["at"]}, target.context.frame["at"]
+        )
+        self.assertAlmostEqual(summary["equity"], 108.856)
+        self.confirmed(target, 10, bid=9, initial_bid=9, volume=5)
+        target.fill(0, -5, 9, target.context.frame["at"], 3, "holding_period")
+        self.assertFalse(target.positions)
+        self.assertEqual(target.closed, 1)
+        self.assertEqual(target.wins, 0)
+        self.assertAlmostEqual(target.cash, 98.801)
+        self.assertAlmostEqual(target.realized, -1.199)
+        self.assertAlmostEqual(target.context.tax_realized_krw["actual"], -1.199 * 1500)
+        self.assertTrue(target.trades[-1]["position_closed"])
+        self.assertEqual(target.order_attempts[1]["status"], "partial")
+
+    def test_unfilled_exit_keeps_the_position_and_charges_no_exit_fee(self) -> None:
+        target = book()
+        self.confirmed(target)
+        target.fill(0, 9, 10, target.context.frame["at"], 1, "entry")
+        before = target.cash, target.fee_totals["total_usd"]
+        self.confirmed(target, 5, bid=8, initial_bid=9)
+        target.fill(0, -9, 9, target.context.frame["at"], 2, "stop_at_observed_check")
+        self.assertEqual((target.cash, target.fee_totals["total_usd"]), before)
+        self.assertEqual(target.positions[0].quantity, 9)
+        self.assertEqual(target.order_attempts[-1]["filled_quantity"], 0)
+
+    def test_partial_exit_win_uses_the_complete_position_not_the_last_fill(self) -> None:
+        target = book()
+        self.confirmed(target)
+        target.fill(0, 9, 10, target.context.frame["at"], 1, "entry")
+        self.confirmed(target, 5, bid=12, initial_bid=12, volume=4)
+        target.fill(0, -9, 12, target.context.frame["at"], 2, "holding_period")
+        self.confirmed(target, 10, bid=9, initial_bid=9, volume=5)
+        target.fill(0, -5, 9, target.context.frame["at"], 3, "holding_period")
+        self.assertLess(target.trades[-1]["realized_pnl"], 0)
+        self.assertEqual(target.closed, 1)
+        self.assertEqual(target.wins, 1)
+        self.assertAlmostEqual(target.cash, 102.797)
+
+    def test_partial_exit_cannot_sell_more_shares_than_the_account_holds(self) -> None:
+        target = book()
+        self.confirmed(target)
+        target.fill(0, 9, 10, target.context.frame["at"], 1, "entry")
+        before = target.cash
+        with self.assertRaisesRegex(ValueError, "sell more"):
+            target.fill(0, -10, 10, target.context.frame["at"], 2, "holding_period")
+        self.assertEqual(target.positions[0].quantity, 9)
+        self.assertEqual(target.cash, before)
+
     def test_last_fill_keeps_provider_signal_and_execution_times_separate(self) -> None:
         target = book("last")
         target.context.frame.update(
@@ -355,7 +506,7 @@ class LiveExecutionTests(unittest.TestCase):
                 [row for row in after if row[clock] <= stamp(5)],
             )
 
-    def test_current_runtime_policy_set_has_independent_last_and_quote_accounts(self) -> None:
+    def test_legacy_last_and_quote_models_remain_isolated(self) -> None:
         specs = signals()
         families = ("momentum", "reversal", "breakout", "mean_reversion", "transition")
         configs = []

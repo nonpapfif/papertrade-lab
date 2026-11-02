@@ -111,7 +111,7 @@ class LiveRunnerTests(unittest.TestCase):
             journal = Journal(output)
             frames = journal.db.execute("SELECT at,payload_gzip FROM frames").fetchall()
             self.assertEqual(len(frames), 1)
-            self.assertEqual(frames[0][0], opening.isoformat())
+            self.assertGreaterEqual(datetime.fromisoformat(frames[0][0]), opening)
             first_frame = json.loads(gzip.decompress(frames[0][1]))
             self.assertIsNotNone(first_frame["long_features"][0][1][0])
             final = journal.load()
@@ -185,7 +185,7 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual(frame["source_times"][0], frame["signal_at"])
         self.assertIn("not_exchange_OHLCV", frame["feature_basis"])
 
-    def test_full_live_runner_shares_feed_and_checkpoints_both_execution_models(self) -> None:
+    def test_full_live_runner_checkpoints_quote_only_accounts(self) -> None:
         start = datetime(2026, 11, 2, 15, tzinfo=UTC)
 
         class Clock:
@@ -284,14 +284,15 @@ class LiveRunnerTests(unittest.TestCase):
                 run(output, "2026-11-02", 100, 0, False)
             status = json.loads((output / "status.json").read_text())
             self.assertEqual(status["state"], "complete")
-            self.assertEqual(status["accounts"], 4)
+            self.assertEqual(status["accounts"], 2)
             self.assertEqual(status["ai_calls"], 0)
             self.assertGreater(status["evaluations"], 1)
             self.assertLess(Feed.instance.snapshots, 16)
             with (output / "comparison.csv").open() as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual(len(rows), 4)
-            self.assertEqual({r["mode"] for r in rows}, {"last", "quotes"})
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({r["mode"] for r in rows}, {"quotes"})
+            self.assertFalse((output / "last-report.json.gz").exists())
             self.assertTrue(all(float(r["cash"]) >= 0 for r in rows))
             journal = Journal(output)
             state = journal.load()

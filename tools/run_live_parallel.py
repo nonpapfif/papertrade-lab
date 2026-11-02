@@ -175,6 +175,10 @@ def reports(output: Path, state: dict[str, Any]) -> None:
                     "mode": mode,
                     "policy": h["id"],
                     "behavior_group": group,
+                    "evaluation_equity_usd": h["summary"].get(
+                        "after_tax_bid_liquidation_estimate_usd"
+                    ),
+                    "evaluation_basis": "conditional_after_tax_bid_liquidation_not_actual_fill",
                     **{k: v for k, v in h["summary"].items() if not isinstance(v, (list, dict))},
                 }
             )
@@ -281,6 +285,35 @@ def collect_books(
         frame["fx_at"] = now()
 
 
+def confirm_books(feed: LiveFeed, frame: dict[str, Any], symbols: list[str]) -> None:
+    frame["decision_orderbooks"] = frame["orderbooks"]
+    frame["decision_at"] = now()
+    frame["orderbooks"] = {}
+    frame["confirmation_received_at"] = {}
+    if frame["decision_orderbooks"]:
+        time.sleep(1)
+    for symbol in sorted(frame["decision_orderbooks"]):
+        try:
+            result = feed.orderbooks([symbols[symbol]])
+            book = result.get(symbols[symbol])
+            if book is not None:
+                frame["orderbooks"][symbol] = book
+                frame["confirmation_received_at"][symbol] = now()
+            else:
+                frame["orderbook_failures"][symbol] = "confirmation_empty"
+        except ApiError as error:
+            if error.status in (401, 403):
+                raise
+            frame["orderbook_failures"][symbol] = error.code
+            if error.status == 429:
+                break
+    for symbol in frame["decision_orderbooks"]:
+        if symbol not in frame["orderbooks"]:
+            frame["orderbook_failures"].setdefault(symbol, "confirmation_not_received")
+    frame["fx"] = float(feed.fx()["midRate"])
+    frame["fx_at"] = now()
+
+
 def run(
     output: Path,
     day: str,
@@ -321,6 +354,8 @@ def run(
                 state = journal.load()
                 if state is None:
                     raise ValueError("Live run has no committed checkpoint")
+                if set(state["engines"]) != {"quotes"}:
+                    raise ValueError("This live runner requires quote-only account checkpoints")
                 symbols = manifest["symbols"]
                 feed.symbols = list(symbols)
                 journal.event("resumed", last_slot=state["last_slot"])
@@ -350,6 +385,8 @@ def run(
                     "annual_realized_before_run_krw": prior_gain,
                     "max_quote_age_seconds": 60,
                     "max_fx_age_seconds": 60,
+                    "confirmation_delay_seconds": 1,
+                    "allow_partial_exits": 1,
                 }
                 manifest = {
                     "created_at": now(),
@@ -359,7 +396,8 @@ def run(
                     "scopes": scopes,
                     "policies": policies,
                     "configs": len(configs),
-                    "accounts": len(policies) * 2,
+                    "accounts": len(policies),
+                    "execution_models": ["quotes"],
                     "trade_from_regular": trade_from_regular,
                     "code_sha256": {name: digest(ROOT / name) for name in SOURCES},
                     "fee_schedule": fees,
@@ -383,10 +421,9 @@ def run(
                     "real_orders": False,
                 }
                 engines = {
-                    mode: LiveWeekEngine(
-                        configs, specs, policies, mode=mode, capital=capital, fee_schedule=fees
+                    "quotes": LiveWeekEngine(
+                        configs, specs, policies, mode="quotes", capital=capital, fee_schedule=fees
                     )
-                    for mode in ("last", "quotes")
                 }
                 for engine in engines.values():
                     engine.day_start(day, scopes)
@@ -426,6 +463,7 @@ def run(
                         frame["fx"] = float(feed.fx()["midRate"])
                         frame["fx_at"] = now()
                         collect_books(feed, state["engines"]["quotes"], frame, symbols, journal)
+                        confirm_books(feed, frame, symbols)
                         advance_frame(frame, now())
                         if datetime.fromisoformat(frame["at"]).timestamp() >= end:
                             break
