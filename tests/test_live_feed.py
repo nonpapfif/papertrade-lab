@@ -120,15 +120,17 @@ class SnapshotHistoryTests(unittest.TestCase):
         self.assertEqual([row["symbol"] for row in history.features(at(2))], ["FRESH"])
         self.assertEqual(history.features(at(3)), [])
 
-    def test_future_source_timestamp_fails_atomically_and_keeps_raw_evidence(self) -> None:
+    def test_future_source_timestamp_is_quarantined_without_stopping_other_symbols(self) -> None:
         events = []
         history = SnapshotHistory(lambda kind, payload: events.append((kind, payload)))
         history.add(at(0), [quote(0)])
         future = quote(2, symbol="FUTURE")
-        with self.assertRaisesRegex(ValueError, "exceeds"):
-            history.add(at(1), [quote(1, 105), future])
-        self.assertEqual(len(history.rows["TEST"]), 1)
-        self.assertEqual(history.last_at.isoformat(), at(0))
+        result = history.add(at(1), [quote(1, 105), future])
+        self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
+        self.assertEqual(result["issues"][0]["reason"], "future_source_time")
+        self.assertEqual(len(history.rows["TEST"]), 2)
+        self.assertEqual(history.last_at.isoformat(), at(1))
+        self.assertNotIn("FUTURE", history.rows)
         self.assertEqual(events[-1][1]["row"], future)
         with self.assertRaisesRegex(ValueError, "strictly"):
             history.add(at(0), [])

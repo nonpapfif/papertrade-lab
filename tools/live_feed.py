@@ -119,14 +119,7 @@ class SnapshotHistory:
                 elif not math.isfinite(price) or price <= 0:
                     reason = "invalid_price"
                 elif source > observed:
-                    event = {
-                        "observed_at": observed.isoformat(),
-                        "reason": "future_source_time",
-                        "row": row,
-                    }
-                    if self.record is not None:
-                        self.record("invalid_quote", event)
-                    raise ValueError("Provider quote timestamp exceeds its observation cutoff")
+                    reason = "future_source_time"
                 elif (observed - source).total_seconds() > MAX_AGE_SECONDS:
                     reason = "stale_source_time"
             if reason is None and isinstance(symbol, str):
