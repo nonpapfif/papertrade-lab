@@ -95,6 +95,14 @@ premarket 18:00-23:30, regular 23:30-06:00 and after-hours 06:00-09:50 on Novemb
 The runner can collect warmup observations immediately. It stops at the provider's final
 session end and preserves open positions. It does not force liquidation at market close.
 
+Use `--trade-from-regular` to collect price history before the regular-session opening without
+running either actual or shadow portfolios. Status is `warming_up`; account balances, trades
+and evaluation count remain unchanged. The first snapshot received at or after the opening
+can use that earlier observed history. The flag sets the earliest trading time, not an immediate
+purchase or a regular-session-only policy. It must match when resuming the frozen experiment.
+For the November 2 run, the OS timer starts collection at 23:00 KST and trading begins no earlier
+than 23:30. Longer lookbacks and missing/stale observations can still require additional warmup.
+
 Artifacts remain under the ignored output directory:
 
 | File | Contents |
