@@ -56,6 +56,11 @@ hedging. Compare its own net results, drawdown, costs and missed fills with the 
 
 The runner freezes the available ACTIVE NYSE, NASDAQ, AMEX and US_ETC universe at startup.
 It requests all symbols in batches of 200, targeting one shared snapshot every 60 seconds.
+Depth requests use eight concurrent transports with one locked rate controller. The live
+request floor is 0.08 seconds (12.5 requests/second before stricter provider headers). Header
+limits and cooldowns remain authoritative; pending quote work is canceled on provider rejection.
+Each worker has private HTTP/token state. Raw events are drained to SQLite on the main thread,
+and confirmation uses each response's own receipt timestamp rather than the batch completion.
 Policy decisions target five-minute boundaries. Actual receipt, provider and decision times
 are recorded. Provider pacing, collection and computation can delay checks; missed intervals
 are not replayed as fictional live fills.

@@ -262,10 +262,13 @@ def collect_books(
             missing |= combined.required_symbols(frame)
         if not missing:
             return
+        batch = feed.orderbook_batch([symbols[symbol] for symbol in sorted(missing)])
+        cooldown = False
         for symbol in sorted(missing):
             try:
-                books = feed.orderbooks([symbols[symbol]])
-                book = books.get(symbols[symbol])
+                book = batch.get(symbols[symbol])
+                if isinstance(book, ApiError):
+                    raise book
                 if book is None:
                     frame["orderbook_failures"][symbol] = "provider_returned_no_book"
                 else:
@@ -282,9 +285,9 @@ def collect_books(
                     retry_at=error.retry_at,
                 )
                 if error.status == 429:
-                    for remaining in missing:
-                        frame["orderbook_failures"][remaining] = "provider_cooldown"
-                    return
+                    cooldown = True
+        if cooldown:
+            return
         cutoff = datetime.now(UTC).timestamp()
         for symbol, book in frame["orderbooks"].items():
             stamp = book.get("timestamp")
@@ -301,21 +304,21 @@ def confirm_books(feed: LiveFeed, frame: dict[str, Any], symbols: list[str]) -> 
     frame["confirmation_received_at"] = {}
     if frame["decision_orderbooks"]:
         time.sleep(1)
+    batch = feed.orderbook_batch([symbols[s] for s in sorted(frame["decision_orderbooks"])])
     for symbol in sorted(frame["decision_orderbooks"]):
         try:
-            result = feed.orderbooks([symbols[symbol]])
-            book = result.get(symbols[symbol])
+            book = batch.get(symbols[symbol])
+            if isinstance(book, ApiError):
+                raise book
             if book is not None:
                 frame["orderbooks"][symbol] = book
-                frame["confirmation_received_at"][symbol] = now()
+                frame["confirmation_received_at"][symbol] = book.get("received_at", now())
             else:
                 frame["orderbook_failures"][symbol] = "confirmation_empty"
         except ApiError as error:
             if error.status in (401, 403):
                 raise
             frame["orderbook_failures"][symbol] = error.code
-            if error.status == 429:
-                break
     for symbol in frame["decision_orderbooks"]:
         if symbol not in frame["orderbooks"]:
             frame["orderbook_failures"].setdefault(symbol, "confirmation_not_received")
@@ -342,7 +345,7 @@ def run(
         path = output / "manifest.json"
         settings = Settings.load(ROOT)
         data = copy.deepcopy(settings.data)
-        data["limits"]["minimum_request_interval"] = 0.2
+        data["limits"]["minimum_request_interval"] = 0.08
         feed = LiveFeed(Settings(settings.root, data), journal.record)
         try:
             if path.exists():
