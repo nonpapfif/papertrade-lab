@@ -54,6 +54,7 @@ No offline command starts the continuous trading workers.
 | [Upward-candle search](docs/up-candle-search.md) | Fixed rule grid and chronological selection |
 | [Weekly hypothesis experiment](docs/week-hypotheses.md) | Parallel fixed, cold-start and cumulative selectors over October 26-30 |
 | [Long-only weekly experiment](docs/long-only-week.md) | Independent daily accounts, weighted learning, ensembles, win rates and losing trades |
+| [Whole-share capital sweep](docs/whole-share-capitals.md) | Cash-only USD 50/100/200/500 accounts with integer shares and explicit FX |
 | [Portfolio return search](docs/portfolio-search.md) | Diverse virtual accounts, return rankings, and trade evidence |
 | [Round review](docs/round-review.md) | Trade attribution and ledger reconciliation |
 | [Error audit](ERROR_AUDIT.md) | Technical recovery history and diagnostic commands |

@@ -17,6 +17,7 @@ from tools.run_week_experiment import (
     DAYS,
     ROOT,
     IsolatedWorker,
+    audit_whole_account,
     current_long_features,
     digest,
     encode,
@@ -26,12 +27,66 @@ from tools.run_week_experiment import (
     policies,
     prepare_day,
     remap_frame,
+    run,
     trade_statistics,
 )
 from tools.search_portfolios import configurations, signals
 
 
 class WeekRunnerTests(unittest.TestCase):
+    def test_whole_account_audit_rejects_fractional_fills_and_unfunded_cash(self) -> None:
+        hypothesis = {
+            "accounting": "continuous_account",
+            "daily": [{}],
+            "summary": {"initial_equity": 50},
+            "trades": [
+                {
+                    "day": DAYS[0],
+                    "symbol_id": 0,
+                    "realized_pnl": None,
+                    "quantity_normalized": 5,
+                    "price": 10,
+                    "cash": 0,
+                },
+                {
+                    "day": DAYS[0],
+                    "symbol_id": 0,
+                    "realized_pnl": -10,
+                    "quantity_normalized": -5,
+                    "price": 8,
+                    "cash": 40,
+                },
+            ],
+        }
+        audit_whole_account(hypothesis, 50)
+        hypothesis["trades"][0]["quantity_normalized"] = 4.5
+        with self.assertRaisesRegex(ValueError, "fractional"):
+            audit_whole_account(hypothesis, 50)
+        hypothesis["trades"][0].update(quantity_normalized=6, cash=-10)
+        with self.assertRaisesRegex(ValueError, "borrows"):
+            audit_whole_account(hypothesis, 50)
+
+    def test_whole_run_rejects_invalid_capitals_or_fx_before_creating_files(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "new"
+            for capitals, fx in [
+                ((50, 50), 1300),
+                ((-1,), 1300),
+                ((50,), None),
+                ((50,), float("nan")),
+            ]:
+                with self.subTest(capitals=capitals, fx=fx), self.assertRaises(ValueError):
+                    run(
+                        output,
+                        None,
+                        4,
+                        long_only=True,
+                        whole_shares=True,
+                        capitals=capitals,
+                        krw_per_usd=fx,
+                    )
+                self.assertFalse(output.exists())
+
     def test_long_design_freezes_cold_carry_weighted_and_ensemble_comparisons(self) -> None:
         candidates = long_policies()
         self.assertEqual(len(candidates), 63)
@@ -432,6 +487,44 @@ class WeekRunnerTests(unittest.TestCase):
                     ).fetchone()[0],
                     15,
                 )
+
+            whole = output / "whole"
+            (whole / "jobs").mkdir(parents=True)
+            for seal in (output / "jobs").glob("*.json"):
+                (whole / "jobs" / seal.name).write_bytes(seal.read_bytes())
+            whole_manifest = {
+                **manifest,
+                "whole_shares": True,
+                "initial_capitals_usd": [50],
+                "krw_per_usd": 10,
+            }
+            with (
+                patch(
+                    "tools.run_week_experiment.locations", side_effect=lambda out, day: paths[day]
+                ),
+                patch("tools.search_portfolios.configurations", return_value=configurations(1)[:1]),
+                patch("tools.search_portfolios.signals", return_value=signals()[:1]),
+            ):
+                self.assertEqual(
+                    evaluate(whole, "KR", False, whole_manifest, 50), "KR-causal-usd50"
+                )
+            export_long_results(whole, whole_manifest)
+            with gzip.open(whole / "results/KR-causal-usd50/report.json.gz", "rt") as stream:
+                report = json.load(stream)
+            for hypothesis in report["hypotheses"]:
+                self.assertEqual(hypothesis["starting_capital_usd"], 50)
+                self.assertTrue(
+                    all(float(t["quantity_normalized"]).is_integer() for t in hypothesis["trades"])
+                )
+                self.assertTrue(all(t["cash"] >= -1e-8 for t in hypothesis["trades"]))
+                self.assertTrue(
+                    all(t["native_price"] == t["price"] * 10 for t in hypothesis["trades"])
+                )
+            self.assertEqual(report["hypotheses"][0]["summary"]["initial_equity"], 250)
+            with (whole / "daily-comparison.csv").open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 10)
+            self.assertTrue(all(float(row["starting_capital_usd"]) == 50 for row in rows))
 
 
 if __name__ == "__main__":

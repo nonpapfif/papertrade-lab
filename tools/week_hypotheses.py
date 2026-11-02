@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
+from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
 
@@ -41,6 +42,8 @@ class WeekEngine:
         detailed: bool = True,
         seed: int = 20261102,
         long_only: bool = False,
+        initial_equity: float = INITIAL,
+        whole_shares: bool = False,
     ) -> None:
         if market not in ("KR", "US"):
             raise ValueError("Unknown market")
@@ -51,10 +54,16 @@ class WeekEngine:
             raise ValueError("Configurations must have distinct identifiers")
         self.specs, self.detailed = specs, detailed
         self.long_only = long_only
+        self.initial_equity, self.whole_shares = initial_equity, whole_shares
+        if not math.isfinite(initial_equity) or initial_equity <= 0:
+            raise ValueError("Initial equity must be positive and finite")
+        if whole_shares and (not long_only or any(c["leverage"] != 1 for c in configs)):
+            raise ValueError("Whole-share learning requires long-only cash accounts")
         if long_only and any(specs[config["signal"]].get("side") != "long" for config in configs):
             raise ValueError("Long-only learning requires exclusively long-entry configurations")
         self.long_signals = {config["signal"] for config in configs} if long_only else set()
         self.long_candidate_cache: dict[int, list[list[Any]]] = {}
+        self.whole_bases: dict[tuple[int, str], list[list[Any]]] = {}
         self.policies = policies
         self.needs_shadows = any(
             policy["mode"] in MODES - {"fixed30", "static", "random"} for policy in policies
@@ -120,18 +129,28 @@ class WeekEngine:
                         "leverage": leverage,
                         "candidates": candidates,
                         "chosen": chosen,
-                        "book": Book(self.config_by_id[chosen], market, policy["id"], detailed),
+                        "book": self._new_book(self.config_by_id[chosen], policy["id"], detailed),
                         "owners": {},
                         "choices": [],
                         "daily": [],
                         "past_trades": [],
                         "past_curve": [],
-                        "start_equity": INITIAL,
+                        "start_equity": self.initial_equity,
                         "rng_seed": rng_seed,
                         "rng": random.Random(rng_seed),
                         "allocations": [],
                     }
                 )
+
+    def _new_book(self, config: dict[str, Any], phase: str, detailed: bool) -> Book:
+        return Book(
+            config,
+            self.market,
+            phase,
+            detailed,
+            initial_equity=self.initial_equity,
+            whole_shares=self.whole_shares,
+        )
 
     def day_start(self, day: str, scopes: dict[str, Any]) -> None:
         if self.day_open or self.day is not None and day <= self.day:
@@ -140,7 +159,7 @@ class WeekEngine:
             raise ValueError("Missing market scope")
         self.day, self.scopes, self.day_open, self.day_steps = day, scopes, True, 0
         self.shadows = (
-            [Book(config, self.market, "daily_shadow") for config in self.configs]
+            [self._new_book(config, "daily_shadow", False) for config in self.configs]
             if self.needs_shadows
             else []
         )
@@ -159,11 +178,8 @@ class WeekEngine:
                 state["past_curve"].extend(
                     {"day": state["daily"][-1]["day"], **point} for point in old.curve
                 )
-                state["book"] = Book(
-                    self.config_by_id[state["chosen"]],
-                    self.market,
-                    state["policy"]["id"],
-                    self.detailed,
+                state["book"] = self._new_book(
+                    self.config_by_id[state["chosen"]], state["policy"]["id"], self.detailed
                 )
                 state["owners"] = {}
             state["book"].mark(self.prices)
@@ -171,7 +187,9 @@ class WeekEngine:
 
     def _score(self, mode: str, window: int, current: list[float], at: str) -> list[float]:
         if mode == "daily":
-            return [(book.equity - INITIAL) / INITIAL for book in self.shadows]
+            return [
+                (book.equity - self.initial_equity) / self.initial_equity for book in self.shadows
+            ]
         if mode == "cumulative":
             return current
         if mode == "previous_day":
@@ -181,7 +199,12 @@ class WeekEngine:
         if mode.startswith("weighted_"):
             days = list(self.completed_scores)
             if window:
-                days.append([(book.equity - INITIAL) / INITIAL for book in self.shadows])
+                days.append(
+                    [
+                        (book.equity - self.initial_equity) / self.initial_equity
+                        for book in self.shadows
+                    ]
+                )
             if not days:
                 return [0.0] * len(self.configs)
             weights = [
@@ -205,7 +228,7 @@ class WeekEngine:
                     break
                 previous = scores
             observed = (
-                [(book.equity - INITIAL) / INITIAL for book in self.shadows]
+                [(book.equity - self.initial_equity) / self.initial_equity for book in self.shadows]
                 if self.long_only
                 else current
             )
@@ -259,6 +282,71 @@ class WeekEngine:
             self.long_candidate_cache[signal] = rows
         return self.long_candidate_cache[signal]
 
+    def _whole_candidates(
+        self,
+        config: dict[str, Any],
+        frame: dict[str, Any],
+        book: Book,
+        fresh: dict[int, float],
+        budget: float | None,
+    ) -> Iterator[list[Any]]:
+        spec = self.specs[config["signal"]]
+        key = spec["column"], spec["ranking"]
+        if key not in self.whole_bases:
+            rows = []
+            for symbol, scores, volumes, noises in frame["long_features"]:
+                score = scores[spec["column"]]
+                if score is not None and math.isfinite(score) and score > 0:
+                    rows.append(
+                        [int(symbol), 1, score, volumes[spec["look"]], noises[spec["look"]]]
+                    )
+            rows.sort(
+                key=lambda row: (-row[2] if spec["ranking"] == "strongest" else row[2], row[0])
+            )
+            self.whole_bases[key] = rows
+        for row in self.whole_bases[key]:
+            symbol, _, score, volume, noise = row
+            if score < spec["move"]:
+                if spec["ranking"] == "strongest":
+                    break
+                continue
+            if spec["volume"] and (volume is None or volume < spec["volume"]):
+                continue
+            if spec["noise"] and (noise is None or noise < spec["noise"]):
+                continue
+            if symbol not in fresh:
+                continue
+            if budget is not None:
+                if symbol in book.positions or book.cooldowns.get(symbol, -1) > frame["tick"]:
+                    continue
+                if fresh[symbol] > budget:
+                    book.rejected_unaffordable += 1
+                    continue
+            yield row[:3]
+
+    def _whole_shadow_step(
+        self, book: Book, frame: dict[str, Any], fresh: dict[int, float], allowed: bool
+    ) -> None:
+        config = book.config
+        at, tick = frame["at"], frame["tick"]
+        targets = []
+        if config["rotate"]:
+            for row in self._whole_candidates(config, frame, book, fresh, None):
+                targets.append(row)
+                if len(targets) == config["slots"]:
+                    break
+        book.step(at, tick, fresh, self.prices, targets, False)
+        if allowed:
+            capital = max(book.equity, 0) if config["compound"] else self.initial_equity
+            free = max(0, config["slots"] - len(book.positions))
+            slot_budget = capital / config["slots"]
+            budget = min(book.cash, slot_budget * free)
+            candidates = self._whole_candidates(config, frame, book, fresh, budget)
+            for row, quantity in book.whole_orders(candidates, fresh, free, slot_budget, budget):
+                symbol, _, strength = row
+                book.fill(symbol, quantity, fresh[symbol], at, tick, "entry", strength)
+        book.mark(self.prices)
+
     def _winner_entries(
         self, state: dict[str, Any], frame: dict[str, Any], fresh: dict[int, float], allowed: bool
     ) -> None:
@@ -268,6 +356,23 @@ class WeekEngine:
         at, tick = frame["at"], frame["tick"]
         book.mark(self.prices)
         free = max(0, config["slots"] - len(book.positions))
+        if self.whole_shares:
+            capital = max(book.equity, 0) if config["compound"] else self.initial_equity
+            slot_budget = capital / config["slots"]
+            budget = min(book.cash, slot_budget * free) if allowed else 0.0
+            candidates_whole = self._whole_candidates(config, frame, book, fresh, budget)
+            for row, quantity in book.whole_orders(
+                candidates_whole, fresh, free, slot_budget, budget
+            ):
+                symbol, _, strength = row
+                book.fill(symbol, quantity, fresh[symbol], at, tick, "entry", strength)
+                state["owners"][symbol] = config["id"]
+                if book.detailed:
+                    book.trades[-1].update(configuration=config["id"], day=self.day)
+            book.step(at, tick, {}, self.prices, [], False)
+            if book.curve:
+                book.curve[-1]["day"] = self.day
+            return
         candidates = (
             [
                 row
@@ -284,7 +389,7 @@ class WeekEngine:
             max(book.equity, 0) * state["leverage"]
             - sum(p.quantity * self.prices[s] for s, p in book.positions.items()),
         )
-        capital = max(book.equity, 0) if config["compound"] else INITIAL
+        capital = max(book.equity, 0) if config["compound"] else self.initial_equity
         budget = min(remaining, capital * state["leverage"] / config["slots"] * len(candidates))
         weights = [row[2] if config["sizing"] == "score" else 1.0 for row in candidates]
         total = sum(weights)
@@ -337,6 +442,24 @@ class WeekEngine:
                 if self.specs[self.config_by_id[owner]["signal"]]["family"] == allocation["family"]
             ]
             free = max(0, config["slots"] - len(family_positions))
+            if self.whole_shares:
+                capital = equity if config["compound"] else self.initial_equity
+                target = capital * allocation["weight"]
+                exposure = sum(
+                    book.positions[s].quantity * self.prices[s] for s in family_positions
+                )
+                slot_budget = target / config["slots"]
+                budget = max(0.0, min(book.cash, target - exposure, slot_budget * free))
+                candidates_whole = self._whole_candidates(config, frame, book, fresh, budget)
+                for row, quantity in book.whole_orders(
+                    candidates_whole, fresh, free, slot_budget, budget
+                ):
+                    symbol, _, strength = row
+                    book.fill(symbol, quantity, fresh[symbol], at, tick, "entry", strength)
+                    state["owners"][symbol] = config["id"]
+                    if book.detailed:
+                        book.trades[-1].update(configuration=config["id"], day=self.day)
+                continue
             candidates = [
                 row
                 for row in self._long_candidates(config, frame)
@@ -344,7 +467,7 @@ class WeekEngine:
                 and row[0] in fresh
                 and book.cooldowns.get(row[0], -1) <= tick
             ][:free]
-            capital = equity if config["compound"] else INITIAL
+            capital = equity if config["compound"] else self.initial_equity
             target = capital * state["leverage"] * allocation["weight"]
             exposure = sum(book.positions[s].quantity * self.prices[s] for s in family_positions)
             budget = min(
@@ -453,6 +576,9 @@ class WeekEngine:
         ) and not shared_boundary:
             raise ValueError("Frames must increase in observation time and global check number")
         self.long_candidate_cache.clear()
+        self.whole_bases.clear()
+        if self.whole_shares and "long_features" not in frame:
+            raise ValueError("Whole-share evaluation requires full current long features")
         if self.long_only and any(
             row[1] != 1
             for signal in self.long_signals
@@ -480,18 +606,26 @@ class WeekEngine:
             allowed = at < scope["end"] and (
                 config["session"] == "all" or is_regular == (config["session"] == "regular")
             )
-            book.step(
-                at, tick, fresh, self.prices, ranks[config["signal"]][self.market_index], allowed
-            )
+            if self.whole_shares:
+                self._whole_shadow_step(book, frame, fresh, allowed)
+            else:
+                book.step(
+                    at,
+                    tick,
+                    fresh,
+                    self.prices,
+                    ranks[config["signal"]][self.market_index],
+                    allowed,
+                )
         current = [
-            self.completed_sum[index] + (book.equity - INITIAL) / INITIAL
+            self.completed_sum[index] + (book.equity - self.initial_equity) / self.initial_equity
             for index, book in enumerate(self.shadows)
         ]
         if not self.history:
             baseline = [0.0] * len(current) if self.long_only else list(self.completed_sum)
             self.history.append((scope["start"], baseline))
         observed = (
-            [(book.equity - INITIAL) / INITIAL for book in self.shadows]
+            [(book.equity - self.initial_equity) / self.initial_equity for book in self.shadows]
             if self.long_only
             else current
         )
@@ -563,7 +697,7 @@ class WeekEngine:
         if not self.day_open or self.last_at is None or not self.day_steps:
             raise ValueError("The day has no observed market frames")
         scores = (
-            [(book.equity - INITIAL) / INITIAL for book in self.shadows]
+            [(book.equity - self.initial_equity) / self.initial_equity for book in self.shadows]
             if self.needs_shadows
             else [0.0] * len(self.configs)
         )
@@ -617,7 +751,7 @@ class WeekEngine:
             daily = state["daily"]
             summary = book.summary(self.prices, self.times, self.last_at) if self.last_at else None
             if reset and daily:
-                funded = INITIAL * len(daily)
+                funded = self.initial_equity * len(daily)
                 ending = sum(row["end_equity"] for row in daily)
                 summary = {
                     **daily[-1]["summary"],
@@ -627,7 +761,7 @@ class WeekEngine:
                     "pnl": ending - funded,
                     "continuous_equity": None,
                     "independent_accounts": len(daily),
-                    "capital_refills": max(0, len(daily) - 1) * INITIAL,
+                    "capital_refills": max(0, len(daily) - 1) * self.initial_equity,
                 }
                 for key in (
                     "cash",
@@ -644,6 +778,9 @@ class WeekEngine:
                     summary[key] = sum(row["summary"][key] for row in daily)
                 for key in ("max_drawdown_pct", "gross_exposure_peak", "debt_peak"):
                     summary[key] = max(row["summary"][key] for row in daily)
+                if self.whole_shares:
+                    for key in ("rejected_unaffordable", "zero_quantity"):
+                        summary[key] = sum(row["summary"][key] for row in daily)
                 summary["ever_nonpositive_equity"] = any(
                     row["summary"]["ever_nonpositive_equity"] for row in daily
                 )
@@ -681,12 +818,19 @@ class WeekEngine:
         if self.long_only:
             result["entry_policy"] = "Long entries only; sells close existing long positions."
             result["weighted_learning"] = (
-                "Completed daily shadow P&L divided by USD 1000, averaged with equal, linear "
+                f"Completed daily shadow P&L divided by USD {self.initial_equity:g}, "
+                "averaged with equal, linear "
                 "or exponential date weights. Window one includes today's observed score."
             )
             result["ensemble_allocation"] = (
                 "Best configuration in each family receives a softmax(score) target capital "
                 "weight. Targets apply to new entries only; surviving family exposure and "
                 "total account exposure consume budgets. No forced rebalancing or shadow wealth."
+            )
+        if self.whole_shares:
+            result["whole_share_execution"] = (
+                "Native integer share quantities; cash-only entries; full current feature "
+                "ranking screens affordability. Rounded-zero candidates are skipped in rank "
+                "order without transferring shadow profit or refilling actual cash."
             )
         return result
