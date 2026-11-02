@@ -99,6 +99,47 @@ def policies() -> list[dict[str, Any]]:
     return result
 
 
+def long_policies() -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for cold in (True, False):
+        prefix = "cold_" if cold else "carry_"
+        common = {"reset_daily": cold, "reset_learning": cold}
+        result.extend(
+            {"id": prefix + "static_" + family, "mode": "static", "families": [family], **common}
+            for family in FAMILIES
+        )
+        result.append({"id": prefix + "daily_all", "mode": "daily", **common})
+        result.extend(
+            {"id": prefix + "daily_" + family, "mode": "daily", "families": [family], **common}
+            for family in FAMILIES
+        )
+        result.extend(
+            {
+                "id": f"{prefix}rolling_{window * 5}min_refresh_{refresh * 5}min",
+                "mode": "rolling",
+                "window": window,
+                "refresh_ticks": refresh,
+                **common,
+            }
+            for window in (3, 6, 12, 24)
+            for refresh in (1, 3, 6)
+        )
+    for weighting in ("equal", "linear", "exponential"):
+        for online in (False, True):
+            for allocation in ("winner", "family_ensemble"):
+                result.append(
+                    {
+                        "id": f"weighted_{weighting}_{'online' if online else 'daily'}_{allocation}",
+                        "mode": "weighted_" + weighting,
+                        "window": int(online),
+                        "refresh_day": not online,
+                        "allocation": allocation,
+                    }
+                )
+    result.append({"id": "previous_day_only", "mode": "previous_day", "refresh_day": True})
+    return result
+
+
 def locations(output: Path, day: str) -> tuple[Path, Path, Path]:
     dataset = ROOT / "state" / "datasets" / day / "market.sqlite3"
     if day == "2026-10-30":
@@ -109,14 +150,14 @@ def locations(output: Path, day: str) -> tuple[Path, Path, Path]:
     return dataset, feature, portfolio
 
 
-def prepare_day(output: Path, day: str) -> None:
+def prepare_day(output: Path, day: str, prepared_output: Path | None = None) -> None:
     from tools.search_portfolios import run as portfolio_run
     from tools.search_up_candles import run as feature_run
 
     if day not in DAYS:
         raise ValueError("Only the five frozen experiment dates are allowed")
-    dataset, feature, portfolio = locations(output, day)
-    if day != "2026-10-30":
+    dataset, feature, portfolio = locations(prepared_output or output, day)
+    if prepared_output is None and day != "2026-10-30":
         feature_run(dataset, feature)
         portfolio_run(dataset, feature / "search.sqlite3", portfolio)
     with readonly(portfolio / "portfolios.sqlite3") as db:
@@ -128,12 +169,20 @@ def prepare_day(output: Path, day: str) -> None:
         feature_hash = digest(feature / "search.sqlite3")
         if manifest["feature_cache_sha256"] != feature_hash:
             raise ValueError("Daily causal feature cache changed")
+    portfolio_hash = digest(portfolio / "portfolios.sqlite3")
+    if prepared_output is not None:
+        original = json.loads((prepared_output / "jobs" / (day + ".json")).read_text())
+        if (portfolio_hash, feature_hash) != (
+            original["portfolio_sha256"],
+            original["feature_sha256"],
+        ):
+            raise ValueError("Prepared cache no longer matches its original run: " + day)
     save(
         output / "jobs" / (day + ".json"),
         {
             "state": "complete",
             "day": day,
-            "portfolio_sha256": digest(portfolio / "portfolios.sqlite3"),
+            "portfolio_sha256": portfolio_hash,
             "feature_sha256": feature_hash,
             "updated_at": datetime.now(UTC).isoformat(),
             "ai_calls": 0,
@@ -203,6 +252,7 @@ def worker_loop() -> None:
                 request["fixed_ids"],
                 request["policies"],
                 market=request["market"],
+                long_only=request.get("long_only", False),
             )
             response = {"ready": True}
         elif engine is None:
@@ -256,9 +306,11 @@ class IsolatedWorker:
             raise RuntimeError("Weekly worker pipes unavailable")
         self.input, self.output = self.process.stdin, self.process.stdout
         self.expired = threading.Event()
-        self.timer = threading.Timer(max(0, deadline - time.time()), self.expire)
-        self.timer.daemon = True
-        self.timer.start()
+        self.timer = None
+        if math.isfinite(deadline):
+            self.timer = threading.Timer(max(0, deadline - time.time()), self.expire)
+            self.timer.daemon = True
+            self.timer.start()
 
     def expire(self) -> None:
         self.expired.set()
@@ -282,7 +334,8 @@ class IsolatedWorker:
         return result
 
     def close(self) -> None:
-        self.timer.cancel()
+        if self.timer is not None:
+            self.timer.cancel()
         self.input.close()
         try:
             self.process.wait(timeout=5)
@@ -325,6 +378,37 @@ def remap_frame(
         "marks": marks,
         "ranks": ranks,
     }
+
+
+def current_long_features(
+    source: sqlite3.Connection,
+    frame: dict[str, Any],
+    ids: dict[tuple[str, str], int],
+    market: str,
+) -> tuple[list[list[Any]], str]:
+    row = source.execute(
+        "SELECT output_sha256,basis_gzip FROM frames WHERE at=?", (frame["at"],)
+    ).fetchone()
+    if row is None:
+        raise ValueError("Missing original feature frame")
+    raw = gzip.decompress(row["basis_gzip"])
+    if hashlib.sha256(raw).hexdigest() != row["output_sha256"]:
+        raise ValueError("Original feature frame digest mismatch")
+    result = []
+    for feature in json.loads(raw)["features"]:
+        if feature["quote_at"] > frame["at"] or any(
+            stamp is not None and stamp > frame["at"] for stamp in feature["reference_times"]
+        ):
+            raise ValueError("Future reference in long-only features")
+        if feature["market"] != market or feature["quote_at"] != frame["at"]:
+            continue
+        symbol = ids[(market, feature["symbol"])]
+        if symbol not in frame["quotes"]:
+            continue
+        if feature["price"] != frame["quotes"][symbol]:
+            raise ValueError("Long-only feature price does not match its current quote")
+        result.append([symbol, feature["scores"], feature["volumes"], feature["noises"]])
+    return result, row["output_sha256"]
 
 
 def fixed_winners(output: Path) -> dict[str, list[int]]:
@@ -373,10 +457,114 @@ def diagnostics(hypothesis: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def trade_statistics(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    closed = [trade for trade in trades if trade["realized_pnl"] is not None]
+    wins = [trade["realized_pnl"] for trade in closed if trade["realized_pnl"] > 0]
+    losses = [trade["realized_pnl"] for trade in closed if trade["realized_pnl"] < 0]
+    streak = longest = 0
+    for trade in closed:
+        streak = streak + 1 if trade["realized_pnl"] < 0 else 0
+        longest = max(longest, streak)
+    return {
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "flat_trades": len(closed) - len(wins) - len(losses),
+        "closed_trades": len(closed),
+        "win_rate_pct": len(wins) / len(closed) * 100 if closed else None,
+        "win_rate_excluding_flat_pct": len(wins) / (len(wins) + len(losses)) * 100
+        if wins or losses
+        else None,
+        "gross_realized_profit": sum(wins),
+        "gross_realized_loss": -sum(losses),
+        "profit_factor": sum(wins) / -sum(losses) if losses else None,
+        "max_consecutive_losses": longest,
+    }
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        path.write_text("")
+        return
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=list(dict.fromkeys(key for row in rows for key in row))
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def export_long_results(output: Path, manifest: dict[str, Any]) -> None:
+    daily_rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for path in sorted((output / "results").glob("*/report.json.gz")):
+        with gzip.open(path, "rt") as stream:
+            report = json.load(stream)
+        for hypothesis in report["hypotheses"]:
+            base = {
+                "hypothesis": hypothesis["id"],
+                "market": hypothesis["market"],
+                "leverage": hypothesis["leverage"],
+                "accounting": hypothesis["accounting"],
+            }
+            independent = hypothesis["accounting"] == "independent_daily_accounts"
+            positions: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for trade in hypothesis["trades"]:
+                key: tuple[Any, ...] = (trade["configuration"], trade["symbol_id"])
+                if independent:
+                    key += (trade["day"],)
+                if trade["realized_pnl"] is None:
+                    if trade["quantity_normalized"] <= 0 or key in positions:
+                        raise ValueError("Invalid long-only entry trace")
+                    positions[key] = trade
+                    continue
+                entry = positions.pop(key)
+                if trade["quantity_normalized"] >= 0 or not math.isclose(
+                    -trade["quantity_normalized"], entry["quantity_normalized"], rel_tol=1e-9
+                ):
+                    raise ValueError("Long-only exit does not close its original position")
+                if trade["realized_pnl"] < 0:
+                    failures.append(
+                        {
+                            **base,
+                            "day": trade["day"],
+                            "symbol": manifest["symbols"][trade["symbol_id"]][1],
+                            "configuration": trade["configuration"],
+                            "entry_at": entry["fill_at"],
+                            "exit_at": trade["fill_at"],
+                            "entry_price": entry["price"],
+                            "exit_price": trade["price"],
+                            "position_return_pct": (trade["price"] / entry["price"] - 1) * 100,
+                            "realized_pnl": trade["realized_pnl"],
+                            "reason": trade["reason"],
+                        }
+                    )
+            for row in hypothesis["daily"]:
+                trades = [t for t in hypothesis["trades"] if t["day"] == row["day"]]
+                daily_rows.append(
+                    {
+                        **base,
+                        **{
+                            key: row[key]
+                            for key in ("day", "start_equity", "end_equity", "pnl", "return_pct")
+                        },
+                        **trade_statistics(trades),
+                        "open_positions": row["summary"]["open_positions"],
+                        "stale_open_positions": row["summary"]["stale_open_positions"],
+                        "cumulative_drawdown_pct": row["summary"]["max_drawdown_pct"],
+                    }
+                )
+    write_csv(output / "daily-comparison.csv", daily_rows)
+    write_csv(output / "losing-trades.csv", failures)
+
+
 def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str, Any]) -> str:
     from tools.search_portfolios import configurations, signals
 
-    deadline = datetime.fromisoformat(manifest["deadline"]).timestamp()
+    deadline = (
+        datetime.fromisoformat(manifest["deadline"]).timestamp()
+        if manifest["deadline"]
+        else math.inf
+    )
     verify_code(manifest)
     group = market + ("-retrospective" if retrospective else "-causal")
     result = output / "results" / group
@@ -384,18 +572,27 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
     status_path = result / "status.json"
     all_specs = signals()
     configs = configurations(len(all_specs))
+    long_only = manifest.get("long_only", False)
     fixed_ids = manifest["fixed_oct30_ids"] if retrospective else {}
     selected_signals = None
     if retrospective:
         identifiers = set(fixed_ids[market])
         configs = [config for config in configs if config["id"] in identifiers]
         selected_signals = {config["signal"] for config in configs}
+    if long_only:
+        if retrospective:
+            raise ValueError("Long-only evaluation does not accept retrospective winners")
+        configs = [config for config in configs if all_specs[config["signal"]]["side"] == "long"]
+        selected_signals = {config["signal"] for config in configs}
     selected_policies = [
         p for p in manifest["policies"] if (p["mode"] == "fixed30") == retrospective
     ]
     ids = {tuple(value): index for index, value in enumerate(manifest["symbols"])}
-    data_paths = [locations(output, day)[0] for day in DAYS]
-    cache_paths = [locations(output, day)[2] / "portfolios.sqlite3" for day in DAYS]
+    prepared = Path(manifest["prepared_output"]) if manifest.get("prepared_output") else output
+    data_paths = [locations(prepared, day)[0] for day in DAYS]
+    cache_paths = [locations(prepared, day)[2] / "portfolios.sqlite3" for day in DAYS]
+    feature_paths = [locations(prepared, day)[1] / "search.sqlite3" for day in DAYS]
+    forbidden_features = feature_paths if long_only else []
     canary = result / "private-canary.txt"
     canary.write_text("Private scoring data is not a worker input")
     db = sqlite3.connect(result / "evaluation.sqlite3")
@@ -404,20 +601,32 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
         "sequence INTEGER PRIMARY KEY,day TEXT,at TEXT,sha256 TEXT,source_sha256 TEXT)"
     )
     db.execute("CREATE TABLE IF NOT EXISTS day_results (day TEXT PRIMARY KEY,payload_gzip BLOB)")
+    if long_only:
+        db.execute("ALTER TABLE sealed_inputs ADD COLUMN source_feature_sha256 TEXT")
     db.commit()
     worker = IsolatedWorker(
-        output, result, [*data_paths, *cache_paths, result / "evaluation.sqlite3", canary], deadline
+        output,
+        result,
+        [*data_paths, *cache_paths, *forbidden_features, result / "evaluation.sqlite3", canary],
+        deadline,
     )
     last_at = ""
     previous_quotes: dict[int, float] = {}
     sequence = 0
+    feature_source = None
     try:
         checks = worker.exchange(
             {
                 "kind": "probe",
                 "paths": [
                     str(p)
-                    for p in [*data_paths, *cache_paths, result / "evaluation.sqlite3", canary]
+                    for p in [
+                        *data_paths,
+                        *cache_paths,
+                        *forbidden_features,
+                        result / "evaluation.sqlite3",
+                        canary,
+                    ]
                 ],
             }
         )
@@ -432,12 +641,17 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                 "specs": all_specs,
                 "fixed_ids": fixed_ids,
                 "policies": selected_policies,
+                "long_only": long_only,
             }
         )
-        for day, path in zip(DAYS, cache_paths, strict=True):
+        for day, path, feature_path in zip(DAYS, cache_paths, feature_paths, strict=True):
             sealed = json.loads((output / "jobs" / (day + ".json")).read_text())
             if digest(path) != sealed["portfolio_sha256"]:
                 raise ValueError("Frozen portfolio cache changed: " + day)
+            if long_only:
+                if digest(feature_path) != sealed["feature_sha256"]:
+                    raise ValueError("Frozen feature cache changed: " + day)
+                feature_source = readonly(feature_path)
             with readonly(path) as source:
                 scope = metadata(source, "manifest")["scopes"]
                 local = metadata(source, "symbols")
@@ -458,18 +672,27 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                             if key in previous_quotes
                         ):
                             raise ValueError("Cross-day quotes disagree or move backwards")
-                        continue
+                        if not long_only:
+                            continue
+                    feature_hash = None
+                    if feature_source is not None:
+                        frame["long_features"], feature_hash = current_long_features(
+                            feature_source, frame, ids, market
+                        )
                     sequence += 1
                     with db:
                         db.execute(
-                            "INSERT INTO sealed_inputs VALUES (?,?,?,?,?)",
+                            "INSERT INTO sealed_inputs VALUES (?,?,?,?,?,?)"
+                            if long_only
+                            else "INSERT INTO sealed_inputs VALUES (?,?,?,?,?)",
                             (
                                 sequence,
                                 day,
                                 frame["at"],
                                 hashlib.sha256(encode(frame).encode()).hexdigest(),
                                 row["sha256"],
-                            ),
+                            )
+                            + ((feature_hash,) if long_only else ()),
                         )
                     worker.exchange(frame)
                     last_at, previous_quotes = frame["at"], frame["quotes"]
@@ -526,9 +749,16 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                         "ai_calls": 0,
                     },
                 )
+            if feature_source is not None:
+                feature_source.close()
+                feature_source = None
+                if digest(feature_path) != sealed["feature_sha256"]:
+                    raise ValueError("Feature cache changed during its replay: " + day)
         report = worker.exchange({"kind": "report"})
         for hypothesis in report["hypotheses"]:
             hypothesis["diagnostics"] = diagnostics(hypothesis)
+            if long_only:
+                hypothesis["diagnostics"].update(trade_statistics(hypothesis["trades"]))
         (result / "report.json.gz").write_bytes(
             gzip.compress(encode(report).encode(), compresslevel=1, mtime=0)
         )
@@ -562,14 +792,29 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
         )
         raise
     finally:
+        if feature_source is not None:
+            feature_source.close()
         worker.close()
         db.close()
 
 
-def make_manifest(output: Path, deadline: datetime, workers: int) -> dict[str, Any]:
+def make_manifest(
+    output: Path,
+    deadline: datetime | None,
+    workers: int,
+    *,
+    long_only: bool = False,
+    prepared_output: Path | None = None,
+) -> dict[str, Any]:
+    prepared = prepared_output or output
+    if prepared_output is not None:
+        if prepared_output.resolve() == output.resolve():
+            raise ValueError("Prepared caches and new results need separate directories")
+        if json.loads((prepared_output / "status.json").read_text())["state"] != "complete":
+            raise ValueError("Prepared experiment has not completed")
     sources = {}
     for day in DAYS:
-        path = locations(output, day)[0]
+        path = locations(prepared, day)[0]
         with readonly(path) as db:
             if metadata(db, "state") not in ("complete", "complete_with_errors"):
                 raise ValueError("Dataset is not complete: " + day)
@@ -581,21 +826,23 @@ def make_manifest(output: Path, deadline: datetime, workers: int) -> dict[str, A
                     for row in db.execute("SELECT status,COUNT(*) FROM symbols GROUP BY status")
                 ],
             }
-    with readonly(locations(output, "2026-10-30")[0]) as db:
+    with readonly(locations(prepared, "2026-10-30")[0]) as db:
         symbols = [
             list(row)
             for row in db.execute("SELECT market,symbol FROM symbols ORDER BY market,symbol")
         ]
     return {
         "created_at": datetime.now(UTC).isoformat(),
-        "deadline": deadline.isoformat(),
+        "deadline": deadline.isoformat() if deadline else None,
         "days": DAYS,
         "excluded_days": ["2026-10-23"],
         "prepare_workers": workers,
         "sources": sources,
         "symbols": symbols,
-        "policies": policies(),
-        "fixed_oct30_ids": fixed_winners(output),
+        "policies": long_policies() if long_only else policies(),
+        "long_only": long_only,
+        "prepared_output": str(prepared_output) if prepared_output else None,
+        "fixed_oct30_ids": {} if long_only else fixed_winners(output),
         "code_sha256": {
             name: digest(ROOT / "tools" / name)
             for name in (
@@ -608,15 +855,38 @@ def make_manifest(output: Path, deadline: datetime, workers: int) -> dict[str, A
         },
         "initial_equity_per_market_hypothesis": 1000,
         "ai_calls": 0,
-        "interpretation": "Fixed October 30 models are retrospective transfer tests. "
-        "Causal policies never receive those winner IDs. Daily indicators reset; cumulative "
-        "learning retains policy scores, not cross-day raw indicator histories. All five dates "
-        "remain research data, not independent prospective evidence.",
+        "interpretation": (
+            "Only long-entry candidates are evaluated; no October 30 winner IDs are used. "
+            if long_only
+            else "Fixed October 30 models are retrospective transfer tests. "
+            "Causal policies never receive those winner IDs. "
+        )
+        + "Daily indicators reset; cumulative learning retains policy scores, not cross-day "
+        "raw indicator histories. All five dates remain research data, not independent "
+        "prospective evidence.",
         "execution": "Observed current close; zero costs; constant FX; no intrabar fills; "
-        "short liabilities and debt retained; no real orders.",
-        "boundary": "Separate KR/US clocks, stable symbol IDs, epoch five-minute ticks, "
-        "equal-time cross-day boundary processed once after overlapping price validation.",
+        + ("long entries and closing sells only; " if long_only else "shorts allowed; ")
+        + "debt retained; no real orders.",
+        "boundary": "Separate KR/US clocks, stable symbol IDs, epoch five-minute ticks. "
+        + (
+            "Validated equal-time new-day boundaries initialize cold accounts and selection "
+            "cadence; continuous accounts only mark prices without duplicate fills."
+            if long_only
+            else "Equal-time cross-day boundaries are processed once after "
+            "overlapping price validation."
+        ),
         "events": "Excluded until original publication-time availability is verified.",
+        "long_only_design": {
+            "independent_days": "Cold policies reset capital, selected settings and learning "
+            "daily. Every daily account is separately funded with USD 1000.",
+            "weighted_days": "Equal, linear 1..n, or exponential 1,2,4,... weights over "
+            "daily normalized shadow P&L. Online variants include only observed current-day P&L.",
+            "allocation": "Winner selection or softmax family weights applied to new entries. "
+            "Existing positions keep original exit rules and are not forcibly rebalanced.",
+            "validation": "Final winners are exploratory selections from these same five days.",
+        }
+        if long_only
+        else None,
     }
 
 
@@ -637,9 +907,24 @@ def terminate(process: subprocess.Popen[Any]) -> None:
         process.wait()
 
 
-def run(output: Path, deadline: datetime, workers: int) -> None:
-    if workers < 1 or deadline.utcoffset() is None or deadline.timestamp() <= time.time():
+def run(
+    output: Path,
+    deadline: datetime | None,
+    workers: int,
+    *,
+    long_only: bool = False,
+    prepared_output: Path | None = None,
+) -> None:
+    if (
+        workers < 1
+        or deadline is None
+        and not long_only
+        or deadline is not None
+        and (deadline.utcoffset() is None or deadline.timestamp() <= time.time())
+    ):
         raise ValueError("Choose positive concurrency and a future timezone-aware deadline")
+    deadline_at = deadline.timestamp() if deadline else math.inf
+    deadline_text = deadline.isoformat() if deadline else None
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     (output / "jobs").mkdir(exist_ok=True)
     with (output / "experiment.lock").open("a+") as lock:
@@ -647,7 +932,9 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
         manifest_path = output / "manifest.json"
         if manifest_path.exists():
             raise ValueError("Use a new output directory for a new hypothesis experiment")
-        manifest = make_manifest(output, deadline, workers)
+        manifest = make_manifest(
+            output, deadline, workers, long_only=long_only, prepared_output=prepared_output
+        )
         save(manifest_path, manifest)
         status_path = output / "status.json"
         active: list[tuple[str, subprocess.Popen[Any], Any, Any]] = []
@@ -655,23 +942,26 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
         completed = []
         try:
             while pending or active:
-                if time.time() >= deadline.timestamp():
+                if time.time() >= deadline_at:
                     raise TimeoutError("Seven-hour experiment deadline reached")
                 while pending and len(active) < workers:
                     day = pending.pop(0)
                     stdout = (output / "jobs" / (day + "-stdout.log")).open("a")
                     stderr = (output / "jobs" / (day + "-stderr.log")).open("a")
+                    command = [
+                        str(Path(sys.executable).resolve()),
+                        "-u",
+                        "-m",
+                        "tools.run_week_experiment",
+                        "--prepare-day",
+                        day,
+                        "--output",
+                        str(output),
+                    ]
+                    if prepared_output is not None:
+                        command.extend(["--prepared-output", str(prepared_output)])
                     process = subprocess.Popen(
-                        [
-                            str(Path(sys.executable).resolve()),
-                            "-u",
-                            "-m",
-                            "tools.run_week_experiment",
-                            "--prepare-day",
-                            day,
-                            "--output",
-                            str(output),
-                        ],
+                        command,
                         cwd=ROOT,
                         stdout=stdout,
                         stderr=stderr,
@@ -696,7 +986,7 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
                         "completed_days": completed,
                         "running_days": [job[0] for job in active],
                         "pending_days": pending,
-                        "deadline": deadline.isoformat(),
+                        "deadline": deadline_text,
                         "pid": os.getpid(),
                         "ai_calls": 0,
                         "hypotheses": len(manifest["policies"]),
@@ -708,7 +998,7 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
                 status_path,
                 {
                     "state": "evaluating",
-                    "deadline": deadline.isoformat(),
+                    "deadline": deadline_text,
                     "pid": os.getpid(),
                     "ai_calls": 0,
                     "updated_at": datetime.now(UTC).isoformat(),
@@ -719,7 +1009,7 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
                 futures = [
                     pool.submit(evaluate, output, market, retrospective, manifest)
                     for market in ("KR", "US")
-                    for retrospective in (False, True)
+                    for retrospective in ((False,) if long_only else (False, True))
                 ]
                 for future in as_completed(futures):
                     groups.append(future.result())
@@ -728,7 +1018,7 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
                         {
                             "state": "evaluating",
                             "completed_groups": groups,
-                            "deadline": deadline.isoformat(),
+                            "deadline": deadline_text,
                             "pid": os.getpid(),
                             "ai_calls": 0,
                             "updated_at": datetime.now(UTC).isoformat(),
@@ -738,7 +1028,7 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
                 if digest(Path(source["path"])) != source["sha256"]:
                     raise ValueError("Source dataset changed during the experiment: " + day)
                 sealed = json.loads((output / "jobs" / (day + ".json")).read_text())
-                _, feature, portfolio = locations(output, day)
+                _, feature, portfolio = locations(prepared_output or output, day)
                 if digest(portfolio / "portfolios.sqlite3") != sealed["portfolio_sha256"]:
                     raise ValueError("Portfolio cache changed during evaluation: " + day)
                 if digest(feature / "search.sqlite3") != sealed["feature_sha256"]:
@@ -759,20 +1049,18 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
                             **summary,
                         }
                     )
-            if rows:
-                with (output / "comparison.csv").open("w", newline="") as stream:
-                    writer = csv.DictWriter(
-                        stream, fieldnames=list(dict.fromkeys(key for row in rows for key in row))
-                    )
-                    writer.writeheader()
-                    writer.writerows(rows)
+            write_csv(output / "comparison.csv", rows)
+            if long_only:
+                if len(rows) != len(manifest["policies"]) * 4 * 2:
+                    raise ValueError("Long-only account count does not match the frozen design")
+                export_long_results(output, manifest)
             save(
                 status_path,
                 {
                     "state": "complete",
                     "groups": groups,
                     "result_rows": len(rows),
-                    "deadline": deadline.isoformat(),
+                    "deadline": deadline_text,
                     "pid": os.getpid(),
                     "ai_calls": 0,
                     "updated_at": datetime.now(UTC).isoformat(),
@@ -782,12 +1070,10 @@ def run(output: Path, deadline: datetime, workers: int) -> None:
             save(
                 status_path,
                 {
-                    "state": "deadline_reached"
-                    if time.time() >= deadline.timestamp()
-                    else "failed",
+                    "state": "deadline_reached" if time.time() >= deadline_at else "failed",
                     "error_type": type(error).__name__,
                     "message": str(error),
-                    "deadline": deadline.isoformat(),
+                    "deadline": deadline_text,
                     "pid": os.getpid(),
                     "ai_calls": 0,
                     "updated_at": datetime.now(UTC).isoformat(),
@@ -808,6 +1094,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--deadline")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--long-only", action="store_true")
+    parser.add_argument("--prepared-output", type=Path)
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
@@ -818,9 +1106,19 @@ def main() -> None:
     elif args.status:
         print((args.output / "status.json").read_text())
     elif args.prepare_day:
-        prepare_day(args.output.resolve(), args.prepare_day)
-    elif args.deadline:
-        run(args.output.resolve(), datetime.fromisoformat(args.deadline), args.workers)
+        prepare_day(
+            args.output.resolve(),
+            args.prepare_day,
+            args.prepared_output.resolve() if args.prepared_output else None,
+        )
+    elif args.deadline or args.long_only:
+        run(
+            args.output.resolve(),
+            datetime.fromisoformat(args.deadline) if args.deadline else None,
+            args.workers,
+            long_only=args.long_only,
+            prepared_output=args.prepared_output.resolve() if args.prepared_output else None,
+        )
     else:
         parser.error("--deadline is required")
 

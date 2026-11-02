@@ -56,7 +56,341 @@ def replay_day(target: WeekEngine, day: str, prices: list[float]) -> dict[str, A
     return target.day_end()
 
 
+def long_engine(policies: list[dict[str, Any]], **changes: Any) -> WeekEngine:
+    configs = [
+        {**configurations(1)[0], "id": index, "signal": index, **changes} for index in range(2)
+    ]
+    specs = [{"family": family, "side": "long"} for family in ("momentum", "reversal")]
+    return WeekEngine(configs, specs, {}, policies, market="US", long_only=True)
+
+
+def long_frame(day: str, minute: int, first: float, second: float) -> dict[str, Any]:
+    result = frame(day, minute, first)
+    at = result["at"]
+    result["quotes"][1] = second
+    result["marks"][1] = [second, at]
+    result["ranks"] = [[[], [[0, 1, 0.01]]], [[], [[1, 1, 0.02]]]]
+    return result
+
+
 class WeekHypothesisTests(unittest.TestCase):
+    def test_long_only_rejects_mixed_configs_and_non_long_ranks_before_trading(self) -> None:
+        config = configurations(1)[0]
+        for side in ("short", "both", None):
+            with self.subTest(side=side), self.assertRaises(ValueError):
+                WeekEngine(
+                    [config],
+                    [{"family": "momentum", "side": side}],
+                    {},
+                    [{"id": "fixed", "mode": "static"}],
+                    market="US",
+                    long_only=True,
+                )
+        target = long_engine([{"id": "fixed", "mode": "static"}])
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        bad = long_frame("2026-10-26", 5, 100, 100)
+        bad["ranks"][0][1][0][1] = -1
+        with self.assertRaises(ValueError):
+            target.step(bad)
+        self.assertFalse(target.states[0]["book"].trades)
+        self.assertFalse(target.shadows)
+
+    def test_cold_daily_and_rolling_accounts_ignore_previous_day_learning(self) -> None:
+        policies = [
+            {"id": "cold_daily", "mode": "daily", "reset_daily": True, "reset_learning": True},
+            {
+                "id": "cold_recent",
+                "mode": "rolling",
+                "window": 3,
+                "reset_daily": True,
+                "reset_learning": True,
+            },
+        ]
+        first, changed = long_engine(policies), long_engine(copy.deepcopy(policies))
+        for target, price in ((first, 200), (changed, 20)):
+            target.day_start("2026-10-26", scopes("2026-10-26"))
+            for minute, value in ((5, 100), (10, price), (15, price)):
+                target.step(long_frame("2026-10-26", minute, value, 100))
+            target.day_end()
+        self.assertNotEqual(first.completed_scores, changed.completed_scores)
+        for target in (first, changed):
+            target.day_start("2026-10-27", scopes("2026-10-27"))
+            for minute, price in ((5, 100), (10, 80), (15, 130), (20, 90)):
+                target.step(long_frame("2026-10-27", minute, price, 100))
+            target.day_end()
+        for before, after in zip(
+            first.report()["hypotheses"], changed.report()["hypotheses"], strict=True
+        ):
+            for key, clock in (("choices", "at"), ("trades", "fill_at")):
+                self.assertEqual(
+                    [x for x in before[key] if x[clock][:10] == "2026-10-27"],
+                    [x for x in after[key] if x[clock][:10] == "2026-10-27"],
+                )
+            self.assertEqual(before["daily"][1], after["daily"][1])
+            self.assertEqual(before["summary"]["initial_equity"], 2000)
+            self.assertTrue(all(x["completed_training_days"] == 0 for x in before["choices"]))
+
+    def test_weighted_scores_use_exact_completed_days_and_optional_observed_today(self) -> None:
+        target = long_engine([{"id": "learn", "mode": "weighted_equal", "window": 0}])
+        self.assertEqual(target._score("weighted_equal", 0, [0, 0], ""), [0, 0])
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        target.completed_scores = [[1, 4], [3, 2]]
+        target.shadows[0].equity = 5000
+        target.shadows[1].equity = 1000
+        self.assertEqual(target._score("weighted_equal", 0, [900, 900], ""), [2, 3])
+        actual = target._score("weighted_linear", 0, [900, 900], "")
+        self.assertAlmostEqual(actual[0], 7 / 3)
+        self.assertAlmostEqual(actual[1], 8 / 3)
+        actual = target._score("weighted_exponential", 1, [900, 900], "")
+        self.assertAlmostEqual(actual[0], 23 / 7)
+        self.assertAlmostEqual(actual[1], 8 / 7)
+        actual = target._score("weighted_linear", 1, [900, 900], "")
+        self.assertAlmostEqual(actual[0], 19 / 6)
+        self.assertAlmostEqual(actual[1], 8 / 6)
+
+    def test_weighted_previous_days_freeze_selection_during_current_day(self) -> None:
+        target = long_engine(
+            [{"id": "frozen", "mode": "weighted_equal", "window": 0, "refresh_day": True}]
+        )
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        for minute, first in ((5, 100), (10, 50), (15, 50)):
+            target.step(long_frame("2026-10-26", minute, first, 100))
+        target.day_end()
+        target.day_start("2026-10-27", scopes("2026-10-27"))
+        for minute, first in ((5, 100), (10, 200), (15, 300), (20, 400)):
+            target.step(long_frame("2026-10-27", minute, first, 100))
+        target.day_end()
+        result = target.report()["hypotheses"][0]
+        choices = [x for x in result["choices"] if x["day"] == "2026-10-27"]
+        self.assertEqual(len(choices), 1)
+        self.assertEqual(choices[0]["configuration"], 1)
+        self.assertEqual(result["summary"]["initial_equity"], 1000)
+        self.assertEqual(result["daily"][1]["start_equity"], result["daily"][0]["end_equity"])
+
+    def test_ensemble_uses_one_account_and_never_copies_shadow_wealth(self) -> None:
+        target = long_engine(
+            [
+                {
+                    "id": "ensemble",
+                    "mode": "weighted_equal",
+                    "window": 1,
+                    "allocation": "family_ensemble",
+                }
+            ]
+        )
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        target.step(long_frame("2026-10-26", 5, 100, 100))
+        book = target.states[0]["book"]
+        self.assertEqual(book.cash, 0)
+        self.assertEqual([p.quantity for p in book.positions.values()], [5, 5])
+        target.step(long_frame("2026-10-26", 10, 150, 50))
+        self.assertAlmostEqual(book.equity, 1000)
+        self.assertAlmostEqual(book.realized, 0)
+        exposure = sum(p.quantity * target.prices[s] for s, p in book.positions.items())
+        self.assertLessEqual(exposure, book.equity + 1e-8)
+        self.assertGreaterEqual(book.cash, -1e-8)
+        self.assertTrue(all(p.quantity > 0 for p in book.positions.values()))
+        allocations = target.states[0]["choices"][-1]["allocations"]
+        self.assertAlmostEqual(sum(a["weight"] for a in allocations), 1)
+        self.assertGreater(allocations[0]["weight"], allocations[1]["weight"])
+        target.day_end()
+        self.assertEqual(target.report()["hypotheses"][0]["summary"]["equity"], 1000)
+
+    def test_ensemble_respects_surviving_exposure_and_original_exit_configuration(self) -> None:
+        target = long_engine(
+            [
+                {
+                    "id": "ensemble",
+                    "mode": "weighted_equal",
+                    "window": 1,
+                    "allocation": "family_ensemble",
+                }
+            ],
+            hold=0,
+            stop=0.1,
+        )
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        target.step(long_frame("2026-10-26", 5, 100, 100))
+        target.step(long_frame("2026-10-26", 10, 150, 100))
+        book = target.states[0]["book"]
+        self.assertEqual(book.opened, 2)
+        self.assertEqual(book.closed, 0)
+        target.step(long_frame("2026-10-26", 15, 80, 100))
+        exits = [x for x in book.trades if x["realized_pnl"] is not None]
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0]["reason"], "stop_at_observed_check")
+        self.assertEqual(exits[0]["configuration"], 0)
+        exposure = sum(p.quantity * target.prices[s] for s, p in book.positions.items())
+        self.assertLessEqual(exposure, max(book.equity, 0) + 1e-8)
+        self.assertAlmostEqual(book.equity, 1000 + book.realized)
+
+    def test_long_winner_configuration_switch_cannot_create_extra_leverage(self) -> None:
+        target = long_engine([{"id": "switch", "mode": "static"}], hold=0)
+        target.configs[1]["slots"] = 2
+        day = "2026-10-26"
+        target.day_start(day, scopes(day))
+        target.step(long_frame(day, 5, 100, 100))
+        state = target.states[0]
+        self.assertEqual(state["book"].opened, 1)
+        state["chosen"] = 1
+        target.step(long_frame(day, 10, 100, 100))
+        book = state["book"]
+        self.assertEqual(book.opened, 1)
+        self.assertEqual(book.cash, 0)
+        self.assertEqual(book.equity, 1000)
+        self.assertEqual(
+            sum(p.quantity * target.prices[s] for s, p in book.positions.items()), 1000
+        )
+
+    def test_ensemble_full_features_find_candidates_beyond_original_top_hundred(self) -> None:
+        families = ["a", "b", "c", "d", "e", "f"]
+        configs = [
+            {**configurations(1)[0], "id": i, "signal": i, "slots": 20, "hold": 0} for i in range(6)
+        ]
+        specs = [
+            {
+                "family": family,
+                "side": "long",
+                "column": i,
+                "look": 0,
+                "move": 0,
+                "volume": 0,
+                "noise": 0,
+                "ranking": "strongest",
+            }
+            for i, family in enumerate(families)
+        ]
+        target = WeekEngine(
+            configs,
+            specs,
+            {},
+            [
+                {
+                    "id": "ensemble",
+                    "mode": "weighted_equal",
+                    "window": 1,
+                    "allocation": "family_ensemble",
+                }
+            ],
+            market="US",
+            long_only=True,
+        )
+        day, at = "2026-10-26", stamp("2026-10-26", 5)
+        target.day_start(day, scopes(day))
+        state = target.states[0]
+        book = state["book"]
+        for symbol in range(100):
+            book.config = configs[symbol // 20]
+            book.fill(symbol, 1, 5, stamp(day, 0), 0, "entry")
+            state["owners"][symbol] = symbol // 20
+        ranks = [[[], [[symbol, 1, 120 - symbol] for symbol in range(100)]] for _ in range(6)]
+        incoming = {
+            "at": at,
+            "tick": int(datetime.fromisoformat(at).timestamp() // 300),
+            "quotes": {symbol: 5 for symbol in range(120)},
+            "marks": {symbol: [5, at] for symbol in range(120)},
+            "ranks": ranks,
+            "long_features": [
+                [symbol, [120 - symbol] * 6 + [None] * 24, [1] * 5, [1] * 5]
+                for symbol in range(120)
+            ],
+        }
+        target.step(incoming)
+        self.assertEqual(set(book.positions), set(range(120)))
+        self.assertEqual(book.opened, 120)
+        self.assertTrue(all(state["owners"][s] == 5 for s in range(100, 120)))
+        self.assertLessEqual(sum(p.quantity * 5 for p in book.positions.values()), 1000 + 1e-8)
+
+    def test_ensemble_family_sessions_do_not_follow_primary_selected_session(self) -> None:
+        target = long_engine(
+            [
+                {
+                    "id": "ensemble",
+                    "mode": "weighted_equal",
+                    "window": 1,
+                    "allocation": "family_ensemble",
+                }
+            ]
+        )
+        target.configs[0]["session"] = "extended"
+        target.configs[1]["session"] = "regular"
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        target.step(long_frame("2026-10-26", 10, 100, 100))
+        book = target.states[0]["book"]
+        self.assertEqual(set(book.positions), {1})
+        self.assertEqual(book.equity, 1000)
+        self.assertEqual(book.cash, 500)
+
+    def test_long_ensemble_future_changes_preserve_prefix_choices_and_fills(self) -> None:
+        policy = {
+            "id": "ensemble",
+            "mode": "weighted_exponential",
+            "window": 1,
+            "allocation": "family_ensemble",
+        }
+        first, changed = long_engine([policy]), long_engine([copy.deepcopy(policy)])
+        for target, final in ((first, 200), (changed, 1)):
+            target.day_start("2026-10-26", scopes("2026-10-26"))
+            for minute, price in ((5, 100), (10, 90), (15, final)):
+                target.step(long_frame("2026-10-26", minute, price, 100))
+            target.day_end()
+        for key, clock in (("choices", "at"), ("trades", "fill_at")):
+            before = first.report()["hypotheses"][0][key]
+            after = changed.report()["hypotheses"][0][key]
+            cutoff = stamp("2026-10-26", 10)
+            self.assertEqual(
+                [x for x in before if x[clock] <= cutoff], [x for x in after if x[clock] <= cutoff]
+            )
+
+    def test_shared_day_boundary_matches_cold_standalone_without_retrading_carry(self) -> None:
+        policies = [
+            {
+                "id": "cold",
+                "mode": "rolling",
+                "window": 3,
+                "refresh_ticks": 3,
+                "reset_daily": True,
+                "reset_learning": True,
+            },
+            {"id": "carry", "mode": "daily"},
+        ]
+        cumulative = long_engine(policies)
+        standalone = long_engine(copy.deepcopy(policies))
+        monday, tuesday = "2026-10-26", "2026-10-27"
+        previous_scope = {
+            "US": {
+                "start": stamp(monday, 1430),
+                "end": stamp(tuesday, 0),
+                "sessions": [{"start": stamp(monday, 1430), "end": stamp(tuesday, 0)}] * 3,
+            }
+        }
+        cumulative.day_start(monday, previous_scope)
+        cumulative.step(long_frame(monday, 1435, 100, 100))
+        cumulative.step(long_frame(monday, 1440, 100, 100))
+        cumulative.day_end()
+        carry = cumulative.states[1]["book"]
+        previous_count = len(carry.trades)
+        self.assertEqual(previous_count, 2)
+        for target in (cumulative, standalone):
+            target.day_start(tuesday, scopes(tuesday))
+            target.step(long_frame(tuesday, 0, 100, 100))
+        self.assertEqual(len(carry.trades), previous_count)
+        self.assertEqual(cumulative.day_steps, 1)
+        with self.assertRaises(ValueError):
+            cumulative.step(long_frame(tuesday, 0, 100, 100))
+        for target in (cumulative, standalone):
+            for minute, price in ((5, 90), (10, 110), (15, 100), (20, 120), (25, 90), (30, 100)):
+                target.step(long_frame(tuesday, minute, price, 100))
+            target.day_end()
+        before = cumulative.report()["hypotheses"][0]
+        after = standalone.report()["hypotheses"][0]
+        self.assertEqual(before["daily"][1], after["daily"][0])
+        for key in ("choices", "trades", "curve"):
+            self.assertEqual([x for x in before[key] if x["day"] == tuesday], after[key])
+        self.assertEqual(
+            [x["at"] for x in after["choices"]], [stamp(tuesday, minute) for minute in (0, 15, 30)]
+        )
+
     def test_future_price_changes_cannot_change_earlier_choices_or_trades(self) -> None:
         policies = [
             {"id": "daily", "mode": "daily"},
