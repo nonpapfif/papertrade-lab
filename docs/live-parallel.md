@@ -61,7 +61,8 @@ are recorded. Provider pacing, collection and computation can delay checks; miss
 are not replayed as fictional live fills.
 
 Inputs are sampled current prices, not exchange OHLCV candles. Only received observations
-can enter a lookback. Price quotes older than 90 seconds are quarantined; gaps longer than
+can enter a lookback. Quotes dated after receipt or older than 90 seconds are quarantined;
+one invalid symbol does not stop other valid observations. Gaps longer than
 90 seconds invalidate continuous signal windows. Volume-dependent configurations and the
 four volume-only policies are excluded. Sampled highs and noise differ from historical
 candle features. Do not compare live and historical returns as identical input experiments.
