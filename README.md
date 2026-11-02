@@ -55,7 +55,7 @@ No offline command starts the continuous trading workers.
 | [Weekly hypothesis experiment](docs/week-hypotheses.md) | Parallel fixed, cold-start and cumulative selectors over October 26-30 |
 | [Long-only weekly experiment](docs/long-only-week.md) | Independent daily accounts, weighted learning, ensembles, win rates and losing trades |
 | [Whole-share capital sweep](docs/whole-share-capitals.md) | Cash-only USD 50/100/200/500 accounts with integer shares and explicit FX |
-| [Parallel live paper accounts](docs/live-parallel.md) | 59 USD 100 accounts, confirmed quote estimates, missed/partial fills, fees and taxes |
+| [Parallel live paper accounts](docs/live-parallel.md) | 59 independent accounts and one USD 100 combined allocation account, partial fills, fees and taxes |
 | [Portfolio return search](docs/portfolio-search.md) | Diverse virtual accounts, return rankings, and trade evidence |
 | [Round review](docs/round-review.md) | Trade attribution and ledger reconciliation |
 | [Error audit](ERROR_AUDIT.md) | Technical recovery history and diagnostic commands |
