@@ -11,7 +11,19 @@ from typing import Any
 from tools.search_portfolios import INITIAL, Book, parse, regular
 
 MODES = frozenset(
-    {"fixed30", "static", "random", "daily", "cumulative", "rolling", "previous_day", "prior_days"}
+    {
+        "fixed30",
+        "static",
+        "random",
+        "daily",
+        "cumulative",
+        "rolling",
+        "previous_day",
+        "prior_days",
+        "weighted_equal",
+        "weighted_linear",
+        "weighted_exponential",
+    }
 )
 
 
@@ -28,6 +40,7 @@ class WeekEngine:
         market: str,
         detailed: bool = True,
         seed: int = 20261102,
+        long_only: bool = False,
     ) -> None:
         if market not in ("KR", "US"):
             raise ValueError("Unknown market")
@@ -37,6 +50,11 @@ class WeekEngine:
         if len(self.config_by_id) != len(self.configs) or not self.configs:
             raise ValueError("Configurations must have distinct identifiers")
         self.specs, self.detailed = specs, detailed
+        self.long_only = long_only
+        if long_only and any(specs[config["signal"]].get("side") != "long" for config in configs):
+            raise ValueError("Long-only learning requires exclusively long-entry configurations")
+        self.long_signals = {config["signal"] for config in configs} if long_only else set()
+        self.long_candidate_cache: dict[int, list[list[Any]]] = {}
         self.policies = policies
         self.needs_shadows = any(
             policy["mode"] in MODES - {"fixed30", "static", "random"} for policy in policies
@@ -66,6 +84,19 @@ class WeekEngine:
                 raise ValueError("Invalid hypothesis mode or refresh interval")
             if mode == "rolling" and int(policy.get("window", 0)) < 1:
                 raise ValueError("Rolling score needs a positive check window")
+            if mode.startswith("weighted_") and int(policy.get("window", 0)) not in (0, 1):
+                raise ValueError("Weighted day scores use window zero or one for today's inclusion")
+            if policy.get("reset_learning") and (
+                not policy.get("reset_daily")
+                or mode not in {"static", "random", "daily", "rolling"}
+            ):
+                raise ValueError("Cold daily learning requires independent daily accounts")
+            if policy.get("allocation") not in (None, "winner", "family_ensemble"):
+                raise ValueError("Unknown capital allocation")
+            if policy.get("allocation") == "family_ensemble" and (
+                not long_only or not mode.startswith("weighted_")
+            ):
+                raise ValueError("Family ensembles require long-only weighted scores")
             eligible = [
                 config
                 for config in self.configs
@@ -82,6 +113,7 @@ class WeekEngine:
                 if mode == "fixed30" and not fixed:
                     raise ValueError("Frozen October 30 reference is missing for this cohort")
                 chosen = fixed[0] if mode == "fixed30" else candidates[0]
+                rng_seed = f"{policy.get('seed', seed)}:{market}:{policy['id']}:{leverage}"
                 self.states.append(
                     {
                         "policy": policy,
@@ -95,9 +127,9 @@ class WeekEngine:
                         "past_trades": [],
                         "past_curve": [],
                         "start_equity": INITIAL,
-                        "rng": random.Random(
-                            f"{policy.get('seed', seed)}:{market}:{policy['id']}:{leverage}"
-                        ),
+                        "rng_seed": rng_seed,
+                        "rng": random.Random(rng_seed),
+                        "allocations": [],
                     }
                 )
 
@@ -112,7 +144,13 @@ class WeekEngine:
             if self.needs_shadows
             else []
         )
+        if self.long_only:
+            self.history.clear()
         for state in self.states:
+            if state["policy"].get("reset_learning"):
+                state["chosen"] = state["candidates"][0]
+                state["rng"] = random.Random(state["rng_seed"])
+                state["allocations"] = []
             if state["policy"].get("reset_daily", False) and state["daily"]:
                 old = state["book"]
                 state["past_trades"].extend(
@@ -140,6 +178,25 @@ class WeekEngine:
             return self.completed_scores[-1] if self.completed_scores else [0.0] * len(current)
         if mode == "prior_days":
             return self.completed_sum
+        if mode.startswith("weighted_"):
+            days = list(self.completed_scores)
+            if window:
+                days.append([(book.equity - INITIAL) / INITIAL for book in self.shadows])
+            if not days:
+                return [0.0] * len(self.configs)
+            weights = [
+                1
+                if mode == "weighted_equal"
+                else index + 1
+                if mode == "weighted_linear"
+                else 2**index
+                for index in range(len(days))
+            ]
+            total = sum(weights)
+            return [
+                sum(weight / total * day[index] for weight, day in zip(weights, days, strict=True))
+                for index in range(len(self.configs))
+            ]
         if mode == "rolling":
             cutoff = parse(at) - timedelta(minutes=window * 5)
             previous = self.history[0][1] if self.history else current
@@ -147,8 +204,174 @@ class WeekEngine:
                 if parse(stamp) > cutoff:
                     break
                 previous = scores
-            return [now - before for now, before in zip(current, previous, strict=True)]
+            observed = (
+                [(book.equity - INITIAL) / INITIAL for book in self.shadows]
+                if self.long_only
+                else current
+            )
+            return [now - before for now, before in zip(observed, previous, strict=True)]
         raise ValueError("This hypothesis does not use a score vector")
+
+    def _family_allocations(
+        self, state: dict[str, Any], scores: list[float]
+    ) -> list[dict[str, Any]]:
+        winners: dict[str, int] = {}
+        for identifier in state["candidates"]:
+            family = self.specs[self.config_by_id[identifier]["signal"]]["family"]
+            previous = winners.get(family)
+            if previous is None or (-scores[self.index_by_id[identifier]], identifier) < (
+                -scores[self.index_by_id[previous]],
+                previous,
+            ):
+                winners[family] = identifier
+        maximum = max(scores[self.index_by_id[identifier]] for identifier in winners.values())
+        weights = {
+            family: math.exp(scores[self.index_by_id[identifier]] - maximum)
+            for family, identifier in winners.items()
+        }
+        total = sum(weights.values())
+        return [
+            {"family": family, "configuration": identifier, "weight": weights[family] / total}
+            for family, identifier in sorted(winners.items())
+        ]
+
+    def _long_candidates(self, config: dict[str, Any], frame: dict[str, Any]) -> list[list[Any]]:
+        signal = config["signal"]
+        if "long_features" not in frame:
+            return frame["ranks"][signal][self.market_index]  # type: ignore[no-any-return]
+        if signal not in self.long_candidate_cache:
+            spec = self.specs[signal]
+            rows = []
+            for symbol, scores, volumes, noises in frame["long_features"]:
+                score = scores[spec["column"]]
+                if score is None or not math.isfinite(score) or score <= 0 or score < spec["move"]:
+                    continue
+                volume, noise = volumes[spec["look"]], noises[spec["look"]]
+                if spec["volume"] and (volume is None or volume < spec["volume"]):
+                    continue
+                if spec["noise"] and (noise is None or noise < spec["noise"]):
+                    continue
+                rows.append([int(symbol), 1, score])
+            if spec["ranking"] == "strongest":
+                rows.sort(key=lambda row: (-row[2], row[0]))
+            else:
+                rows.sort(key=lambda row: (row[2], row[0]))
+            self.long_candidate_cache[signal] = rows
+        return self.long_candidate_cache[signal]
+
+    def _winner_entries(
+        self, state: dict[str, Any], frame: dict[str, Any], fresh: dict[int, float], allowed: bool
+    ) -> None:
+        book: Book = state["book"]
+        config = self.config_by_id[state["chosen"]]
+        book.config = config
+        at, tick = frame["at"], frame["tick"]
+        book.mark(self.prices)
+        free = max(0, config["slots"] - len(book.positions))
+        candidates = (
+            [
+                row
+                for row in frame["ranks"][config["signal"]][self.market_index]
+                if row[0] not in book.positions
+                and row[0] in fresh
+                and book.cooldowns.get(row[0], -1) <= tick
+            ][:free]
+            if allowed
+            else []
+        )
+        remaining = max(
+            0.0,
+            max(book.equity, 0) * state["leverage"]
+            - sum(p.quantity * self.prices[s] for s, p in book.positions.items()),
+        )
+        capital = max(book.equity, 0) if config["compound"] else INITIAL
+        budget = min(remaining, capital * state["leverage"] / config["slots"] * len(candidates))
+        weights = [row[2] if config["sizing"] == "score" else 1.0 for row in candidates]
+        total = sum(weights)
+        if budget > 0 and total > 0:
+            for row, weight in zip(candidates, weights, strict=True):
+                symbol, _, strength = row
+                book.fill(
+                    symbol,
+                    budget * weight / total / fresh[symbol],
+                    fresh[symbol],
+                    at,
+                    tick,
+                    "entry",
+                    strength,
+                )
+                state["owners"][symbol] = config["id"]
+                if book.detailed:
+                    book.trades[-1].update(configuration=config["id"], day=self.day)
+        book.step(at, tick, {}, self.prices, [], False)
+        if book.curve:
+            book.curve[-1]["day"] = self.day
+
+    def _ensemble_entries(
+        self, state: dict[str, Any], frame: dict[str, Any], fresh: dict[int, float], allowed: bool
+    ) -> None:
+        book: Book = state["book"]
+        at, tick = frame["at"], frame["tick"]
+        scope = self.scopes[self.market]
+        is_regular = regular(at, self.market, scope)
+        book.mark(self.prices)
+        equity = max(book.equity, 0)
+        remaining = max(
+            0.0,
+            equity * state["leverage"]
+            - sum(
+                position.quantity * self.prices[symbol]
+                for symbol, position in book.positions.items()
+            ),
+        )
+        for allocation in state["allocations"]:
+            config = self.config_by_id[allocation["configuration"]]
+            book.config = config
+            if not allowed or not (
+                config["session"] == "all" or is_regular == (config["session"] == "regular")
+            ):
+                continue
+            family_positions = [
+                symbol
+                for symbol, owner in state["owners"].items()
+                if self.specs[self.config_by_id[owner]["signal"]]["family"] == allocation["family"]
+            ]
+            free = max(0, config["slots"] - len(family_positions))
+            candidates = [
+                row
+                for row in self._long_candidates(config, frame)
+                if row[0] not in book.positions
+                and row[0] in fresh
+                and book.cooldowns.get(row[0], -1) <= tick
+            ][:free]
+            capital = equity if config["compound"] else INITIAL
+            target = capital * state["leverage"] * allocation["weight"]
+            exposure = sum(book.positions[s].quantity * self.prices[s] for s in family_positions)
+            budget = min(
+                remaining,
+                max(0.0, target - exposure),
+                target / config["slots"] * len(candidates),
+            )
+            weights = [row[2] if config["sizing"] == "score" else 1.0 for row in candidates]
+            total = sum(weights)
+            if budget <= 0 or total <= 0:
+                continue
+            for row, weight in zip(candidates, weights, strict=True):
+                symbol, side, strength = row
+                if side != 1:
+                    raise ValueError("A long-only ensemble cannot enter a short position")
+                investment = budget * weight / total
+                book.fill(
+                    symbol, investment / fresh[symbol], fresh[symbol], at, tick, "entry", strength
+                )
+                state["owners"][symbol] = config["id"]
+                if book.detailed:
+                    book.trades[-1].update(configuration=config["id"], day=self.day)
+                remaining = max(0.0, remaining - investment)
+        book.config = self.config_by_id[state["chosen"]]
+        book.step(at, tick, {}, self.prices, [], False)
+        if book.curve:
+            book.curve[-1]["day"] = self.day
 
     def _actual_step(
         self,
@@ -182,6 +405,12 @@ class WeekEngine:
                 trade["day"] = self.day
             owners = {symbol: owner for symbol, owner in owners.items() if symbol in book.positions}
             state["owners"] = owners
+        if state["policy"].get("allocation") == "family_ensemble":
+            self._ensemble_entries(state, frame, fresh, entry_allowed)
+            return
+        if self.long_only:
+            self._winner_entries(state, frame, fresh, entry_allowed)
+            return
         config = self.config_by_id[state["chosen"]]
         book.config = config
         available = {
@@ -212,8 +441,24 @@ class WeekEngine:
         scope = self.scopes[self.market]
         if not scope["start"] <= at <= scope["end"]:
             return
-        if self.last_at is not None and at <= self.last_at or tick <= self.last_tick:
+        shared_boundary = (
+            self.long_only
+            and self.day_steps == 0
+            and at == scope["start"]
+            and at == self.last_at
+            and tick == self.last_tick
+        )
+        if (
+            self.last_at is not None and at <= self.last_at or tick <= self.last_tick
+        ) and not shared_boundary:
             raise ValueError("Frames must increase in observation time and global check number")
+        self.long_candidate_cache.clear()
+        if self.long_only and any(
+            row[1] != 1
+            for signal in self.long_signals
+            for row in frame["ranks"][signal][self.market_index]
+        ):
+            raise ValueError("A long-entry signal contains a non-long direction")
         fresh = {int(symbol): float(value) for symbol, value in frame["quotes"].items()}
         for symbol, mark in frame["marks"].items():
             symbol = int(symbol)
@@ -243,14 +488,26 @@ class WeekEngine:
             for index, book in enumerate(self.shadows)
         ]
         if not self.history:
-            self.history.append((scope["start"], list(self.completed_sum)))
-        self.history.append((at, current))
+            baseline = [0.0] * len(current) if self.long_only else list(self.completed_sum)
+            self.history.append((scope["start"], baseline))
+        observed = (
+            [(book.equity - INITIAL) / INITIAL for book in self.shadows]
+            if self.long_only
+            else current
+        )
+        self.history.append((at, observed))
         score_cache: dict[tuple[str, int], list[float]] = {}
         winner_cache: dict[tuple[str, int, int, tuple[str, ...]], int] = {}
+        allocation_cache: dict[tuple[str, int, int, tuple[str, ...]], list[dict[str, Any]]] = {}
         for state in self.states:
             policy = state["policy"]
             mode = policy["mode"]
-            if self.day_steps % int(policy.get("refresh_ticks", 1)) == 0:
+            refresh = (
+                self.day_steps == 0
+                if policy.get("refresh_day")
+                else (self.day_steps % int(policy.get("refresh_ticks", 1)) == 0)
+            )
+            if refresh:
                 choices = state["candidates"]
                 if mode == "random":
                     state["chosen"] = state["rng"].choice(choices)
@@ -270,22 +527,35 @@ class WeekEngine:
                             ),
                         )
                     state["chosen"] = winner_cache[cohort]
+                    if policy.get("allocation") == "family_ensemble":
+                        if cohort not in allocation_cache:
+                            allocation_cache[cohort] = self._family_allocations(state, scores)
+                        state["allocations"] = allocation_cache[cohort]
                 state["choices"].append(
                     {
                         "day": self.day,
                         "at": at,
                         "tick": tick,
                         "configuration": state["chosen"],
-                        "completed_training_days": len(self.completed_scores),
+                        "completed_training_days": 0
+                        if policy.get("reset_learning")
+                        else len(self.completed_scores),
                         "information_through": at,
                         "classification": "retrospective_30_fit" if mode == "fixed30" else "causal",
                     }
                 )
+                if policy.get("allocation") == "family_ensemble":
+                    state["choices"][-1]["allocations"] = state["allocations"]
             selected = self.config_by_id[state["chosen"]]
             allowed = at < scope["end"] and (
-                selected["session"] == "all" or is_regular == (selected["session"] == "regular")
+                policy.get("allocation") == "family_ensemble"
+                or selected["session"] == "all"
+                or is_regular == (selected["session"] == "regular")
             )
-            self._actual_step(state, frame, fresh, allowed)
+            if shared_boundary and not policy.get("reset_daily"):
+                state["book"].mark(self.prices)
+            else:
+                self._actual_step(state, frame, fresh, allowed)
         self.day_steps += 1
         self.last_at, self.last_tick = at, tick
 
@@ -397,7 +667,7 @@ class WeekEngine:
                     "open_position_origins": dict(state["owners"]),
                 }
             )
-        return {
+        result = {
             "market": self.market,
             "days": [row["day"] for row in self.shadow_daily_scores],
             "hypotheses": hypotheses,
@@ -408,3 +678,15 @@ class WeekEngine:
             "positions. Original entry configurations manage open-position exits.",
             "ai_calls": 0,
         }
+        if self.long_only:
+            result["entry_policy"] = "Long entries only; sells close existing long positions."
+            result["weighted_learning"] = (
+                "Completed daily shadow P&L divided by USD 1000, averaged with equal, linear "
+                "or exponential date weights. Window one includes today's observed score."
+            )
+            result["ensemble_allocation"] = (
+                "Best configuration in each family receives a softmax(score) target capital "
+                "weight. Targets apply to new entries only; surviving family exposure and "
+                "total account exposure consume budgets. No forced rebalancing or shadow wealth."
+            )
+        return result

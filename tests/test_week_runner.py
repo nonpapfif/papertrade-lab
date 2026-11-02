@@ -17,16 +17,120 @@ from tools.run_week_experiment import (
     DAYS,
     ROOT,
     IsolatedWorker,
+    current_long_features,
     digest,
     encode,
     evaluate,
+    export_long_results,
+    long_policies,
     policies,
+    prepare_day,
     remap_frame,
+    trade_statistics,
 )
 from tools.search_portfolios import configurations, signals
 
 
 class WeekRunnerTests(unittest.TestCase):
+    def test_long_design_freezes_cold_carry_weighted_and_ensemble_comparisons(self) -> None:
+        candidates = long_policies()
+        self.assertEqual(len(candidates), 63)
+        self.assertEqual(len({policy["id"] for policy in candidates}), 63)
+        self.assertEqual(sum(bool(p.get("reset_learning")) for p in candidates), 25)
+        self.assertEqual(sum(p.get("allocation") == "family_ensemble" for p in candidates), 6)
+        self.assertFalse(any(p["mode"] == "fixed30" for p in candidates))
+
+    def test_trade_metrics_include_flat_trades_and_keep_loss_streaks(self) -> None:
+        result = trade_statistics([{"realized_pnl": value} for value in (None, 12, -3, -1, 0)])
+        self.assertEqual(result["win_rate_pct"], 25)
+        self.assertAlmostEqual(result["win_rate_excluding_flat_pct"], 100 / 3)
+        self.assertEqual(result["profit_factor"], 3)
+        self.assertEqual(result["max_consecutive_losses"], 2)
+        self.assertIsNone(trade_statistics([])["win_rate_pct"])
+
+    def test_full_feature_projection_excludes_outcomes_stale_rows_and_other_markets(self) -> None:
+        with sqlite3.connect(":memory:") as db:
+            db.row_factory = sqlite3.Row
+            db.execute("CREATE TABLE frames(at TEXT,output_sha256 TEXT,basis_gzip BLOB)")
+            at = "2026-10-26T00:05:00+00:00"
+            feature = {
+                "market": "KR",
+                "symbol": "A",
+                "quote_at": at,
+                "price": 10,
+                "reference_times": [None] * 5,
+                "scores": [0.1] * 30,
+                "volumes": [2] * 5,
+                "noises": [3] * 5,
+            }
+            raw = encode(
+                {
+                    "features": [feature, {**feature, "market": "US"}],
+                    "decisions": ["Must never be sent"],
+                }
+            ).encode()
+            db.execute(
+                "INSERT INTO frames VALUES (?,?,?)",
+                (at, hashlib.sha256(raw).hexdigest(), gzip.compress(raw)),
+            )
+            rows, seal = current_long_features(
+                db, {"at": at, "quotes": {7: 10}}, {("KR", "A"): 7}, "KR"
+            )
+            self.assertEqual(rows, [[7, [0.1] * 30, [2] * 5, [3] * 5]])
+            self.assertEqual(seal, hashlib.sha256(raw).hexdigest())
+            with self.assertRaisesRegex(ValueError, "current quote"):
+                current_long_features(db, {"at": at, "quotes": {7: 11}}, {("KR", "A"): 7}, "KR")
+            bad = {**feature, "reference_times": ["2026-10-26T00:10:00+00:00"]}
+            raw = encode({"features": [bad]}).encode()
+            db.execute(
+                "UPDATE frames SET output_sha256=?,basis_gzip=?",
+                (hashlib.sha256(raw).hexdigest(), gzip.compress(raw)),
+            )
+            with self.assertRaisesRegex(ValueError, "Future reference"):
+                current_long_features(db, {"at": at, "quotes": {7: 10}}, {("KR", "A"): 7}, "KR")
+
+    def test_prepared_cache_reuse_checks_original_seals_without_running_search(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output, prepared = root / "new", root / "old"
+            for base in (output, prepared):
+                (base / "jobs").mkdir(parents=True)
+            dataset, feature = root / "data.sqlite3", root / "search.sqlite3"
+            dataset.write_text("Original prices")
+            feature.write_text("Original causal features")
+            portfolio = root / "portfolios.sqlite3"
+            with sqlite3.connect(portfolio) as db:
+                db.execute("CREATE TABLE metadata(key TEXT,value TEXT)")
+                db.executemany(
+                    "INSERT INTO metadata VALUES (?,?)",
+                    [
+                        ("simulation_complete", "true"),
+                        ("frames_complete", "true"),
+                        (
+                            "manifest",
+                            encode(
+                                {
+                                    "dataset_sha256": digest(dataset),
+                                    "feature_cache_sha256": digest(feature),
+                                }
+                            ),
+                        ),
+                    ],
+                )
+            seal = {"feature_sha256": digest(feature), "portfolio_sha256": digest(portfolio)}
+            (prepared / "jobs/2026-10-26.json").write_text(encode(seal))
+            with (
+                patch("tools.run_week_experiment.locations", return_value=(dataset, root, root)),
+                patch("tools.search_up_candles.run") as features,
+                patch("tools.search_portfolios.run") as portfolios,
+            ):
+                prepare_day(output, "2026-10-26", prepared)
+                features.assert_not_called()
+                portfolios.assert_not_called()
+                feature.write_text("Changed causal features")
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    prepare_day(output, "2026-10-26", prepared)
+
     def test_experiment_dates_exclude_october_23_and_freeze_35_unique_policies(self) -> None:
         self.assertEqual(DAYS, tuple(f"2026-10-{day}" for day in range(26, 31)))
         candidates = policies()
@@ -202,6 +306,132 @@ class WeekRunnerTests(unittest.TestCase):
             with sqlite3.connect(result / "evaluation.sqlite3") as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM sealed_inputs").fetchone()[0], 15)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM day_results").fetchone()[0], 5)
+
+    def test_long_controller_streams_full_features_and_exports_daily_losses(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            (output / "jobs").mkdir()
+            paths = {}
+            for day in DAYS:
+                base = output / day
+                base.mkdir()
+                dataset = base / "source.sqlite3"
+                dataset.write_text("Private future prices")
+                scope = {
+                    "KR": {
+                        "start": day + "T00:00:00+00:00",
+                        "end": day + "T00:15:00+00:00",
+                        "sessions": [
+                            {"start": day + "T00:00:00+00:00", "end": day + "T00:15:00+00:00"}
+                        ]
+                        * 2,
+                    }
+                }
+                with (
+                    sqlite3.connect(base / "portfolios.sqlite3") as db,
+                    sqlite3.connect(base / "search.sqlite3") as features,
+                ):
+                    db.executescript(
+                        "CREATE TABLE metadata(key TEXT,value TEXT);"
+                        "CREATE TABLE frames(id INTEGER,at TEXT,sha256 TEXT,payload BLOB);"
+                    )
+                    features.execute(
+                        "CREATE TABLE frames(at TEXT,output_sha256 TEXT,basis_gzip BLOB)"
+                    )
+                    db.executemany(
+                        "INSERT INTO metadata VALUES (?,?)",
+                        [
+                            ("manifest", encode({"scopes": scope})),
+                            ("symbols", encode([["KR", "A"]])),
+                        ],
+                    )
+                    for ordinal, price in enumerate((100, 80, 70), 1):
+                        at = day + f"T00:{ordinal * 5:02d}:00+00:00"
+                        raw = encode(
+                            {
+                                "at": at,
+                                "quotes": {0: price},
+                                "marks": {0: [price, at]},
+                                "ranks": [[[[0, 1, 0.01]], []]],
+                            }
+                        ).encode()
+                        db.execute(
+                            "INSERT INTO frames VALUES (?,?,?,?)",
+                            (ordinal, at, hashlib.sha256(raw).hexdigest(), gzip.compress(raw)),
+                        )
+                        raw = encode(
+                            {
+                                "features": [
+                                    {
+                                        "market": "KR",
+                                        "symbol": "A",
+                                        "quote_at": at,
+                                        "price": price,
+                                        "reference_times": [None] * 5,
+                                        "scores": [0.01] * 30,
+                                        "volumes": [2] * 5,
+                                        "noises": [3] * 5,
+                                    }
+                                ],
+                                "decisions": ["Forbidden outcome data"],
+                            }
+                        ).encode()
+                        features.execute(
+                            "INSERT INTO frames VALUES (?,?,?)",
+                            (at, hashlib.sha256(raw).hexdigest(), gzip.compress(raw)),
+                        )
+                (output / "jobs" / (day + ".json")).write_text(
+                    encode(
+                        {
+                            "portfolio_sha256": digest(base / "portfolios.sqlite3"),
+                            "feature_sha256": digest(base / "search.sqlite3"),
+                        }
+                    )
+                )
+                paths[day] = dataset, base, base
+            manifest = {
+                "deadline": None,
+                "long_only": True,
+                "symbols": [["KR", "A"]],
+                "policies": [
+                    {"id": "cold", "mode": "daily", "reset_daily": True, "reset_learning": True},
+                    {
+                        "id": "ensemble",
+                        "mode": "weighted_equal",
+                        "window": 1,
+                        "allocation": "family_ensemble",
+                    },
+                ],
+                "code_sha256": {},
+            }
+            with (
+                patch(
+                    "tools.run_week_experiment.locations", side_effect=lambda out, day: paths[day]
+                ),
+                patch("tools.search_portfolios.configurations", return_value=configurations(1)[:1]),
+                patch("tools.search_portfolios.signals", return_value=signals()[:1]),
+            ):
+                evaluate(output, "KR", False, manifest)
+            export_long_results(output, manifest)
+            import csv
+
+            with (output / "daily-comparison.csv").open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 10)
+            cold = [row for row in rows if row["hypothesis"] == "cold"]
+            self.assertTrue(all(float(row["start_equity"]) == 1000 for row in cold))
+            self.assertTrue(all(int(row["losing_trades"]) == 2 for row in cold))
+            with (output / "losing-trades.csv").open() as stream:
+                losses = list(csv.DictReader(stream))
+            self.assertTrue(losses)
+            self.assertTrue(all(float(row["position_return_pct"]) < 0 for row in losses))
+            with sqlite3.connect(output / "results/KR-causal/evaluation.sqlite3") as db:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT COUNT(*) FROM sealed_inputs WHERE source_feature_sha256 IS NOT NULL"
+                    ).fetchone()[0],
+                    15,
+                )
 
 
 if __name__ == "__main__":
