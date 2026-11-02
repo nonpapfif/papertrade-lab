@@ -55,6 +55,7 @@ No offline command starts the continuous trading workers.
 | [Weekly hypothesis experiment](docs/week-hypotheses.md) | Parallel fixed, cold-start and cumulative selectors over October 26-30 |
 | [Long-only weekly experiment](docs/long-only-week.md) | Independent daily accounts, weighted learning, ensembles, win rates and losing trades |
 | [Whole-share capital sweep](docs/whole-share-capitals.md) | Cash-only USD 50/100/200/500 accounts with integer shares and explicit FX |
+| [Parallel live paper accounts](docs/live-parallel.md) | Shared US snapshots, 59 policies, independent USD 100 books, depth, fees and estimated taxes |
 | [Portfolio return search](docs/portfolio-search.md) | Diverse virtual accounts, return rankings, and trade evidence |
 | [Round review](docs/round-review.md) | Trade attribution and ledger reconciliation |
 | [Error audit](ERROR_AUDIT.md) | Technical recovery history and diagnostic commands |
@@ -62,6 +63,9 @@ No offline command starts the continuous trading workers.
 | [Contributor instructions](AGENTS.md) | Experiment boundaries and repository workflow |
 
 ## Virtual fills and accounting
+
+These are the default free-profile rules. The separate live comparison uses the explicit
+execution and cost assumptions in [Parallel live paper accounts](docs/live-parallel.md).
 
 - Allow shorts, fractional quantities, additions, partial exits, reversals, and virtual borrowing.
 - Do not require settlement, margin, depth, whole shares, trading status, or market hours.
