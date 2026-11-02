@@ -281,7 +281,14 @@ def collect_books(
         frame["fx_at"] = now()
 
 
-def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool) -> None:
+def run(
+    output: Path,
+    day: str,
+    capital: float,
+    prior_gain: float,
+    resume: bool,
+    trade_from_regular: bool = False,
+) -> None:
     if not math.isfinite(capital) or capital <= 0 or not math.isfinite(prior_gain):
         raise ValueError("Choose positive finite capital and finite prior realized gain")
     if not "2026-10-01" <= datetime.fromisoformat(day).date().isoformat() <= "2026-12-31":
@@ -306,6 +313,8 @@ def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool)
                     manifest["fee_schedule"]["annual_realized_before_run_krw"],
                 ) != (day, capital, prior_gain):
                     raise ValueError("Resume arguments do not match the frozen live experiment")
+                if manifest.get("trade_from_regular", False) != trade_from_regular:
+                    raise ValueError("Resume trading start does not match the frozen experiment")
                 for name, expected in manifest["code_sha256"].items():
                     if digest(ROOT / name) != expected:
                         raise ValueError("Frozen live source changed: " + name)
@@ -351,6 +360,7 @@ def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool)
                     "policies": policies,
                     "configs": len(configs),
                     "accounts": len(policies) * 2,
+                    "trade_from_regular": trade_from_regular,
                     "code_sha256": {name: digest(ROOT / name) for name in SOURCES},
                     "fee_schedule": fees,
                     "cost_sources": COST_SOURCES,
@@ -391,6 +401,10 @@ def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool)
                 save(path, manifest)
                 journal.commit(state)
             ids = {symbol: index for index, symbol in enumerate(symbols)}
+            us_scope = manifest["scopes"]["US"]
+            trading_start = (
+                us_scope["sessions"][2]["start"] if trade_from_regular else us_scope["start"]
+            )
             end = datetime.fromisoformat(manifest["scopes"]["US"]["end"]).timestamp()
             if state["complete"]:
                 raise ValueError("Completed live runs cannot be restarted")
@@ -403,7 +417,10 @@ def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool)
                     journal.event("snapshot_coverage", **coverage)
                     state["snapshots"] += 1
                     slot = int(datetime.fromisoformat(observed).timestamp() // 300)
-                    if slot > state["last_slot"]:
+                    warming = datetime.fromisoformat(observed) < datetime.fromisoformat(
+                        trading_start
+                    )
+                    if not warming and slot > state["last_slot"]:
                         frame = make_frame(state["history"], observed, ids)
                         frame["signal_slot"] = slot
                         frame["fx"] = float(feed.fx()["midRate"])
@@ -425,7 +442,7 @@ def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool)
                     save(
                         output / "status.json",
                         {
-                            "state": "running",
+                            "state": "warming_up" if warming else "running",
                             "at": now(),
                             "ai_calls": 0,
                             "pid": os.getpid(),
@@ -435,6 +452,7 @@ def run(output: Path, day: str, capital: float, prior_gain: float, resume: bool)
                             "evaluations": state["evaluations"],
                             "last_execution_slot": state["last_slot"],
                             "session_end": manifest["scopes"]["US"]["end"],
+                            "trading_start": trading_start,
                         },
                     )
                 except ApiError as error:
@@ -496,13 +514,21 @@ def main() -> None:
     parser.add_argument("--capital", type=float, default=100)
     parser.add_argument("--prior-realized-krw", type=float, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--trade-from-regular", action="store_true")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
     if args.status:
         print((args.output / "status.json").read_text())
     else:
-        run(args.output.resolve(), args.date, args.capital, args.prior_realized_krw, args.resume)
+        run(
+            args.output.resolve(),
+            args.date,
+            args.capital,
+            args.prior_realized_krw,
+            args.resume,
+            args.trade_from_regular,
+        )
 
 
 if __name__ == "__main__":

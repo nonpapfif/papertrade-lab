@@ -3,19 +3,123 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tools.run_live_parallel import Journal, advance_frame, live_design, make_frame, run
 from tools.search_portfolios import configurations, signals
 
 
 class LiveRunnerTests(unittest.TestCase):
+    def test_regular_start_collects_warmup_without_trades_and_uses_it_at_open(self) -> None:
+        start = datetime(2026, 11, 2, 15, tzinfo=UTC)
+        opening = start + timedelta(minutes=5)
+        clock = [start.timestamp()]
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> datetime:
+                return datetime.fromtimestamp(clock[0], UTC)
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        feed = Mock()
+        feed.universe.return_value = ["X"]
+        bounds = [
+            start - timedelta(hours=2),
+            start - timedelta(hours=1),
+            opening,
+            start + timedelta(minutes=6),
+            start + timedelta(minutes=7),
+        ]
+        feed.calendar.return_value = {
+            "today": {
+                "date": "2026-11-02",
+                **{
+                    key: {
+                        "startTime": bounds[i].isoformat(),
+                        "endTime": bounds[i + 1].isoformat(),
+                    }
+                    for i, key in enumerate(
+                        ("dayMarket", "preMarket", "regularMarket", "afterMarket")
+                    )
+                },
+            }
+        }
+        feed.fx.return_value = {"midRate": "1300"}
+        specs = signals()
+        config = {**configurations(len(specs))[0], "hold": 0}
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+
+            def snapshot() -> list[dict]:
+                if clock[0] == opening.timestamp():
+                    status = json.loads((output / "status.json").read_text())
+                    self.assertEqual(status["state"], "warming_up")
+                    journal = Journal(output)
+                    state = journal.load()
+                    journal.db.close()
+                    self.assertEqual(state["evaluations"], 0)
+                    self.assertEqual(state["snapshots"], 5)
+                    for engine in state["engines"].values():
+                        self.assertEqual(engine.day_steps, 0)
+                        self.assertFalse(engine.shadows[0].positions)
+                        self.assertEqual(engine.states[0]["book"].cash, 100)
+                        self.assertFalse(engine.states[0]["book"].trades)
+                    feed.orderbooks.assert_not_called()
+                    feed.fx.assert_not_called()
+                return [
+                    {
+                        "symbol": "X",
+                        "lastPrice": str(10 + (clock[0] - start.timestamp()) / 600),
+                        "currency": "USD",
+                        "timestamp": FrozenDateTime.now().isoformat(),
+                    }
+                ]
+
+            def orderbooks(symbols: list[str]) -> dict:
+                self.assertGreaterEqual(clock[0], opening.timestamp())
+                return {
+                    "X": {
+                        "timestamp": FrozenDateTime.now().isoformat(),
+                        "currency": "USD",
+                        "asks": [{"price": 10.6, "volume": 100}],
+                        "bids": [{"price": 10.4, "volume": 100}],
+                    }
+                }
+
+            feed.snapshot.side_effect = snapshot
+            feed.orderbooks.side_effect = orderbooks
+            with (
+                patch("tools.run_live_parallel.LiveFeed", return_value=feed),
+                patch("tools.run_live_parallel.datetime", FrozenDateTime),
+                patch("tools.run_live_parallel.time.time", side_effect=lambda: clock[0]),
+                patch("tools.run_live_parallel.time.sleep", side_effect=sleep),
+                patch(
+                    "tools.run_live_parallel.live_design",
+                    return_value=([config], specs, [{"id": "learn", "mode": "daily"}]),
+                ),
+            ):
+                run(output, "2026-11-02", 100, 0, False, trade_from_regular=True)
+            journal = Journal(output)
+            frames = journal.db.execute("SELECT at,payload_gzip FROM frames").fetchall()
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0][0], opening.isoformat())
+            first_frame = json.loads(gzip.decompress(frames[0][1]))
+            self.assertIsNotNone(first_frame["long_features"][0][1][0])
+            final = journal.load()
+            self.assertTrue(all(e.states[0]["book"].opened == 1 for e in final["engines"].values()))
+            journal.db.close()
+            with self.assertRaisesRegex(ValueError, "Resume trading start"):
+                run(output, "2026-11-02", 100, 0, True)
+
     def test_delayed_execution_expires_prices_without_relabeling_their_observation(self) -> None:
         at = "2026-11-02T15:00:00+00:00"
         frame = {
