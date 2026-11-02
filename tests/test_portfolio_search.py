@@ -59,6 +59,50 @@ def scopes() -> dict[str, Any]:
 
 
 class PortfolioTests(unittest.TestCase):
+    def test_custom_capital_whole_shares_round_down_and_reconcile_without_debt(self) -> None:
+        book = Book(config(hold=1), "US", "whole", True, initial_equity=50, whole_shares=True)
+        book.step(at(5), 1, {0: 9}, {0: 9}, [[0, 1, 1]], True)
+        self.assertEqual(book.cash, 5)
+        self.assertEqual(book.positions[0].quantity, 5)
+        book.step(at(10), 2, {0: 10}, {0: 10}, [], False)
+        result = book.summary({0: 10}, {0: at(10)}, at(10))
+        self.assertEqual(result["initial_equity"], 50)
+        self.assertEqual(result["equity"], 55)
+        self.assertAlmostEqual(result["return_pct"], 10)
+        self.assertEqual(result["debt"], 0)
+        for quantity in (-1, 0, 1.5, 100):
+            with self.subTest(quantity=quantity), self.assertRaises(ValueError):
+                book.fill(1, quantity, 10, at(15), 3, "entry")
+
+    def test_whole_zero_rounding_skips_to_lower_rank_without_borrowing_or_cash_refill(self) -> None:
+        book = Book(
+            config(slots=2, hold=0), "US", "whole", True, initial_equity=50, whole_shares=True
+        )
+        prices = {0: 30, 1: 40, 2: 10, 3: 5}
+        book.step(at(5), 1, prices, prices, [[s, 1, 1] for s in prices], True)
+        self.assertEqual(set(book.positions), {2, 3})
+        self.assertEqual([p.quantity for p in book.positions.values()], [2, 5])
+        self.assertEqual(book.cash, 5)
+        self.assertEqual(book.equity, 50)
+        self.assertEqual(book.zero_quantity, 2)
+        self.assertTrue(all(float(t["quantity_normalized"]).is_integer() for t in book.trades))
+
+    def test_whole_fixed_sizing_uses_custom_initial_capital_and_preserves_cash_dust(self) -> None:
+        book = Book(
+            config(compound=False, hold=1),
+            "US",
+            "whole",
+            True,
+            initial_equity=50,
+            whole_shares=True,
+        )
+        book.step(at(5), 1, {0: 10}, {0: 10}, [[0, 1, 1]], True)
+        book.step(at(10), 2, {0: 20, 1: 10}, {0: 20, 1: 10}, [[1, 1, 1]], True)
+        self.assertEqual(book.equity, 100)
+        self.assertEqual(book.positions[1].quantity, 5)
+        self.assertEqual(book.cash, 50)
+        self.assertEqual(book.affordable_quantity(0.3, 0.1), 2)
+
     def test_fixed_grid_and_sample_ids_are_unique_and_reproducible(self) -> None:
         specs = signals()
         configs = configurations(len(specs))

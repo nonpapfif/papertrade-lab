@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from bisect import bisect_left
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import product
@@ -273,6 +274,76 @@ class Book:
     cooldowns: dict[int, int] = field(default_factory=dict)
     trades: list[dict[str, Any]] = field(default_factory=list)
     curve: list[dict[str, Any]] = field(default_factory=list)
+    initial_equity: float = INITIAL
+    whole_shares: bool = False
+    rejected_unaffordable: int = 0
+    zero_quantity: int = 0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.initial_equity) or self.initial_equity <= 0:
+            raise ValueError("Initial equity must be positive and finite")
+        if self.initial_equity != INITIAL:
+            self.cash = self.equity = self.peak = self.initial_equity
+        if self.whole_shares and self.config["leverage"] != 1:
+            raise ValueError("Whole-share accounts require cash-only leverage one")
+
+    def affordable_quantity(self, amount: float, price: float) -> int:
+        available = max(0.0, min(amount, self.cash))
+        quantity = math.floor(available / price)
+        if quantity * price > available:
+            quantity -= 1
+        return max(0, quantity)
+
+    def whole_orders(
+        self,
+        candidates: Iterable[list[Any]],
+        prices: dict[int, float],
+        free: int,
+        slot_budget: float,
+        budget: float,
+    ) -> list[tuple[list[Any], int]]:
+        iterator = iter(candidates)
+        selected: list[list[Any]] = []
+        exhausted = False
+        available = max(0.0, min(budget, self.cash))
+        if free <= 0 or available <= 0 or slot_budget <= 0:
+            return []
+        while True:
+            while len(selected) < free and not exhausted:
+                try:
+                    candidate = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                if prices[candidate[0]] > available:
+                    self.rejected_unaffordable += 1
+                    continue
+                selected.append(candidate)
+            if not selected:
+                return []
+            spend = min(available, slot_budget * len(selected))
+            scale = max((row[2] for row in selected), default=1)
+            weights = [
+                row[2] / scale if self.config["sizing"] == "score" else 1 for row in selected
+            ]
+            total = sum(weights)
+            if total <= 0:
+                self.zero_quantity += len(selected)
+                return []
+            orders = []
+            remaining_cash = self.cash
+            for row, weight in zip(selected, weights, strict=True):
+                amount = min(spend * weight / total, remaining_cash)
+                quantity = self.affordable_quantity(amount, prices[row[0]])
+                remaining_cash -= quantity * prices[row[0]]
+                orders.append((row, quantity))
+            rejected = sum(quantity == 0 for _, quantity in orders)
+            self.zero_quantity += rejected
+            if not rejected:
+                return orders
+            selected = [row for row, quantity in orders if quantity > 0]
+            if exhausted and not selected:
+                return []
 
     def mark(self, prices: dict[int, float]) -> None:
         values = [p.quantity * prices[s] for s, p in self.positions.items()]
@@ -295,6 +366,16 @@ class Book:
         reason: str,
         strength: float | None = None,
     ) -> None:
+        if self.whole_shares:
+            if not math.isfinite(quantity) or quantity == 0 or not float(quantity).is_integer():
+                raise ValueError("Whole-share fills require a nonzero integer quantity")
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Whole-share prices must be positive and finite")
+            if reason == "entry":
+                if quantity < 0 or quantity * price > self.cash or symbol in self.positions:
+                    raise ValueError("Whole-share entries cannot short or borrow cash")
+            elif symbol not in self.positions or quantity != -self.positions[symbol].quantity:
+                raise ValueError("Whole-share sales must close an existing long position")
         self.cash -= quantity * price
         self.turnover += abs(quantity * price)
         pnl = None
@@ -372,12 +453,27 @@ class Book:
                 and self.cooldowns.get(r[0], -1) <= tick
                 and r[0] in fresh
             ][:free]
-            capital = max(self.equity, 0) if cfg["compound"] else INITIAL
+            capital = max(self.equity, 0) if cfg["compound"] else self.initial_equity
             budget = capital * cfg["leverage"] / cfg["slots"] * len(chosen)
             scale = max((r[2] for r in chosen), default=1)
             weights = [r[2] / scale if cfg["sizing"] == "score" else 1 for r in chosen]
             total = sum(weights)
-            if budget > 0 and total > 0:
+            if self.whole_shares:
+                candidates_all = (
+                    row
+                    for row in candidates
+                    if row[0] not in self.positions
+                    and row[0] in fresh
+                    and self.cooldowns.get(row[0], -1) <= tick
+                )
+                for row, quantity in self.whole_orders(
+                    candidates_all, fresh, free, capital / cfg["slots"], self.cash
+                ):
+                    symbol, side, strength = row
+                    if side != 1:
+                        raise ValueError("Whole-share learning cannot enter short positions")
+                    self.fill(symbol, quantity, fresh[symbol], at, tick, "entry", strength)
+            elif budget > 0 and total > 0:
                 for (symbol, side, strength), weight in zip(chosen, weights, strict=True):
                     quantity = side * budget * weight / total / fresh[symbol]
                     self.fill(symbol, quantity, fresh[symbol], at, tick, "entry", strength)
@@ -396,16 +492,19 @@ class Book:
         self.mark(prices)
         unrealized = sum(p.quantity * (prices[s] - p.entry) for s, p in self.positions.items())
         if not math.isclose(
-            self.equity, INITIAL + self.realized + unrealized, rel_tol=1e-9, abs_tol=1e-6
+            self.equity,
+            self.initial_equity + self.realized + unrealized,
+            rel_tol=1e-9,
+            abs_tol=1e-6,
         ):
             raise ValueError("Virtual ledger does not reconcile")
-        return {
+        result = {
             "configuration": self.config["id"],
             "market": self.market,
             "phase": self.phase,
-            "initial_equity": INITIAL,
+            "initial_equity": self.initial_equity,
             "equity": self.equity,
-            "return_pct": (self.equity / INITIAL - 1) * 100,
+            "return_pct": (self.equity / self.initial_equity - 1) * 100,
             "cash": self.cash,
             "debt": max(-self.cash, 0),
             "realized": self.realized,
@@ -422,6 +521,11 @@ class Book:
             "stale_open_positions": sum(times[s] != at for s in self.positions),
             "oldest_open_quote_at": min((times[s] for s in self.positions), default=None),
         }
+        if self.whole_shares:
+            result["whole_shares"] = True
+            result["rejected_unaffordable"] = self.rejected_unaffordable
+            result["zero_quantity"] = self.zero_quantity
+        return result
 
 
 def boundaries(scope: dict[str, Any]) -> list[str]:

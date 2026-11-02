@@ -253,6 +253,8 @@ def worker_loop() -> None:
                 request["policies"],
                 market=request["market"],
                 long_only=request.get("long_only", False),
+                initial_equity=request.get("initial_equity", 1000.0),
+                whole_shares=request.get("whole_shares", False),
             )
             response = {"ready": True}
         elif engine is None:
@@ -506,6 +508,12 @@ def export_long_results(output: Path, manifest: dict[str, Any]) -> None:
                 "leverage": hypothesis["leverage"],
                 "accounting": hypothesis["accounting"],
             }
+            if manifest.get("whole_shares"):
+                base.update(
+                    starting_capital_usd=hypothesis["starting_capital_usd"],
+                    price_currency="USD",
+                    native_currency="KRW" if hypothesis["market"] == "KR" else "USD",
+                )
             independent = hypothesis["accounting"] == "independent_daily_accounts"
             positions: dict[tuple[Any, ...], dict[str, Any]] = {}
             for trade in hypothesis["trades"]:
@@ -536,6 +544,15 @@ def export_long_results(output: Path, manifest: dict[str, Any]) -> None:
                             "position_return_pct": (trade["price"] / entry["price"] - 1) * 100,
                             "realized_pnl": trade["realized_pnl"],
                             "reason": trade["reason"],
+                            **(
+                                {
+                                    "entry_native_price": entry["native_price"],
+                                    "exit_native_price": trade["native_price"],
+                                    "quantity": entry["quantity_normalized"],
+                                }
+                                if manifest.get("whole_shares")
+                                else {}
+                            ),
                         }
                     )
             for row in hypothesis["daily"]:
@@ -551,13 +568,56 @@ def export_long_results(output: Path, manifest: dict[str, Any]) -> None:
                         "open_positions": row["summary"]["open_positions"],
                         "stale_open_positions": row["summary"]["stale_open_positions"],
                         "cumulative_drawdown_pct": row["summary"]["max_drawdown_pct"],
+                        **(
+                            {
+                                "cash_usd": row["summary"]["cash"],
+                                "cumulative_rejected_unaffordable": row["summary"][
+                                    "rejected_unaffordable"
+                                ],
+                                "cumulative_zero_quantity": row["summary"]["zero_quantity"],
+                            }
+                            if manifest.get("whole_shares")
+                            else {}
+                        ),
                     }
                 )
     write_csv(output / "daily-comparison.csv", daily_rows)
     write_csv(output / "losing-trades.csv", failures)
 
 
-def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str, Any]) -> str:
+def audit_whole_account(hypothesis: dict[str, Any], capital: float) -> None:
+    independent = hypothesis["accounting"] == "independent_daily_accounts"
+    cash, day = capital, None
+    holdings: dict[int, float] = {}
+    for trade in hypothesis["trades"]:
+        if independent and day != trade["day"]:
+            cash, holdings = capital, {}
+        day = trade["day"]
+        quantity = float(trade["quantity_normalized"])
+        if not math.isfinite(quantity) or quantity == 0 or not quantity.is_integer():
+            raise ValueError("Whole-share trace contains a fractional or invalid quantity")
+        symbol = trade["symbol_id"]
+        if trade["realized_pnl"] is None:
+            if quantity < 0 or symbol in holdings:
+                raise ValueError("Whole-share trace contains an invalid entry")
+            holdings[symbol] = quantity
+        elif quantity >= 0 or holdings.pop(symbol) != -quantity:
+            raise ValueError("Whole-share trace sells shares that are not held")
+        cash -= quantity * trade["price"]
+        if cash < -1e-8 or not math.isclose(cash, trade["cash"], rel_tol=1e-9, abs_tol=1e-8):
+            raise ValueError("Whole-share trace borrows money or changes cash without a fill")
+    expected_funding = capital * (len(hypothesis["daily"]) if independent else 1)
+    if not math.isclose(hypothesis["summary"]["initial_equity"], expected_funding):
+        raise ValueError("Whole-share account reports incorrect initial funding")
+
+
+def evaluate(
+    output: Path,
+    market: str,
+    retrospective: bool,
+    manifest: dict[str, Any],
+    initial_equity: float | None = None,
+) -> str:
     from tools.search_portfolios import configurations, signals
 
     deadline = (
@@ -567,6 +627,12 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
     )
     verify_code(manifest)
     group = market + ("-retrospective" if retrospective else "-causal")
+    whole_shares = manifest.get("whole_shares", False)
+    capital = 1000.0 if initial_equity is None else initial_equity
+    if whole_shares:
+        if capital not in manifest["initial_capitals_usd"]:
+            raise ValueError("Starting capital is absent from the frozen experiment")
+        group += f"-usd{capital:.17g}"
     result = output / "results" / group
     result.mkdir(parents=True, exist_ok=True)
     status_path = result / "status.json"
@@ -583,6 +649,11 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
         if retrospective:
             raise ValueError("Long-only evaluation does not accept retrospective winners")
         configs = [config for config in configs if all_specs[config["signal"]]["side"] == "long"]
+        selected_signals = {config["signal"] for config in configs}
+    if whole_shares:
+        if not long_only:
+            raise ValueError("Whole-share experiments require long-only execution")
+        configs = [config for config in configs if config["leverage"] == 1]
         selected_signals = {config["signal"] for config in configs}
     selected_policies = [
         p for p in manifest["policies"] if (p["mode"] == "fixed30") == retrospective
@@ -642,6 +713,8 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                 "fixed_ids": fixed_ids,
                 "policies": selected_policies,
                 "long_only": long_only,
+                "initial_equity": capital,
+                "whole_shares": whole_shares,
             }
         )
         for day, path, feature_path in zip(DAYS, cache_paths, feature_paths, strict=True):
@@ -665,6 +738,19 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                     if hashlib.sha256(raw).hexdigest() != row["sha256"]:
                         raise ValueError("Daily causal frame digest mismatch")
                     frame = remap_frame(json.loads(raw), local, ids, market, selected_signals)
+                    feature_hash = None
+                    if feature_source is not None:
+                        frame["long_features"], feature_hash = current_long_features(
+                            feature_source, frame, ids, market
+                        )
+                    if whole_shares and market == "KR":
+                        rate = manifest["krw_per_usd"]
+                        frame["quotes"] = {
+                            key: price / rate for key, price in frame["quotes"].items()
+                        }
+                        frame["marks"] = {
+                            key: [mark[0] / rate, mark[1]] for key, mark in frame["marks"].items()
+                        }
                     if frame["at"] <= last_at:
                         if frame["at"] != last_at or any(
                             previous_quotes[key] != price
@@ -674,11 +760,6 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                             raise ValueError("Cross-day quotes disagree or move backwards")
                         if not long_only:
                             continue
-                    feature_hash = None
-                    if feature_source is not None:
-                        frame["long_features"], feature_hash = current_long_features(
-                            feature_source, frame, ids, market
-                        )
                     sequence += 1
                     with db:
                         db.execute(
@@ -756,6 +837,16 @@ def evaluate(output: Path, market: str, retrospective: bool, manifest: dict[str,
                     raise ValueError("Feature cache changed during its replay: " + day)
         report = worker.exchange({"kind": "report"})
         for hypothesis in report["hypotheses"]:
+            if whole_shares:
+                hypothesis["starting_capital_usd"] = capital
+                rate = manifest["krw_per_usd"] if market == "KR" else 1.0
+                for trade in hypothesis["trades"]:
+                    trade["price_currency"] = "USD"
+                    trade["native_currency"] = "KRW" if market == "KR" else "USD"
+                    trade["native_price"] = trade["price"] * rate
+                    trade["native_entry_price"] = trade["entry_price"] * rate
+                    trade["krw_per_usd"] = manifest["krw_per_usd"] if market == "KR" else None
+                audit_whole_account(hypothesis, capital)
             hypothesis["diagnostics"] = diagnostics(hypothesis)
             if long_only:
                 hypothesis["diagnostics"].update(trade_statistics(hypothesis["trades"]))
@@ -805,6 +896,9 @@ def make_manifest(
     *,
     long_only: bool = False,
     prepared_output: Path | None = None,
+    whole_shares: bool = False,
+    capitals: tuple[float, ...] = (50.0, 100.0, 200.0, 500.0),
+    krw_per_usd: float | None = None,
 ) -> dict[str, Any]:
     prepared = prepared_output or output
     if prepared_output is not None:
@@ -841,6 +935,14 @@ def make_manifest(
         "symbols": symbols,
         "policies": long_policies() if long_only else policies(),
         "long_only": long_only,
+        "whole_shares": whole_shares,
+        "initial_capitals_usd": list(capitals) if whole_shares else [1000.0],
+        "krw_per_usd": krw_per_usd if whole_shares else None,
+        "fx_assumption": "Fixed KRW/USD conversion for all five days, not a historical daily "
+        "FX series or a point-in-time currency forecast. Native whole-share quantities are "
+        "priced in USD for accounting; original feature ratios are unchanged."
+        if whole_shares
+        else None,
         "prepared_output": str(prepared_output) if prepared_output else None,
         "fixed_oct30_ids": {} if long_only else fixed_winners(output),
         "code_sha256": {
@@ -853,7 +955,7 @@ def make_manifest(
                 "replay_market_day.py",
             )
         },
-        "initial_equity_per_market_hypothesis": 1000,
+        "initial_equity_per_market_hypothesis": None if whole_shares else 1000,
         "ai_calls": 0,
         "interpretation": (
             "Only long-entry candidates are evaluated; no October 30 winner IDs are used. "
@@ -865,8 +967,15 @@ def make_manifest(
         "raw indicator histories. All five dates remain research data, not independent "
         "prospective evidence.",
         "execution": "Observed current close; zero costs; constant FX; no intrabar fills; "
-        + ("long entries and closing sells only; " if long_only else "shorts allowed; ")
-        + "debt retained; no real orders.",
+        + (
+            "whole-share cash-only long entries and closing sells; "
+            if whole_shares
+            else "long entries and closing sells only; "
+            if long_only
+            else "shorts allowed; "
+        )
+        + ("no borrowing; " if whole_shares else "debt retained; ")
+        + "no real orders.",
         "boundary": "Separate KR/US clocks, stable symbol IDs, epoch five-minute ticks. "
         + (
             "Validated equal-time new-day boundaries initialize cold accounts and selection "
@@ -878,7 +987,7 @@ def make_manifest(
         "events": "Excluded until original publication-time availability is verified.",
         "long_only_design": {
             "independent_days": "Cold policies reset capital, selected settings and learning "
-            "daily. Every daily account is separately funded with USD 1000.",
+            "daily. Every daily account receives its cohort's starting capital again.",
             "weighted_days": "Equal, linear 1..n, or exponential 1,2,4,... weights over "
             "daily normalized shadow P&L. Online variants include only observed current-day P&L.",
             "allocation": "Winner selection or softmax family weights applied to new entries. "
@@ -914,7 +1023,22 @@ def run(
     *,
     long_only: bool = False,
     prepared_output: Path | None = None,
+    whole_shares: bool = False,
+    capitals: tuple[float, ...] = (50.0, 100.0, 200.0, 500.0),
+    krw_per_usd: float | None = None,
 ) -> None:
+    if whole_shares and (
+        not long_only
+        or not capitals
+        or len(set(capitals)) != len(capitals)
+        or any(not math.isfinite(capital) or capital <= 0 for capital in capitals)
+        or krw_per_usd is None
+        or not math.isfinite(krw_per_usd)
+        or krw_per_usd <= 0
+    ):
+        raise ValueError(
+            "Whole-share experiments need positive distinct capitals and a fixed FX rate"
+        )
     if (
         workers < 1
         or deadline is None
@@ -933,7 +1057,14 @@ def run(
         if manifest_path.exists():
             raise ValueError("Use a new output directory for a new hypothesis experiment")
         manifest = make_manifest(
-            output, deadline, workers, long_only=long_only, prepared_output=prepared_output
+            output,
+            deadline,
+            workers,
+            long_only=long_only,
+            prepared_output=prepared_output,
+            whole_shares=whole_shares,
+            capitals=capitals,
+            krw_per_usd=krw_per_usd,
         )
         save(manifest_path, manifest)
         status_path = output / "status.json"
@@ -1005,9 +1136,10 @@ def run(
                 },
             )
             groups = []
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=workers if whole_shares else 4) as pool:
                 futures = [
-                    pool.submit(evaluate, output, market, retrospective, manifest)
+                    pool.submit(evaluate, output, market, retrospective, manifest, capital)
+                    for capital in (capitals if whole_shares else (None,))
                     for market in ("KR", "US")
                     for retrospective in ((False,) if long_only else (False, True))
                 ]
@@ -1045,13 +1177,19 @@ def run(
                             "leverage": hypothesis["leverage"],
                             "classification": hypothesis["classification"],
                             "accounting": encode(hypothesis["accounting"]),
+                            **(
+                                {"starting_capital_usd": hypothesis["starting_capital_usd"]}
+                                if whole_shares
+                                else {}
+                            ),
                             **hypothesis["diagnostics"],
                             **summary,
                         }
                     )
             write_csv(output / "comparison.csv", rows)
             if long_only:
-                if len(rows) != len(manifest["policies"]) * 4 * 2:
+                cohorts = len(capitals) if whole_shares else 4
+                if len(rows) != len(manifest["policies"]) * cohorts * 2:
                     raise ValueError("Long-only account count does not match the frozen design")
                 export_long_results(output, manifest)
             save(
@@ -1095,6 +1233,9 @@ def main() -> None:
     parser.add_argument("--deadline")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--long-only", action="store_true")
+    parser.add_argument("--whole-shares", action="store_true")
+    parser.add_argument("--capitals", nargs="+", type=float, default=[50, 100, 200, 500])
+    parser.add_argument("--krw-per-usd", type=float)
     parser.add_argument("--prepared-output", type=Path)
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
@@ -1111,13 +1252,16 @@ def main() -> None:
             args.prepare_day,
             args.prepared_output.resolve() if args.prepared_output else None,
         )
-    elif args.deadline or args.long_only:
+    elif args.deadline or args.long_only or args.whole_shares:
         run(
             args.output.resolve(),
             datetime.fromisoformat(args.deadline) if args.deadline else None,
             args.workers,
-            long_only=args.long_only,
+            long_only=args.long_only or args.whole_shares,
             prepared_output=args.prepared_output.resolve() if args.prepared_output else None,
+            whole_shares=args.whole_shares,
+            capitals=tuple(args.capitals),
+            krw_per_usd=args.krw_per_usd,
         )
     else:
         parser.error("--deadline is required")

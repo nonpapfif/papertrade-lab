@@ -73,7 +73,154 @@ def long_frame(day: str, minute: int, first: float, second: float) -> dict[str, 
     return result
 
 
+def whole_engine(capital: float, policies: list[dict[str, Any]]) -> WeekEngine:
+    configs = [{**configurations(1)[0], "id": i, "signal": i} for i in range(2)]
+    specs = [
+        {
+            "family": family,
+            "side": "long",
+            "column": i,
+            "look": i,
+            "move": 0,
+            "volume": 0,
+            "noise": 0,
+            "ranking": "strongest",
+        }
+        for i, family in enumerate(("momentum", "reversal"))
+    ]
+    return WeekEngine(
+        configs,
+        specs,
+        {},
+        policies,
+        market="US",
+        long_only=True,
+        initial_equity=capital,
+        whole_shares=True,
+    )
+
+
+def whole_frame(day: str, minute: int, first: float, second: float) -> dict[str, Any]:
+    result = long_frame(day, minute, first, second)
+    result["long_features"] = [
+        [0, [0.02, None] + [None] * 28, [1] * 5, [1] * 5],
+        [1, [None, 0.02] + [None] * 28, [1] * 5, [1] * 5],
+    ]
+    return result
+
+
 class WeekHypothesisTests(unittest.TestCase):
+    def test_whole_share_learning_recomputes_returns_for_each_starting_capital(self) -> None:
+        small = whole_engine(50, [{"id": "learn", "mode": "daily"}])
+        large = whole_engine(200, [{"id": "learn", "mode": "daily"}])
+        day = "2026-10-26"
+        for target in (small, large):
+            target.day_start(day, scopes(day))
+            target.step(whole_frame(day, 5, 100, 10))
+            target.step(whole_frame(day, 10, 200, 12))
+            target.day_end()
+            for book in [*target.shadows, *(state["book"] for state in target.states)]:
+                self.assertEqual(book.initial_equity, target.initial_equity)
+                self.assertGreaterEqual(book.cash, 0)
+                self.assertTrue(
+                    all(float(p.quantity).is_integer() for p in book.positions.values())
+                )
+        self.assertEqual(small.states[0]["chosen"], 1)
+        self.assertEqual(large.states[0]["chosen"], 0)
+        self.assertEqual(small.completed_scores[0], [0, 0.2])
+        self.assertEqual(large.completed_scores[0], [1, 0.2])
+        self.assertIn("USD 50", small.report()["weighted_learning"])
+
+    def test_whole_share_rank_skips_hundred_expensive_symbols_for_affordable_candidate(
+        self,
+    ) -> None:
+        target = whole_engine(50, [{"id": "learn", "mode": "daily"}])
+        day = "2026-10-26"
+        target.day_start(day, scopes(day))
+        incoming = whole_frame(day, 5, 100, 100)
+        incoming["quotes"] = {s: 100 if s < 100 else 9 for s in range(101)}
+        incoming["marks"] = {s: [price, incoming["at"]] for s, price in incoming["quotes"].items()}
+        incoming["ranks"] = [[[], [[s, 1, 101 - s] for s in range(100)]], [[], []]]
+        incoming["long_features"] = [
+            [s, [101 - s] + [None] * 29, [1] * 5, [1] * 5] for s in range(101)
+        ]
+        target.step(incoming)
+        for book in (target.shadows[0], target.states[0]["book"]):
+            self.assertEqual(set(book.positions), {100})
+            self.assertEqual(book.positions[100].quantity, 5)
+            self.assertEqual(book.cash, 5)
+            self.assertEqual(book.equity, 50)
+            self.assertEqual(book.rejected_unaffordable, 100)
+        self.assertLessEqual(len(target.whole_bases), 2)
+
+    def test_whole_cold_accounts_count_all_funding_and_rejections(self) -> None:
+        target = whole_engine(
+            50, [{"id": "cold", "mode": "daily", "reset_daily": True, "reset_learning": True}]
+        )
+        for date in range(26, 31):
+            day = f"2026-10-{date}"
+            target.day_start(day, scopes(day))
+            target.step(whole_frame(day, 5, 100, 10))
+            target.step(whole_frame(day, 10, 100, 10))
+            target.day_end()
+        result = target.report()["hypotheses"][0]
+        self.assertEqual(result["summary"]["initial_equity"], 250)
+        self.assertEqual(result["summary"]["equity"], 250)
+        self.assertEqual(result["summary"]["capital_refills"], 200)
+        self.assertEqual(result["summary"]["rejected_unaffordable"], 10)
+        self.assertEqual(result["summary"]["zero_quantity"], 0)
+        self.assertTrue(all(day["start_equity"] == 50 for day in result["daily"]))
+
+    def test_whole_ensemble_cash_quantities_and_prefix_are_conserved(self) -> None:
+        policy = {
+            "id": "ensemble",
+            "mode": "weighted_equal",
+            "window": 1,
+            "allocation": "family_ensemble",
+        }
+        first, changed = whole_engine(50, [policy]), whole_engine(50, [copy.deepcopy(policy)])
+        day = "2026-10-26"
+        for target, final in ((first, 18), (changed, 2)):
+            target.day_start(day, scopes(day))
+            for minute, price in ((5, 10), (10, 11), (15, final)):
+                target.step(whole_frame(day, minute, price, 8))
+            target.day_end()
+            result = target.report()["hypotheses"][0]
+            self.assertTrue(
+                all(float(t["quantity_normalized"]).is_integer() for t in result["trades"])
+            )
+            self.assertTrue(all(t["cash"] >= 0 for t in result["trades"]))
+            self.assertEqual(result["summary"]["debt"], 0)
+            self.assertAlmostEqual(
+                result["summary"]["equity"],
+                50 + result["summary"]["realized"] + result["summary"]["unrealized"],
+            )
+        for key, clock in (("choices", "at"), ("trades", "fill_at")):
+            before, after = [target.report()["hypotheses"][0][key] for target in (first, changed)]
+            self.assertEqual(
+                [x for x in before if x[clock] <= stamp(day, 10)],
+                [x for x in after if x[clock] <= stamp(day, 10)],
+            )
+
+    def test_whole_accounts_reject_leverage_and_missing_full_features(self) -> None:
+        specs = [{"family": "momentum", "side": "long"}]
+        with self.assertRaises(ValueError):
+            WeekEngine(
+                [{**configurations(1)[0], "leverage": 2}],
+                specs,
+                {},
+                [],
+                market="US",
+                long_only=True,
+                whole_shares=True,
+                initial_equity=50,
+            )
+        target = whole_engine(50, [{"id": "fixed", "mode": "static"}])
+        target.day_start("2026-10-26", scopes("2026-10-26"))
+        with self.assertRaisesRegex(ValueError, "full current"):
+            target.step(long_frame("2026-10-26", 5, 10, 10))
+        self.assertEqual(target.states[0]["book"].cash, 50)
+
     def test_long_only_rejects_mixed_configs_and_non_long_ranks_before_trading(self) -> None:
         config = configurations(1)[0]
         for side in ("short", "both", None):
