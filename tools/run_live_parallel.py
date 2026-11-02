@@ -20,6 +20,7 @@ from typing import Any
 
 from papertrade.api import ApiError
 from papertrade.core import Settings
+from tools.combined_hedge import CombinedHedge
 from tools.live_execution import LiveWeekEngine
 from tools.live_feed import LiveFeed, SnapshotHistory
 from tools.run_week_experiment import long_policies
@@ -28,6 +29,7 @@ from tools.search_portfolios import configurations, rank_frame, signals
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (
     "tools/run_live_parallel.py",
+    "tools/combined_hedge.py",
     "tools/live_execution.py",
     "tools/live_feed.py",
     "tools/week_hypotheses.py",
@@ -155,6 +157,10 @@ def reports(output: Path, state: dict[str, Any]) -> None:
     summaries = []
     for mode, engine in state["engines"].items():
         report = engine.report()
+        if mode == "quotes" and "combined" in state:
+            combined = state["combined"].report()
+            combined["policy"] = {"id": "combined_hedge", "mode": "adaptive_allocation"}
+            report["hypotheses"].append(combined)
         for h in report["hypotheses"]:
             signature = [
                 {
@@ -247,10 +253,13 @@ def collect_books(
     frame: dict[str, Any],
     symbols: list[str],
     journal: Journal,
+    combined: CombinedHedge | None = None,
 ) -> None:
     while True:
         advance_frame(frame, now())
         missing = engine.quote_requests(frame)
+        if combined is not None:
+            missing |= combined.required_symbols(frame)
         if not missing:
             return
         for symbol in sorted(missing):
@@ -356,6 +365,8 @@ def run(
                     raise ValueError("Live run has no committed checkpoint")
                 if set(state["engines"]) != {"quotes"}:
                     raise ValueError("This live runner requires quote-only account checkpoints")
+                if "combined" not in state:
+                    raise ValueError("This experiment requires the combined-account checkpoint")
                 symbols = manifest["symbols"]
                 feed.symbols = list(symbols)
                 journal.event("resumed", last_slot=state["last_slot"])
@@ -396,7 +407,13 @@ def run(
                     "scopes": scopes,
                     "policies": policies,
                     "configs": len(configs),
-                    "accounts": len(policies),
+                    "accounts": len(policies) + 1,
+                    "independent_accounts": len(policies),
+                    "combined_account": {
+                        "capital": capital,
+                        "window_minutes": 60,
+                        "weights": "lagged_return_softmax_plus_smoothed_win_rate",
+                    },
                     "execution_models": ["quotes"],
                     "trade_from_regular": trade_from_regular,
                     "code_sha256": {name: digest(ROOT / name) for name in SOURCES},
@@ -429,6 +446,7 @@ def run(
                     engine.day_start(day, scopes)
                 state = {
                     "engines": engines,
+                    "combined": CombinedHedge(engines["quotes"], capital),
                     "history": SnapshotHistory(),
                     "last_slot": -1,
                     "snapshots": 0,
@@ -462,7 +480,16 @@ def run(
                         frame["signal_slot"] = slot
                         frame["fx"] = float(feed.fx()["midRate"])
                         frame["fx_at"] = now()
-                        collect_books(feed, state["engines"]["quotes"], frame, symbols, journal)
+                        collect_books(
+                            feed,
+                            state["engines"]["quotes"],
+                            frame,
+                            symbols,
+                            journal,
+                            state["combined"],
+                        )
+                        state["combined"].prepare(state["engines"]["quotes"], frame)
+                        frame["combined_plan"] = state["combined"].allocations[-1]
                         confirm_books(feed, frame, symbols)
                         advance_frame(frame, now())
                         if datetime.fromisoformat(frame["at"]).timestamp() >= end:
@@ -470,6 +497,7 @@ def run(
                         candidate = copy.deepcopy(state)
                         for engine in candidate["engines"].values():
                             engine.step(frame)
+                        candidate["combined"].step(frame)
                         candidate["last_slot"] = frame["tick"]
                         candidate["evaluations"] += 1
                         journal.commit(candidate, frame)

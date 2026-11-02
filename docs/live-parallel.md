@@ -14,6 +14,7 @@ python3 -m tools.run_live_parallel \
 ## Comparison design
 
 The 59 policies each receive an independent virtual USD 100 in one quote-based execution model.
+An additional combined account receives only USD 100 total, shared across all 59 strategy signals.
 The ideal last-price, zero-fee comparison is excluded from live runs. Its implementation remains
 available only for historical module tests.
 
@@ -27,6 +28,29 @@ model market impact from submitting all accounts together.
 Cold/carry policies and several daily weighting methods coincide on their first day. The
 `behavior_group` field identifies matching trade histories. The account count is not a count
 of independent strategies or evidence for a probability of profit.
+
+## Combined allocation experiment
+
+The combined account is a separate scenario alongside the 59 independent references. It never
+receives their profits or cash. At each decision, weights use only their previously committed
+performance. Scores combine 60-minute fee-bearing mark returns divided by their cross-sectional
+standard deviation (minimum 0.000001), and full-history position win rate smoothed with a
+Beta(1,1) prior, minus 0.5. Softmax normalizes scores to weights summing to one. The first
+decision is equally weighted. These are frozen first-trial parameters, not optimized results.
+
+A read-only clone obtains current strategy exposures from the initial quotes. Weighted dollar
+exposures are aggregated by symbol and rounded down to whole-share targets for the single
+account. Its reductions execute before increases. Targets stay frozen while confirmation quotes
+arrive. Unfilled sales do not release cash, and all orders share one cash balance and depth pool.
+Position increases retain weighted entry prices, entry fees and KRW basis. One annual tax
+allowance applies to the combined account, not one allowance per strategy.
+
+Allocation history records target weights, reference-performance cutoff, net quantity targets
+and concentration. These are target strategy allocations; this version does not maintain
+separately realized internal sleeve profits. The external reference scores drive weights.
+Whole-share rounding can leave cash idle, especially with USD 100 spread across many signals.
+Duplicate policies can amplify similar exposures. Dynamic allocation is not proof of downside
+hedging. Compare its own net results, drawdown, costs and missed fills with the independent books.
 
 ## Shared observations and causal execution
 
