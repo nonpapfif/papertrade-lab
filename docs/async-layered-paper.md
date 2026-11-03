@@ -54,3 +54,10 @@ Old results are retained and are not directly interchangeable with the revised t
 This is an in-memory research engine. Durable crash recovery and dynamic whole-universe candidate
 subscription remain separate integration work. Recorded-source replay does not measure live
 production latency, actual broker queue position, or strategy generalization.
+
+Additional adversarial coverage rejects features from another symbol or with nonfinite values before
+queueing. Unexpected worker failures propagate to the corresponding caller without leaving an
+unresolved acknowledgement. Cancelling an acknowledgement wait does not cancel or duplicate an
+already accepted paper intent. Holding quote staleness uses elapsed seconds and the configured
+quote-age threshold, including equivalent timestamps in different timezones. Async account marks
+are explicitly labelled as book midpoints rather than last trades.
