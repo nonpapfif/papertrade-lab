@@ -16,6 +16,57 @@ def feature(minute: int = 0, symbol: int = 0) -> Feature:
 
 
 class LayerTests(unittest.TestCase):
+    def bars(self, missing=()):
+        at = datetime.fromisoformat(frame()["decision_at"])
+        rows = [
+            {
+                "timestamp": (at - timedelta(minutes=16 - i)).isoformat(),
+                "available_at": (at - timedelta(minutes=15 - i)).isoformat(),
+                "closePrice": str(10 + i / 100),
+                "highPrice": str(10.1 + i / 100),
+            }
+            for i in range(16)
+            if i not in missing
+        ]
+        return at, rows
+
+    def test_sparse_observations_use_time_references_without_filling_rows(self) -> None:
+        at, rows = self.bars(missing=(1, 2, 7, 8, 12))
+        original = copy.deepcopy(rows)
+        f = feature_from_bars(0, rows, at.isoformat())
+        self.assertIsNotNone(f)
+        self.assertAlmostEqual(f.r5, 10.15 / 10.10 - 1)
+        self.assertAlmostEqual(f.r15, 10.15 / 10 - 1)
+        self.assertEqual(f.observations, 11)
+        self.assertEqual(f.missing_minutes, 5)
+        self.assertEqual(f.max_gap_seconds, 180)
+        self.assertEqual(rows, original)
+
+    def test_missing_reference_uses_only_an_earlier_nearby_observation(self) -> None:
+        at, rows = self.bars(missing=(10,))
+        f = feature_from_bars(0, rows, at.isoformat())
+        self.assertAlmostEqual(f.r5, 10.15 / 10.09 - 1)
+        self.assertEqual(f.reference5_age_seconds, 60)
+        self.assertEqual(f.reference15_age_seconds, 0)
+
+    def test_overly_old_reference_is_still_unavailable(self) -> None:
+        at, rows = self.bars(missing=(9, 10))
+        self.assertIsNone(feature_from_bars(0, rows, at.isoformat()))
+
+    def test_dense_features_keep_existing_numerical_values(self) -> None:
+        at, rows = self.bars()
+        f = feature_from_bars(0, rows, at.isoformat())
+        self.assertAlmostEqual(f.r5, 10.15 / 10.10 - 1)
+        self.assertAlmostEqual(f.mean, sum(10 + i / 100 for i in range(15)) / 15)
+        self.assertEqual(f.missing_minutes, 0)
+        self.assertEqual(f.observations, 16)
+
+    def test_stale_latest_bar_and_naive_clock_are_not_silently_accepted(self) -> None:
+        at, rows = self.bars()
+        self.assertIsNone(feature_from_bars(0, rows, (at + timedelta(seconds=91)).isoformat()))
+        with self.assertRaises(ValueError):
+            feature_from_bars(0, rows, at.replace(tzinfo=None).isoformat())
+
     def test_assignment_and_maintenance_are_distinct(self) -> None:
         f = feature()
         self.assertEqual(assign(f), "breakout")

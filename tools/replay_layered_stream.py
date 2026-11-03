@@ -8,7 +8,7 @@ import gzip
 import hashlib
 import json
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
@@ -82,8 +82,22 @@ def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
     books, history = read_recording(capture, ids)
     received = {s: [parse(x["received_at"]) for x in rows] for s, rows in books.items()}
     feature_times = {s: [r[0] for r in rows] for s, rows in history.items()}
+    coverage = {
+        symbol: {
+            "snapshots": len(history[i]),
+            "usable_snapshots": sum(f is not None for _, f in history[i]),
+            "observed_features": [asdict(f) for _, f in history[i] if f is not None],
+        }
+        for symbol, i in ids.items()
+    }
+    private_json(output / "feature-coverage.json", coverage)
     decisions = sorted(
-        {t for rows in received.values() for t in rows if t >= parse(freeze["frozen_at"])}
+        {
+            t
+            for rows in received.values()
+            for t in rows
+            if t >= parse(freeze.get("evaluation_start", freeze["frozen_at"]))
+        }
     )
     fx_history = json.loads((output / "fx-history.json").read_text())["observations"]
     fx_times = [parse(r["received_at"]) for r in fx_history]
@@ -173,6 +187,7 @@ def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
                 "ai_calls": 0,
             },
         )
+    total_entries = sum(row["account"]["entries"] for row in results if row.get("account"))
     private_json(
         output / "results.json",
         {
@@ -182,6 +197,12 @@ def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
             "real_orders": False,
             "freeze": freeze,
             "decisions_available": len(decisions),
+            "evaluation_status": "inconclusive" if total_entries == 0 else "observed_short_sample",
+            "total_entries_including_counterfactual_duplicates": total_entries,
+            "feature_coverage": {
+                s: {k: v for k, v in item.items() if k != "observed_features"}
+                for s, item in coverage.items()
+            },
             "results": results,
             "limitations": [
                 "Two recorded US symbols in one short session; not generalization proof",
@@ -191,6 +212,17 @@ def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
                 "Tax uses observed trade-time FX estimates, not statutory settlement-date FX",
                 "Source clocks are not corrected; future/stale quote rules remain enforced",
             ],
+        },
+    )
+    private_json(
+        output / "progress.json",
+        {
+            "state": "complete",
+            "at": now(),
+            "completed": len(results),
+            "total": len(results),
+            "ai_calls": 0,
+            "evaluation_status": "inconclusive" if total_entries == 0 else "observed_short_sample",
         },
     )
 

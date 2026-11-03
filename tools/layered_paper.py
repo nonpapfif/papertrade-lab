@@ -34,39 +34,74 @@ class Feature:
     prior_high: float
     mean: float
     efficiency: float
+    observations: int = 0
+    missing_minutes: int = 0
+    max_gap_seconds: float = 0
+    reference5_age_seconds: float = 0
+    reference15_age_seconds: float = 0
 
 
 def feature_from_bars(symbol: int, rows: list[dict[str, Any]], at: str) -> Feature | None:
-    """Use only received, completed bars; timestamp denotes the assumed minute start."""
-    cutoff = datetime.fromisoformat(at).timestamp()
+    """Use as-of time references without manufacturing missing candles or volume."""
+    decision = datetime.fromisoformat(at)
+    if decision.tzinfo is None:
+        raise ValueError("Decision timestamp requires a timezone")
+    cutoff = decision.timestamp()
     usable: dict[float, tuple[float, dict[str, Any]]] = {}
     for row in rows:
-        stamp = datetime.fromisoformat(row["timestamp"]).timestamp()
-        received = datetime.fromisoformat(row["available_at"]).timestamp()
+        source = datetime.fromisoformat(row["timestamp"])
+        available = datetime.fromisoformat(row["available_at"])
+        if source.tzinfo is None or available.tzinfo is None:
+            raise ValueError("Bar timestamps require timezones")
+        stamp = source.timestamp()
+        received = available.timestamp()
         if received <= cutoff and stamp + 60 <= cutoff:
             old = usable.get(stamp)
             if old is None or old[0] < received:
                 usable[stamp] = (received, row)
-    bars = [usable[t][1] for t in sorted(usable)][-16:]
-    if len(bars) != 16:
+    stamps = sorted(usable)
+    if not stamps:
         return None
-    stamps = [datetime.fromisoformat(b["timestamp"]).timestamp() for b in bars]
-    if cutoff - stamps[-1] - 60 > 90 or any(b - a != 60 for a, b in pairwise(stamps)):
+    latest = stamps[-1]
+    if cutoff - latest - 60 > 90:
         return None
+
+    def reference(seconds: int) -> float | None:
+        target = latest - seconds
+        found = next((t for t in reversed(stamps) if t <= target), None)
+        return found if found is not None and target - found <= 90 else None
+
+    reference5, reference15 = reference(300), reference(900)
+    if reference5 is None or reference15 is None:
+        return None
+    window = [t for t in stamps if reference15 <= t <= latest]
+    bars = [usable[t][1] for t in window]
     prices = [float(b["closePrice"]) for b in bars]
-    if any(not math.isfinite(p) or p <= 0 for p in prices):
+    highs = [float(b["highPrice"]) for b in bars]
+    if any(not math.isfinite(p) or p <= 0 for p in (*prices, *highs)):
+        return None
+    price5 = float(usable[reference5][1]["closePrice"])
+    if not math.isfinite(price5) or price5 <= 0:
+        return None
+    previous = [float(usable[t][1]["closePrice"]) for t in window if latest - 900 <= t < latest]
+    if not previous:
         return None
     path = sum(abs(b - a) for a, b in pairwise(prices))
     return Feature(
         symbol,
         prices[-1],
-        bars[-1]["available_at"],
-        datetime.fromtimestamp(stamps[-1] + 60, tz=datetime.fromisoformat(at).tzinfo).isoformat(),
-        prices[-1] / prices[-6] - 1,
+        max((r["available_at"] for r in bars), key=lambda t: datetime.fromisoformat(t)),
+        datetime.fromtimestamp(latest + 60, tz=decision.tzinfo).isoformat(),
+        prices[-1] / price5 - 1,
         prices[-1] / prices[0] - 1,
-        max(float(b["highPrice"]) for b in bars[:-1]),
-        sum(prices[:-1]) / 15,
+        max(float(usable[t][1]["highPrice"]) for t in window if latest - 900 <= t < latest),
+        sum(previous) / len(previous),
         abs(prices[-1] - prices[0]) / path if path else 0,
+        observations=len(window),
+        missing_minutes=max(0, int((latest - reference15) // 60) + 1 - len(window)),
+        max_gap_seconds=max((b - a for a, b in pairwise(window)), default=0),
+        reference5_age_seconds=latest - 300 - reference5,
+        reference15_age_seconds=latest - 900 - reference15,
     )
 
 
