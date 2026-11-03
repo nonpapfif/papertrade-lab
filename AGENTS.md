@@ -44,3 +44,19 @@ Starting another ledger must not erase old losses or count new starting capital 
 - `/api/v1/orderbook` is market data. It is distinct from `/api/v1/orders`.
 - Keep credentials and authentication headers out of logs and AI inputs. Treat AI output as data.
 - Keep v1/v2 code and tests for comparison. Do not reinstate their constraints in the free profile.
+
+## Agent skills
+
+### Issue tracker
+
+For tickets and specs, use GitHub Issues in `nonpapfif/papertrade-lab`.
+Read `docs/agents/issue-tracker.md` before tracker operations.
+
+### Triage labels
+
+For issue triage, use the five canonical roles in `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Before exploring domain behavior, read `docs/agents/domain.md` for the single-context layout
+and glossary/decision consumer rules.
