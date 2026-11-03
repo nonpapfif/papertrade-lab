@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import time
 import urllib.request
 from collections import Counter
@@ -34,6 +36,42 @@ def now() -> str:
 def read_spec() -> bytes:
     with urllib.request.urlopen(SPEC, timeout=15) as response:
         return response.read()
+
+
+def error_details(error: BaseException, token: str) -> dict[str, Any]:
+    details: dict[str, Any] = {"error_type": type(error).__name__}
+    for name in ("rcvd", "sent"):
+        close = getattr(error, name, None)
+        if close is not None:
+            reason = str(close.reason)
+            if token:
+                reason = reason.replace(token, "[redacted]")
+            reason = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", reason, flags=re.IGNORECASE)
+            details[name] = {"code": int(close.code), "reason": reason[:256]}
+    details["rcvd_then_sent"] = getattr(error, "rcvd_then_sent", None)
+    response = getattr(error, "response", None)
+    if response is not None:
+        details["http_status"] = getattr(response, "status_code", None)
+    if error.__cause__ is not None:
+        details["cause_type"] = type(error.__cause__).__name__
+    return details
+
+
+def record_source_delta(stats: dict[str, Any], source: Any, received: str) -> None:
+    try:
+        stamp = datetime.fromisoformat(source)
+        if stamp.tzinfo is None:
+            raise ValueError("Missing source timezone")
+        delta = (datetime.fromisoformat(received) - stamp).total_seconds()
+    except (ValueError, TypeError):
+        stats["invalid_timestamp_count"] = stats.get("invalid_timestamp_count", 0) + 1
+        return
+    stats["count"] = stats.get("count", 0) + 1
+    stats["negative_count"] = stats.get("negative_count", 0) + int(delta < 0)
+    stats["min_seconds"] = min(stats.get("min_seconds", delta), delta)
+    stats["max_seconds"] = max(stats.get("max_seconds", delta), delta)
+    stats["sum_seconds"] = stats.get("sum_seconds", 0) + delta
+    stats["interpretation"] = "raw_clock_difference_plus_delivery_delay_not_network_latency"
 
 
 class CachedTokenClient(MarketClient):
@@ -92,7 +130,8 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     logging.getLogger("websockets").setLevel(logging.CRITICAL)
     started = datetime.now(UTC)
-    deadline = time.monotonic() + duration
+    monotonic_start = time.monotonic()
+    deadline = monotonic_start + duration
     state: dict[str, Any] = {
         "state": "preflight",
         "started_at": started.isoformat(),
@@ -108,6 +147,23 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
         "symbols": symbols,
     }
     private_json(output / "status.json", state)
+    token = ""
+    counts: Counter[str] = Counter()
+    events = (output / "events.jsonl").open("x", buffering=1)
+
+    def event(kind: str, **data: Any) -> None:
+        events.write(
+            json.dumps(
+                {
+                    "at": now(),
+                    "monotonic_elapsed": time.monotonic() - monotonic_start,
+                    "kind": kind,
+                    **data,
+                }
+            )
+            + "\n"
+        )
+
     try:
         client = CachedTokenClient(Settings.load(ROOT))
         token = client.access_token()
@@ -136,9 +192,10 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
                 "real_orders": False,
                 "ai_calls": 0,
                 "scope": "T0, T1 and one controlled reconnect; not strategy or fill validation",
+                "transport_ping_interval_seconds": 20,
+                "application_ping_interval_seconds": 60,
             },
         )
-        counts: Counter[str] = Counter()
         with (output / "frames.jsonl").open("x") as stream:
             for segment in range(2):
                 segment_end = min(deadline, time.monotonic() + duration / 2)
@@ -147,6 +204,7 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
                     "connected_at": now(),
                     "counts": {},
                     "subscribed": [],
+                    "source_clock_deltas": {},
                 }
                 state["segments"].append(detail)
                 segment_counts: Counter[str] = Counter()
@@ -154,50 +212,111 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
                     URL,
                     additional_headers={"Authorization": "Bearer " + token},
                     proxy=None,
-                    ping_interval=None,
+                    ping_interval=20,
+                    ping_timeout=20,
                     open_timeout=15,
                     close_timeout=5,
                 ) as ws:
                     await ws.send(json.dumps(request))
-                    next_ping = time.monotonic()
+                    event("connected_and_declared", segment=segment)
                     pending_pong: float | None = None
-                    while time.monotonic() < segment_end:
-                        tick = time.monotonic()
-                        if pending_pong is not None and tick - pending_pong > 20:
-                            raise TimeoutError("Pong deadline exceeded")
-                        if tick >= next_ping:
+
+                    async def heartbeat(
+                        end: float = segment_end,
+                        number: int = segment,
+                        metrics: dict[str, Any] = detail,
+                    ) -> None:
+                        nonlocal pending_pong
+                        while time.monotonic() < end:
+                            tick = time.monotonic()
+                            if pending_pong is not None:
+                                event("application_pong_timeout", segment=number)
+                                await ws.close(code=1011, reason="Application pong deadline")
+                                raise TimeoutError("Pong deadline exceeded")
                             await ws.send("PING")
                             pending_pong = tick
-                            next_ping = tick + 60
-                        try:
-                            raw_frame = await asyncio.wait_for(
-                                ws.recv(), timeout=min(1, max(0.01, segment_end - time.monotonic()))
+                            metrics["pings_sent"] = metrics.get("pings_sent", 0) + 1
+                            event("ping_sent", segment=number)
+                            await asyncio.sleep(20)
+                            if pending_pong is not None:
+                                continue
+                            await asyncio.sleep(40)
+
+                    heartbeat_task = asyncio.create_task(heartbeat())
+                    last_status = time.monotonic()
+                    try:
+                        while time.monotonic() < segment_end:
+                            if heartbeat_task.done():
+                                heartbeat_task.result()
+                            tick = time.monotonic()
+                            if tick - last_status >= 10:
+                                state.update(state="running", at=now(), counts=dict(counts))
+                                detail["wall_clock_step_seconds"] = (
+                                    datetime.now(UTC) - started
+                                ).total_seconds() - (tick - monotonic_start)
+                                private_json(output / "status.json", state)
+                                stream.flush()
+                                last_status = tick
+                            try:
+                                raw_frame = await asyncio.wait_for(
+                                    ws.recv(),
+                                    timeout=min(1, max(0.01, segment_end - time.monotonic())),
+                                )
+                            except TimeoutError:
+                                continue
+                            frame = json.loads(raw_frame)
+                            key, safe = inspect_frame(frame, expected)
+                            counts[key] += 1
+                            segment_counts[key] += 1
+                            if key == "pong":
+                                event(
+                                    "pong_received",
+                                    segment=segment,
+                                    application_rtt_seconds=(time.monotonic() - pending_pong)
+                                    if pending_pong is not None
+                                    else None,
+                                    transport_rtt_seconds=ws.latency,
+                                )
+                                pending_pong = None
+                            elif key == "subscriptions":
+                                detail["subscribed"] = safe["subscribed"]
+                                if safe["rejected_count"] or set(safe["subscribed"]) != expected:
+                                    raise ValueError("Market subscriptions were not fully accepted")
+                            elif key == "error":
+                                event("provider_error", segment=segment, code=safe.get("code"))
+                                raise ValueError("Provider returned a WebSocket error frame")
+                            received = now()
+                            detail["last_frame_at"] = received
+                            if key not in ("pong", "subscriptions"):
+                                record_source_delta(
+                                    detail["source_clock_deltas"],
+                                    safe["data"].get("timestamp"),
+                                    received,
+                                )
+                            stream.write(
+                                json.dumps(
+                                    {"received_at": received, "segment": segment, "frame": safe}
+                                )
+                                + "\n"
                             )
-                        except TimeoutError:
-                            continue
-                        frame = json.loads(raw_frame)
-                        key, safe = inspect_frame(frame, expected)
-                        counts[key] += 1
-                        segment_counts[key] += 1
-                        if key == "pong":
-                            pending_pong = None
-                        elif key == "subscriptions":
-                            detail["subscribed"] = safe["subscribed"]
-                            if safe["rejected_count"] or set(safe["subscribed"]) != expected:
-                                raise ValueError("Market subscriptions were not fully accepted")
-                        elif key == "error":
-                            raise ValueError("Provider returned a WebSocket error frame")
-                        stream.write(
-                            json.dumps({"received_at": now(), "segment": segment, "frame": safe})
-                            + "\n"
+                            detail["counts"] = dict(segment_counts)
+                            if key == "pong" or key == "subscriptions":
+                                stream.flush()
+                                state.update(state="running", at=now(), counts=dict(counts))
+                                private_json(output / "status.json", state)
+                    finally:
+                        heartbeat_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await heartbeat_task
+                        event(
+                            "connection_exiting",
+                            segment=segment,
+                            close_code=ws.close_code,
+                            transport_rtt_seconds=ws.latency,
                         )
-                        detail["counts"] = dict(segment_counts)
-                        if key == "pong" or key == "subscriptions":
-                            stream.flush()
-                            state.update(state="running", at=now(), counts=dict(counts))
-                            private_json(output / "status.json", state)
                     stream.flush()
                 detail["closed_at"] = now()
+                event("normal_close", segment=segment, close_code=ws.close_code)
                 state["connections_completed"] += 1
                 if segment == 0:
                     state.update(state="controlled_disconnect", at=now(), counts=dict(counts))
@@ -219,9 +338,13 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
             state["result"] = "inconclusive"
         private_json(output / "status.json", state)
     except (OSError, ValueError, KeyError, TypeError, SafetyError, WebSocketException) as error:
-        state.update(state="failed", at=now(), error_type=type(error).__name__)
+        details = error_details(error, token)
+        event("failed", **details)
+        state.update(state="failed", at=now(), counts=dict(counts), **details)
         private_json(output / "status.json", state)
         raise SystemExit("Probe failed; see sanitized status.json") from None
+    finally:
+        events.close()
 
 
 def main() -> None:
