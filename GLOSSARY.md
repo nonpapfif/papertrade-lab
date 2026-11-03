@@ -43,3 +43,12 @@ Strategy promotion affects new entries; account-wide risk limits still apply to 
 **Historical simulation**:
 A supporting experiment that compares strategy candidates on past market data.
 It is not the project's primary deliverable.
+
+**Observation trace**:
+The ordered record of what an execution observed and when its decisions were made,
+including processing delays and periods without quote updates.
+
+**Execution reproduction**:
+Replay of an observation trace with the same strategy version, account starting state,
+and execution assumptions to reproduce the recorded execution's decisions and outcomes.
+_Avoid_: Idealized zero-delay simulation
