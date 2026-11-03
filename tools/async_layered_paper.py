@@ -75,6 +75,22 @@ class AsyncLayeredPaper(LayeredPaper):
     def enqueue(self, event: dict[str, Any]) -> asyncio.Future:
         """Copy inputs on submission so producers cannot change queued observations."""
         symbol = event["symbol"]
+        feature = event.get("feature")
+        if feature is not None:
+            if not isinstance(feature, Feature):
+                raise TypeError("Expected a Feature or None")
+            if feature.symbol != symbol:
+                raise ValueError("Feature does not belong to event symbol")
+            values = (
+                feature.price,
+                feature.r5,
+                feature.r15,
+                feature.prior_high,
+                feature.mean,
+                feature.efficiency,
+            )
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("Feature values must be finite")
         if event["id"] in self._processed:
             done = asyncio.get_running_loop().create_future()
             done.set_result(None)
@@ -108,7 +124,7 @@ class AsyncLayeredPaper(LayeredPaper):
                     finally:
                         self._completed += 1
                         self._turn.notify_all()
-            except (ValueError, KeyError, TypeError, RuntimeError, OverflowError) as error:
+            except Exception as error:  # noqa: BLE001 - Forward every worker failure to its caller.
                 if not done.done():
                     # Keep the failure traceback without exposing the suspended worker frame.
                     traceback = error.__traceback__
@@ -328,6 +344,18 @@ class AsyncLayeredPaper(LayeredPaper):
             "fx_at": self._fx[1],
         }
         result = super().summary()
+        assert self.last_at is not None
+        cutoff = seconds(self.last_at)
+        result["account"]["stale_open_positions"] = sum(
+            not 0
+            <= cutoff - seconds(self.times[symbol])
+            <= self.context.schedule["max_quote_age_seconds"]
+            for symbol in self.book.positions
+        )
+        result["account"]["oldest_open_quote_at"] = min(
+            (self.times[symbol] for symbol in self.book.positions), key=seconds, default=None
+        )
+        result["account"]["mark_basis"] = "book_midpoint_not_liquidated"
         result.update(
             reserved_cash=self.reserved_cash,
             available_cash=self.available_cash,
