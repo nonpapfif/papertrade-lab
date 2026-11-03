@@ -52,3 +52,24 @@ including processing delays and periods without quote updates.
 Replay of an observation trace with the same strategy version, account starting state,
 and execution assumptions to reproduce the recorded execution's decisions and outcomes.
 _Avoid_: Idealized zero-delay simulation
+
+**Strategy artifact**:
+An immutable executable definition of a strategy's rules, parameters and declared dependencies.
+
+**Evaluation contract**:
+The fixed comparison conditions and qualification criteria established before a candidate's
+final evaluation begins.
+
+**Account reservation**:
+Funds or sellable position quantity withheld from new use for outstanding or potentially
+accepted execution requests.
+
+**Uncertain operation**:
+A requested execution change whose outcome lacks attributable acceptance or rejection evidence.
+
+**Reconciliation**:
+The evidence-based comparison of local financial state with externally observed account,
+order and execution state at a known observation cut.
+
+**Operating blocker**:
+A persistent reason that prevents specified account actions until its required resolution.
