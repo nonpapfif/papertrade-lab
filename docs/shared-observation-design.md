@@ -127,9 +127,9 @@ market traffic, or model calls:
 
 ## Delivery order
 
-First fix the two separately reproduced supervisor transition defects using their regression
-cases. They concern GitHub code publication and completion, not runtime strategy promotion.
-Then introduce the shared preparation seam with synthetic parity tests, migrate the two
+The separately reproduced supervisor transition defects now have controller guards and
+regression coverage. They concern GitHub code publication and completion, not runtime strategy
+promotion. Next introduce the shared preparation seam with synthetic parity tests, migrate the two
 callers, and add trace capture/replay evidence in separate reviewable changes.
 Existing recorded experiments retain their versions and results throughout migration.
 Numerical live risk limits, strategy promotion criteria, persistent recovery, Korean-market

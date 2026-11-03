@@ -223,6 +223,62 @@ class AutotestSupervisorTests(unittest.TestCase):
         self.assertNotEqual(self.runner.state["phase"], "publish")
         self.command.assert_not_called()
 
+    def test_fix_review_cannot_authorize_publication(self) -> None:
+        self.completed_review(
+            self.review(decision="fix", publish_ok=True), worktree=str(self.repo)
+        )
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "Contradictory review"),
+        ):
+            self.runner.finish_model()
+        self.assertNotEqual(self.runner.state["phase"], "publish")
+        self.command.assert_not_called()
+
+    def test_blocked_review_cannot_authorize_publication(self) -> None:
+        self.completed_review(
+            self.review(decision="blocked", publish_ok=True), worktree=str(self.repo)
+        )
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "Contradictory review"),
+        ):
+            self.runner.finish_model()
+        self.assertNotEqual(self.runner.state["phase"], "publish")
+        self.command.assert_not_called()
+
+    def test_failed_checks_cannot_be_marked_complete(self) -> None:
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
+        )
+        self.runner.state["tests_passed"] = False
+        self.runner.state["test_jobs"] = [{"returncode": 1}]
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "failed mechanical checks"),
+        ):
+            self.runner.finish_model()
+        self.assertNotEqual(self.runner.state["phase"], "complete")
+        self.command.assert_not_called()
+
+    def test_passing_continue_review_can_authorize_publication(self) -> None:
+        self.completed_review(self.review(publish_ok=True), worktree=str(self.repo))
+        with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
+            self.runner.finish_model()
+        self.assertEqual(self.runner.state["phase"], "publish")
+        self.assertEqual(self.runner.state["publication_digest"], "A")
+        self.command.assert_not_called()
+
+    def test_inherited_evidence_can_complete_without_scheduled_checks(self) -> None:
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
+        )
+        del self.runner.state["tests_passed"]
+        with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
+            self.runner.finish_model()
+        self.assertEqual(self.runner.state["phase"], "complete")
+        self.command.assert_not_called()
+
     def test_source_change_after_test_preparation_blocks_start(self) -> None:
         self.runner.prepare_tests("")
         self.digest.return_value = "B"
