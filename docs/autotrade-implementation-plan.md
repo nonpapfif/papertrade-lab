@@ -1,188 +1,99 @@
-# Autotrade implementation slices
+# Autotrade scope and implementation plan
 
-Status: planned work, not completed implementation. No GitHub implementation issues have been
-published by this document. The dependency IDs below are local design references.
-Read [system design](autotrade-system-design.md) and its linked contracts before implementing.
+Status: scope review completed; the first live comparison is not implemented or run.
+This plan supersedes the earlier assumption that all W01-W11 form a mandatory delivery chain.
+The [system design](autotrade-system-design.md) remains a future contract reference, not a list
+of prerequisites for every experiment. Implement only what the active milestone requires.
 
-Each slice delivers a demonstrable paper/synthetic path and its regression tests.
-Use the existing unittest, SQLite, audit, execution and macOS isolation facilities where suitable.
-Do not introduce real broker traffic, service restarts or new infrastructure to demonstrate a slice.
-The original free profile and historical results remain separately versioned and unchanged.
+## Active milestone
 
-```mermaid
-flowchart LR
-    W01 --> W03
-    W02 --> W03
-    W03 --> W04 --> W05 --> W06 --> W07
-    W07 --> W08 --> W10
-    W07 --> W09 --> W10
-    W10 --> W11
-```
+Complete one finite US live-data paper comparison of an incumbent and a candidate strategy.
+Freeze both definitions/configurations before observations arrive. Give independent accounts
+the same published observations, starting capital, and cost/fill assumptions. Save comparable
+results and provenance. Report observations; do not automatically qualify or promote a winner.
 
-## W01: Reproduce live decision preparation from a complete trace
+The target is a simultaneous live-input comparison. Recorded/synthetic comparisons support
+its tests; they do not satisfy the live demonstration. Exact replay of a live run is separate.
+This scope review does not launch a live campaign or change the current authorization.
 
-Blocked by: none. Covers D7 and the shared-observation prerequisite.
+## Existing capability and smallest gap
 
-Deliver the same account-submission events from live-input fixtures and recorded-input fixtures
-through shared preparation code. Capture sequence, receipt, decision clocks and idle clocks.
-Preserve legacy recording semantics and identify incomplete evidence explicitly.
+Checked against source baseline `bcbe06a` on 2026-11-04:
 
-- [ ] Equal-time observations and delayed decisions preserve original order and logical time.
-- [ ] Candidate features/counts use each account's own policy, holdings and pending state.
-- [ ] Identical trace/configuration/initial state produces identical intents and outcomes.
-- [ ] Existing duplicate, future-mutation, partial-fill and no-borrowing checks remain valid.
+- `replay_case` already creates independent `AsyncLayeredPaper` accounts for fixed settings.
+- `evaluate` already saves per-account results and assumptions, but runs a broad predefined grid.
+- `Runtime` in the finite layered live runner currently owns one account.
+- The older parallel live runner already fans out common frames and saves provenance, but uses
+  a different engine. Reuse it only if it actually expresses the two intended strategies.
+- Existing account summaries already expose trades, intents, pending reservations, cash,
+  fees and valuation assumptions. A new accounting module is not a prerequisite.
 
-Demo: one synthetic trace runs through both adapters and produces equal saved account results.
+An offline scope-audit harness used the existing replay function without runtime changes:
+identical settings produced equal summaries; different fixed rules could act differently;
+the accounts remained independent. Nine existing replay/live-adapter tests passed.
+This evidence establishes reusable mechanics, not a completed live comparison or profit claim.
 
-## W02: Preserve a position's immutable strategy version through promotion
+## Required work now
 
-Blocked by: none. Covers D3.
+| Step | Necessary delivery | Reuse and limit |
+| --- | --- | --- |
+| M1 | Specify/freeze the incumbent, candidate and matching execution conditions | Reuse existing rules/configuration; no optimizer or version-loading platform |
+| M2 | Fan out one ordered live observation stream to separate accounts | Reuse the current execution engine; compute filters/counts from each account's own state |
+| M3 | Save one comparison bundle with metrics, assumptions and failures | Reuse existing summaries/recording helpers; no automatic promotion verdict |
+| M4 | Verify independence, equal input and saved evidence, then demonstrate the finite path | Existing fixture tests plus focused fanout/report tests; no full future fault campaign |
 
-Pin artifact digests to intents and positions using an offline paper account. Switch the
-new-entry pointer while an old-version position and dispatched request remain open.
+Use one observation cut/logical dispatch time for both accounts and record actual processing
+and observation limitations. Never silently make the accounts share reservations or consumed
+paper liquidity. Preserve union protection for held/pending subscriptions. Fix local duplicated
+logic only when it prevents the two accounts from seeing the intended equivalent inputs.
+A shared live/replay framework, new database or broad engine extraction is not required.
 
-- [ ] Old positions, late fills and partial exits retain original management rules.
-- [ ] Unsent retired entry intents are invalidated without releasing uncertain external exposure.
-- [ ] New versions cannot overwrite or add to a differently owned same-symbol exposure.
-- [ ] Referenced artifacts cannot be removed; rollback changes new entries only.
+## Stop criteria
 
-Demo: promote between entry and confirmation; the late fill keeps the original strategy owner.
+Stop this milestone when all of these are demonstrated:
 
-## W03: Recover a durable paper account without duplicate effects
+1. The two fixed strategy/configuration identities and source versions are saved before entry.
+2. Independent accounts begin with equal capital and matching cost/fill assumptions.
+3. A single publication sequence feeds both accounts; event identity, order and logical time
+   are comparable. Different strategies and account states may produce different decisions.
+4. Results save interval, observed/subscribed coverage, input/source identity, costs, realized
+   and unrealized results, cash, positions, pending requests and valuation limitations.
+5. An interruption or failure is recorded as incomplete. Do not silently restart from fresh
+   capital, discard losses, invent final liquidation or label the run a clean comparison.
+6. Focused tests detect shared-account mutation, unequal inputs/settings and missing evidence;
+   the finite live demonstration's actual scope and limitations are reported.
 
-Blocked by: W01, W02. Covers D1.
+No trade or too little evidence is a valid inconclusive report, not a trigger to add features.
+Live results need not prove profitability to complete this plumbing milestone.
+Do not expand into automatic promotion, optimization, continuous operation or exact replay
+merely because the comparison works or reveals a new future-work opportunity.
 
-Persist layered cash, positions, owners, reservations, outcomes and financial cursor atomically.
-Reuse transaction/backup concepts without attaching legacy fixed-capital initialization to the
-new account schema. Restore an interrupted scenario in a fresh process.
+## Reclassification of the original plan
 
-- [ ] Every documented crash point recovers the same economic account state.
-- [ ] Duplicate evidence and repeated recovery never duplicate cash or quantity.
-- [ ] Corrupt/old checkpoints and missing trace/artifact dependencies remain visible blockers.
-- [ ] Backups preserve prior losses and require later evidence before returning to readiness.
+| ID | Classification now | Minimum needed now or trigger for later work |
+| --- | --- | --- |
+| W01 | Required subset; full task conditional | Shared input/order/time for M2. Full trace parity and live/replay extraction only when exact execution reproduction is required |
+| W02 | Conditional | Freeze configuration/source identity now. Immutable executable ownership and hot promotion when versions change with open positions or outstanding requests |
+| W03 | Conditional | Persistent recovery before resume-after-crash or long-lived account operation. A disposable failed comparison can end as incomplete |
+| W04 | Conditional | Preserve existing paper cash/quantity invariants now. Durable risk/control policy before unattended persistent operation or real-money readiness |
+| W05 | Deferred | Unknown external submissions/cancel/replace handling when an external order adapter is actually in scope |
+| W06 | Deferred | Broker reconciliation when authorized external accounts/orders are introduced |
+| W07 | Required subset; full task conditional | Fixed-account comparison and reporting now. Frozen qualification contract and atomic promotion when automatic replacement is enabled |
+| W08 | Conditional | Optimizer isolation/authority when AI-generated artifacts are accepted or executed. Two preselected existing rules do not require an AI proposal pipeline |
+| W09 | Conditional | Existing shutdown/error reporting now. Persistent stop/resume, rollback and configured alerts before unattended continuous operation |
+| W10 | Required subset; full task deferred | M4 verifies the two-account path. Combined recovery/order/promotion fault campaign after those functions exist |
+| W11 | Deferred | KR/mixed-market work after the US path reaches its milestone, consistent with the agreed rollout order |
 
-Demo: kill after a partial-fill commit, restart twice, and reconcile identical cash/reservations.
+Deferred means not needed for this milestone, not unnecessary for eventual real trading.
+Keep the detailed [execution](execution-recovery-design.md),
+[strategy](strategy-lifecycle-design.md), and [control](operational-control-design.md) designs
+as references when their trigger becomes real. Their dependency descriptions do not block M1-M4.
 
-## W04: Enforce fixed risk policy and durable stop before paper dispatch
+## Rule for adding work
 
-Blocked by: W03. Covers D2 and the execution gate required by D9.
-
-Use explicitly labelled synthetic policy values to exercise reservations, working exposure,
-uncertain exposure, pause and stop. User values for live deployment remain unconfigured.
-
-- [ ] Both reservation and dispatch check current risk/operating generations.
-- [ ] Concurrent strategy/risk exits cannot reserve the same sellable quantity twice.
-- [ ] Missing policy cannot be interpreted as unlimited real-money permission.
-- [ ] Configured breach actions handle partial results without reversal or overselling.
-- [ ] A stop survives restart and cannot be cleared by data recovery or AI output.
-
-Demo: pause between decision and dispatch; new exposure is rejected and genuine late fills apply.
-
-## W05: Resolve uncertain operations and cancel/fill races with a fake adapter
-
-Blocked by: W04. Covers D5.
-
-Drive the execution journal through a fault-injectable local adapter. Include lost create
-response, duplicate response, delayed acceptance, partial fill, modification and cancellation.
-Use internal normalized states rather than inventing provider guarantees.
-
-- [ ] Dispatch is journaled first; ambiguous outcomes retain reservation and never blind-retry.
-- [ ] Related operation identifiers preserve lineage without duplicate economic executions.
-- [ ] A cancellation request does not release funds before the actual remainder is resolved.
-- [ ] A second exit or replacement cannot reuse quantity from an unresolved sell request.
-- [ ] Old fenced dispatchers cannot authorize new exposure after restart or stop.
-
-Demo: the adapter accepts a request but loses its response; recovery finds one order and one fill.
-
-## W06: Reconcile a recovering account against moving external fixtures
-
-Blocked by: W05. Covers D6 and external-evidence recovery for D1.
-
-Read fake account/order/execution snapshots with pagination, delayed fills and manual activity.
-Establish a stable evidence cut and append sourced adjustments rather than overwrite balances.
-
-- [ ] Duplicate/reordered executions are applied once across operation lineage.
-- [ ] Unknown activity, incomplete pagination and uncorrelated submissions block affected risk.
-- [ ] Deposits, FX, costs and corporate-action changes preserve funding-adjusted performance.
-- [ ] Stop/pause remains active after otherwise successful reconciliation.
-
-Demo: a changing snapshot becomes reconciled after its overlapping execution window is complete.
-
-## W07: Compare frozen candidates and promote only an eligible version
-
-Blocked by: W06. Covers D4 and D8.
-
-Run independent incumbent/candidate accounts on one trace with a frozen evaluation contract.
-Calculate a verdict from persisted metrics and evidence; promote atomically for new entries.
-Use synthetic contract values in tests. Missing production criteria yield unqualified status.
-
-- [ ] The same artifact cannot change during evaluation; every observed candidate is retained.
-- [ ] Reused/development data cannot be relabelled as an unseen final segment.
-- [ ] Missing evidence, uncertain valuation and failed risk gates cannot produce eligibility.
-- [ ] Concurrent promotions and policy/runtime changes invalidate stale promotion authority.
-
-Demo: one candidate passes fixture criteria, another fails, and only the matching generation wins.
-
-## W08: Accept AI improvement artifacts without granting execution authority
-
-Blocked by: W07. Covers AI authority for D2, D3, D4 and D8.
-
-Feed synthetic model proposals through the optimizer input path. Restrict outputs to permitted
-strategy scope and evaluate them under the independent controller. No model call is required.
-
-- [ ] Proposals cannot edit evidence, evaluation/risk policy, active pointers or account state.
-- [ ] Executable candidate code is isolated from credentials, network and control-state writes.
-- [ ] Engineering-worker permissions are not inherited by the strategy optimizer.
-- [ ] Identical evidence does not trigger repeated AI work; time changes alone do not trigger it.
-
-Demo: a valid rule proposal enters evaluation while a proposal changing risk policy is rejected.
-
-## W09: Operate pause, resume, rollback and actionable local alerts
-
-Blocked by: W07. Covers D9.
-
-Expose local audited commands and status for the paper path. Preserve blocking reasons across
-restart and demonstrate rollback without changing old position owners or financial history.
-
-- [ ] Duplicate/stale-generation commands do not repeat effects or erase unrelated blockers.
-- [ ] Resume checks all required state and reports unresolved reasons.
-- [ ] Emergency-stop acknowledgement reports in-flight and uncertain operations honestly.
-- [ ] Local incidents deduplicate; external alert delivery remains unconfigured until specified.
-
-Demo: stop, restart, reject premature resume, resolve the cause, and explicitly resume once.
-
-## W10: Verify the full US paper operating path under combined faults
-
-Blocked by: W08, W09. Covers end-to-end interaction of D1-D9.
-
-Combine delayed data, unknown order response, partial fill, stop, crash, recovery and promotion
-in one fixture campaign. Bind results to source/artifact/policy/trace digests.
-
-- [ ] No duplicate economic effect, lost owner, unexplained cash or unauthorized promotion.
-- [ ] Crash-point and prefix comparisons agree with uninterrupted reference outcomes.
-- [ ] Evidence distinguishes technical success, paper performance and missing live coverage.
-- [ ] This slice does not enable a real-account adapter or claim real fill feasibility.
-
-Demo: a saved reproducible campaign demonstrates all nine areas with explicit limitations.
-
-## W11: Apply the same operating contracts to KR paper trading
-
-Blocked by: W10. Covers the agreed KR/US target, with US completed first.
-
-Add explicit KR currency/session/fee/price/quantity fixtures and mixed-market account tests.
-Verify market-specific provider contracts before adding connected market-data evidence.
-
-- [ ] KRW and USD buying power remain separate; display FX cannot create spendable funds.
-- [ ] Market-qualified identity prevents symbol collisions and timezone/session ambiguity.
-- [ ] Costs, settlement availability and supported operations are market-specific.
-- [ ] Both markets pass the same recovery, ownership, risk and operating invariants.
-
-Demo: one account with both market scopes survives a partial-fill/restart scenario correctly.
-
-## Future activation prerequisites, not an implementation ticket
-
-Before real-account work, separately verify broker idempotency/correlation, execution identity,
-lineage, snapshot semantics and current KR/US operation support from official evidence.
-Require explicit real-account authorization, approved capital/risk/evaluation values and the
-ability to observe/reconcile actual outcomes. The current market-data allowlist stays intact.
-No listed completed paper slice alone grants real-account access or starts real trading.
+Name the current acceptance criterion the proposed change enables and the code/test evidence
+that it is otherwise blocked. Prefer an existing implementation or a local fix.
+If postponing the change does not prevent the milestone, put it in the conditional backlog.
+A hypothetical future caller, a large file, or a possible improvement alone is not a blocker.
+Code review checks both missing milestone behavior and unrequested/speculative additions.
+When the stop criteria pass, report completion and stop implementation of this milestone.

@@ -7,6 +7,13 @@ automated trading. Read `docs/project-direction.md` before proposing changes to 
 AI responsibilities, validation, or strategy promotion. These are target requirements, not a
 claim that the current implementation satisfies them or authorization to execute real trades.
 
+## Scope discipline
+
+Use `docs/autotrade-implementation-plan.md` to identify the active milestone and stop criteria.
+Add work only for an acceptance criterion blocked by observed code behavior or a failing check.
+Prefer existing code and local fixes. Treat future designs as conditional references, not
+mandatory prerequisites. Stop milestone implementation when its acceptance criteria pass.
+
 ## Repository workflow
 
 - Create a dedicated branch before changing code, configuration, or documentation.

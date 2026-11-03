@@ -1,6 +1,8 @@
 # Autotrade operating design
 
 Status: design baseline and implementation plan, not implemented capabilities.
+The [scope-reviewed plan](autotrade-implementation-plan.md) governs current work. Nine-area
+coverage below is a future contract inventory, not mandatory preparation for the first comparison.
 This design completes the nine operating areas requested during the project review.
 Implementation observations were checked against source baseline `9de301f` on 2026-11-04.
 It extends [Project direction](project-direction.md) and the
@@ -85,10 +87,10 @@ These inputs are configuration decisions, not reasons to stop independent paper 
 
 ## Implementation and verification
 
-[Implementation plan](autotrade-implementation-plan.md) defines reviewable vertical slices,
-dependencies, demonstrations, and acceptance tests for every area above.
-The first complete path uses recorded/synthetic observations and a fault-injectable paper
-execution adapter. No real-account adapter is installed or enabled by this documentation.
+[Implementation plan](autotrade-implementation-plan.md) defines one finite live-data paper
+comparison and reclassifies the earlier W01-W11 list by actual need. Recorded/synthetic checks
+support that path; a full fault-injectable execution platform is not a prerequisite.
+No real-account adapter is installed or enabled by this documentation.
 Use failures at actual execution and restart interfaces, not tests that recompute implementation.
 Preserve all old ledgers, datasets, source versions, failed experiments, and costs.
 

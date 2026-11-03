@@ -1,6 +1,9 @@
 # Shared observation and decision preparation
 
 Status: agreed design direction; not implemented.
+Implementation is conditional on requiring exact live execution reproduction. The
+[active milestone](autotrade-implementation-plan.md) needs common input for a finite comparison,
+not full live/replay unification or a complete trace framework first.
 Read [Project direction](project-direction.md) for the product goal and strategy responsibilities.
 
 ## Goal
@@ -129,8 +132,10 @@ market traffic, or model calls:
 
 The separately reproduced supervisor transition defects now have controller guards and
 regression coverage. They concern GitHub code publication and completion, not runtime strategy
-promotion. Next introduce the shared preparation seam with synthetic parity tests, migrate the two
-callers, and add trace capture/replay evidence in separate reviewable changes.
+promotion. When exact live reproduction becomes an active requirement, introduce the shared
+preparation seam with parity tests, migrate the two callers and add trace capture/replay evidence.
+For the current finite comparison, reuse existing execution and make only the local input-fanout
+changes needed by its acceptance criteria.
 Existing recorded experiments retain their versions and results throughout migration.
 Numerical live risk limits, strategy promotion criteria, persistent recovery, Korean-market
 support, and real broker execution remain separate work described in the project direction.
