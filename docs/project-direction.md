@@ -3,6 +3,9 @@
 This document records the direction agreed during the project review.
 It defines target behavior, not implementation status or permission to start real trading.
 Use `GLOSSARY.md` for shared terminology and `AGENTS.md` for the current execution boundaries.
+The [operating design](autotrade-system-design.md) specifies the nine requested operating areas;
+the [implementation plan](autotrade-implementation-plan.md) separates planned delivery from
+verified capabilities.
 
 ## Product goal
 
@@ -49,13 +52,19 @@ Quantity improvements and candidate promotion must respect those limits.
 These future requirements do not enable broker account/order access in the current repository.
 The existing market-data-only restrictions remain in force.
 
-## Open decisions
+## Required user policy and external evidence
 
-- Exact promotion criteria, evaluation horizon, and required evidence, including treatment of
-  costs, drawdown, concentration, sparse trades, and incomplete market observations.
-- Numerical live risk limits and the response when a limit is reached.
-- Initial real-money capital and the conditions for moving from paper validation to real trading.
-- How strategy versions, account-wide risk actions, and recovery state are persisted.
+The operating design defines state transitions, persistence, risk-action choices and validation
+gates. Their implementation remains planned. These deployment inputs are still unset:
+
+- Numerical promotion margin, evaluation horizon, evidence sufficiency, uncertainty rules,
+  and evaluation risk/coverage thresholds.
+- Numerical live risk limits and the enabled action for each limit.
+- Initial real-money capital, enabled sessions and explicit live-operation authorization.
+- Alert destination/acknowledgement rules and verified broker recovery/correlation semantics.
+
+Missing values prevent the corresponding live activation or automatic promotion; they do not
+prevent independent implementation and fault testing with labelled synthetic policy values.
 
 ## Review findings to resolve
 
