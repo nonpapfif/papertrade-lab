@@ -29,6 +29,9 @@ connectivity are separate engineering changes, outside automatic strategy improv
 Compare the incumbent and candidate on the same live observations in separate paper accounts.
 Use equal starting capital and matching cost and fill assumptions.
 Keep both strategy versions fixed during the comparison; queue further changes for another test.
+Replay prioritizes actual publication order and recorded decision timing, including delays.
+See [Shared observation design](shared-observation-design.md) for the agreed module scope,
+recording requirements, and acceptance criteria; implementation remains pending.
 Automatically promote a candidate only after it passes agreed validation criteria.
 An AI proposal or a single higher-profit observation does not establish that those criteria exist
 or have been met. The criteria remain to be specified below.
