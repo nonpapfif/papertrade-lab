@@ -57,7 +57,7 @@ No offline command starts the continuous trading workers.
 | [Domain glossary](GLOSSARY.md) | Shared project terminology |
 | [Shared observation design](docs/shared-observation-design.md) | Live/replay preparation, actual timing, and parity acceptance criteria |
 | [Autotrade operating design](docs/autotrade-system-design.md) | Recovery, risk, versions, promotion, orders, reconciliation, data, evaluation and controls |
-| [Implementation slices](docs/autotrade-implementation-plan.md) | Dependency-ordered paper demonstrations and acceptance tests |
+| [Current scope and backlog](docs/autotrade-implementation-plan.md) | Minimal live-comparison milestone, stop criteria and conditional future work |
 | [Asynchronous layered execution](docs/async-layered-paper.md) | Rule-based decisions, cash reservation, and delayed paper fills |
 | [Finite live-data validation](docs/async-live-validation.md) | Market-data integration and observed execution evidence |
 | [Event-driven validation supervisor](docs/autotest-supervisor.md) | Existing automated test and publication workflow |

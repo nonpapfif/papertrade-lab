@@ -17,6 +17,11 @@ Treat currency, sessions, costs, and execution conditions as market-specific req
 Historical simulation is a supporting way to compare strategy candidates.
 Building a historical strategy-search platform is not the primary product goal.
 
+The current milestone is one finite US live-data comparison of two fixed strategies with
+independent paper accounts and saved evidence. See the scope-reviewed implementation plan for
+stop criteria and conditional future work. Exact live replay, persistent recovery and automatic
+promotion remain later capabilities, not prerequisites for that comparison.
+
 ## Execution and AI responsibilities
 
 Explicit strategy rules make trading decisions and drive execution.
