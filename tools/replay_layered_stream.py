@@ -3,24 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import bisect
 import gzip
 import hashlib
 import json
 import time
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from itertools import product
 from pathlib import Path
 from typing import Any
 
 from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
-from tools.layered_paper import FAMILIES, LayeredPaper, eligible_stock, feature_from_bars
+from tools.async_layered_paper import AsyncLayeredPaper
+from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
 from tools.probe_toss_websocket import ROOT, CachedTokenClient, now
 
 SOURCES = (
     "tools/layered_paper.py",
+    "tools/async_layered_paper.py",
     "tools/replay_layered_stream.py",
     "tools/live_execution.py",
     "tools/search_portfolios.py",
@@ -76,6 +79,106 @@ def read_recording(capture: Path, ids: dict[str, int]) -> tuple[dict, dict]:
     return books, features
 
 
+async def replay_case(
+    capital: float,
+    config: dict[str, Any],
+    books: dict[int, list[dict[str, Any]]],
+    history: dict[int, list[tuple[float, Feature | None]]],
+    feature_times: dict[int, list[float]],
+    fx_history: list[dict[str, Any]],
+    fx_times: list[float],
+    eligible: set[int],
+    start: float,
+) -> AsyncLayeredPaper:
+    account = AsyncLayeredPaper(
+        capital,
+        policy=config["policy"],
+        selection=config["selection"],
+        allocation=config["allocation"],
+        delay=config["delay"],
+    )
+    events = sorted(
+        (parse(row["received_at"]), symbol, index, row)
+        for symbol, rows in books.items()
+        for index, row in enumerate(rows)
+    )
+    latest: dict[int, dict[str, Any]] = {}
+    slots: dict[int, float] = {}
+
+    def current_feature(symbol: int, tick: float) -> Feature | None:
+        index = bisect.bisect_right(feature_times[symbol], tick) - 1
+        if index < 0 or history[symbol][index][1] is None or symbol not in latest:
+            return None
+        f = history[symbol][index][1]
+        assert f is not None
+        book = latest[symbol]
+        if not 0 <= tick - parse(book["timestamp"]) <= 60:
+            return None
+        price = (
+            min(float(r["price"]) for r in book["asks"])
+            + max(float(r["price"]) for r in book["bids"])
+        ) / 2
+        return replace(
+            f,
+            price=price,
+            r5=price / (f.price / (1 + f.r5)) - 1,
+            r15=price / (f.price / (1 + f.r15)) - 1,
+        )
+
+    try:
+        for tick, symbol, index, row in events:
+            latest[symbol] = row
+            if tick < start:
+                continue
+            cadence = config["cadence"]
+            slot = int(tick // cadence) if cadence else tick
+            entries = slots.get(symbol) != slot
+            slots[symbol] = slot
+            candidates = []
+            for candidate in sorted(eligible):
+                f = current_feature(candidate, tick)
+                if (
+                    f is not None
+                    and 0 <= tick - parse(f.bar_end) <= 90
+                    and candidate not in account.pending
+                    and candidate not in account.book.positions
+                    and assign(f, config["policy"])
+                    and (
+                        config["selection"] != "active" or abs(f.r5) >= 0.001 or abs(f.r15) >= 0.003
+                    )
+                ):
+                    candidates.append(candidate)
+            fx_index = bisect.bisect_right(fx_times, tick) - 1
+            fx = fx_history[fx_index] if fx_index >= 0 else None
+            quote = {
+                **row,
+                **{
+                    side: [
+                        {**r, "volume": str(int(float(r["volume"]) * config["depth"]))}
+                        for r in row[side]
+                    ]
+                    for side in ("asks", "bids")
+                },
+            }
+            await account.submit(
+                {
+                    "id": f"{symbol}:{index}",
+                    "symbol": symbol,
+                    "received_at": row["received_at"],
+                    "book": quote,
+                    "feature": current_feature(symbol, tick),
+                    "eligible": symbol in eligible,
+                    "entries": entries,
+                    "candidate_count": max(1, len(candidates)),
+                    "fx": float(fx["result"]["midRate"]) if fx else 0,
+                    "fx_at": fx["received_at"] if fx else row["received_at"],
+                }
+            )
+    finally:
+        await account.close()
+    return account
+
+
 def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
     ids = {symbol: i for i, symbol in enumerate(freeze["symbols"])}
     eligible = {ids[row["symbol"]] for row in freeze["stock_info"] if eligible_stock(row)}
@@ -103,78 +206,19 @@ def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
     fx_times = [parse(r["received_at"]) for r in fx_history]
     results = []
     for capital, config in product((50, 100, 200, 500), variations()):
-        account = LayeredPaper(
-            capital,
-            policy=config["policy"],
-            selection=config["selection"],
-            allocation=config["allocation"],
+        account = asyncio.run(
+            replay_case(
+                capital,
+                config,
+                books,
+                history,
+                feature_times,
+                fx_history,
+                fx_times,
+                eligible,
+                parse(freeze.get("evaluation_start", freeze["frozen_at"])),
+            )
         )
-        ready = -1.0
-        slot = None
-        for tick in decisions:
-            if tick < ready:
-                continue
-            cadence = config["cadence"]
-            current_slot = int(tick // cadence) if cadence else tick
-            if current_slot == slot:
-                continue
-            initial, confirmation, fs, prices = {}, {}, {}, {}
-            arrivals, sources = {}, {}
-            for symbol, rows in books.items():
-                i = bisect.bisect_right(received[symbol], tick) - 1
-                j = bisect.bisect_left(received[symbol], tick + config["delay"])
-                if i < 0 or j >= len(rows):
-                    continue
-                decision_book, confirmed = rows[i], rows[j]
-                if tick - received[symbol][i] > 60 or received[symbol][j] - tick > 30:
-                    continue
-                initial[symbol] = decision_book
-                confirmation[symbol] = {
-                    **confirmed,
-                    **{
-                        side: [
-                            {**r, "volume": str(int(float(r["volume"]) * config["depth"]))}
-                            for r in confirmed[side]
-                        ]
-                        for side in ("asks", "bids")
-                    },
-                }
-                arrivals[symbol] = confirmed["received_at"]
-                sources[symbol] = decision_book["timestamp"]
-                best_ask = min(float(r["price"]) for r in decision_book["asks"])
-                best_bid = max(float(r["price"]) for r in decision_book["bids"])
-                prices[symbol] = (best_bid + best_ask) / 2
-                index = bisect.bisect_right(feature_times[symbol], tick) - 1
-                if index >= 0 and history[symbol][index][1] is not None:
-                    f = history[symbol][index][1]
-                    fs[symbol] = replace(
-                        f,
-                        price=prices[symbol],
-                        r5=prices[symbol] / (f.price / (1 + f.r5)) - 1,
-                        r15=prices[symbol] / (f.price / (1 + f.r15)) - 1,
-                    )
-            if not confirmation:
-                continue
-            decision_at = datetime.fromtimestamp(tick, UTC).isoformat()
-            at = max(arrivals.values(), key=parse)
-            fx_index = bisect.bisect_right(fx_times, tick) - 1
-            fx = fx_history[fx_index] if fx_index >= 0 else None
-            frame = {
-                "at": at,
-                "decision_at": decision_at,
-                "tick": int(tick * 1000),
-                "quotes": prices,
-                "marks": {s: [p, sources[s]] for s, p in prices.items()},
-                "source_times": sources,
-                "decision_orderbooks": initial,
-                "orderbooks": confirmation,
-                "confirmation_received_at": arrivals,
-                "fx": float(fx["result"]["midRate"]) if fx else 0,
-                "fx_at": fx["received_at"] if fx else at,
-            }
-            account.step(str(tick), frame, fs, eligible)
-            ready = parse(at)
-            slot = current_slot
         result = account.summary() if account.last_at else {"account": None}
         results.append({"capital": capital, "configuration": config, **result})
         private_json(
@@ -205,7 +249,9 @@ def evaluate(capture: Path, output: Path, freeze: dict[str, Any]) -> None:
             },
             "results": results,
             "limitations": [
-                "Two recorded US symbols in one short session; not generalization proof",
+                "Recorded symbols in one short session; not generalization proof",
+                "Per-symbol FIFO decisions; pending intents expire after 30 seconds",
+                "Allocation follows receipt order; equal sizing uses current candidate count",
                 "OHLCV maturity assumes timestamp denotes minute start",
                 "Depth fractions and delay are sensitivity assumptions, not calibrated fill probabilities",
                 "Midpoint marks are estimates, not liquidation proceeds",
