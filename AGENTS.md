@@ -1,4 +1,11 @@
-# Free paper-trading experiments
+# Papertrade Lab
+
+## Project direction
+
+Papertrade Lab is the validation precursor to Autotrade Lab, whose final goal is real-money
+automated trading. Read `docs/project-direction.md` before proposing changes to execution,
+AI responsibilities, validation, or strategy promotion. These are target requirements, not a
+claim that the current implementation satisfies them or authorization to execute real trades.
 
 ## Repository workflow
 
@@ -22,6 +29,9 @@ The user has set two boundaries:
 - Never execute real trades.
 
 The free simulation uses `simulation.enabled=true`.
+The unrestricted fill and risk assumptions below apply to that profile. Separate layered
+experiments retain their documented costs and execution constraints; neither profile's rules
+silently redefine the other. Consult the relevant guide linked from `README.md`.
 Its objective is to maximize virtual profit through active experiments, rather than preserve cash
 or minimize losses. Frequent trades, concentration, failed experiments, and losing the entire
 ledger are permitted. Do not default to waiting because of past losses or a small sample.
