@@ -1,7 +1,13 @@
 # Papertrade Lab
 
-Market-data collection, isolated historical experiments, and virtual trading with event-triggered
-AI reviews. Python 3.12 or later is required; the project has no third-party Python dependencies.
+Papertrade Lab is the validation precursor to Autotrade Lab, an intended real-money automated
+trading system. The agreed direction is rule-based execution with AI analysis and strategy
+improvement. Target requirements and unresolved decisions are in
+[Project direction](docs/project-direction.md); they are not a claim of implemented behavior.
+
+The current repository includes market-data collection, historical experiments, virtual trading
+with event-triggered AI reviews, and a separate rule-based layered experiment.
+Python 3.12 or later is required; the project has no mandatory third-party Python dependencies.
 The isolated predictors and background service examples use macOS.
 
 The user has set two boundaries:
@@ -47,6 +53,11 @@ No offline command starts the continuous trading workers.
 
 | Guide | Purpose |
 |---|---|
+| [Project direction](docs/project-direction.md) | Agreed product goal, AI role, strategy validation, and open decisions |
+| [Domain glossary](GLOSSARY.md) | Shared project terminology |
+| [Asynchronous layered execution](docs/async-layered-paper.md) | Rule-based decisions, cash reservation, and delayed paper fills |
+| [Finite live-data validation](docs/async-live-validation.md) | Market-data integration and observed execution evidence |
+| [Event-driven validation supervisor](docs/autotest-supervisor.md) | Existing automated test and publication workflow |
 | [Market-day download](docs/market-day-download.md) | Coverage, pacing, checkpoints, raw data, and errors |
 | [Reverse monthly collection](docs/month-download.md) | Shared-rate parallel downloads, descending dates, and independent holidays |
 | [Event-source archive](docs/event-sources.md) | Macro/earnings schedules, numerical results and source provenance |
