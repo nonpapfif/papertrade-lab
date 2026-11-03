@@ -97,6 +97,8 @@ def declaration(market: str, symbols: list[str]) -> list[dict[str, Any]]:
 
 
 def inspect_frame(frame: dict[str, Any], expected: set[str]) -> tuple[str, dict[str, Any]]:
+    if not isinstance(frame, dict):
+        raise TypeError("WebSocket frame must be an object")
     kind = frame.get("type")
     if kind == "message":
         topic = frame.get("topic")
@@ -118,7 +120,10 @@ def inspect_frame(frame: dict[str, Any], expected: set[str]) -> tuple[str, dict[
     if kind == "pong":
         return "pong", {"type": kind}
     if kind == "error":
-        return "error", {"type": kind, "code": frame.get("error", {}).get("code")}
+        error = frame.get("error", {})
+        if not isinstance(error, dict):
+            raise ValueError("Provider error must be an object")
+        return "error", {"type": kind, "code": error.get("code")}
     raise ValueError("Unexpected WebSocket frame type")
 
 

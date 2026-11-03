@@ -1,0 +1,241 @@
+"""Independent per-symbol signals and a single cash-funded virtual execution account."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import pairwise
+from typing import Any
+
+from tools.live_execution import DEFAULT_FEES, ExecutionBook, ExecutionContext
+
+FAMILIES = ("trend", "breakout", "rebound")
+
+
+def eligible_stock(row: dict[str, Any]) -> bool:
+    return (
+        row.get("status") == "ACTIVE"
+        and row.get("currency") == "USD"
+        and row.get("securityType") == "STOCK"
+        and row.get("isCommonShare") is True
+        and row.get("leverageFactor") in (None, 1)
+    )
+
+
+@dataclass(frozen=True)
+class Feature:
+    symbol: int
+    price: float
+    available_at: str
+    bar_end: str
+    r5: float
+    r15: float
+    prior_high: float
+    mean: float
+    efficiency: float
+
+
+def feature_from_bars(symbol: int, rows: list[dict[str, Any]], at: str) -> Feature | None:
+    """Use only received, completed bars; timestamp denotes the assumed minute start."""
+    cutoff = datetime.fromisoformat(at).timestamp()
+    usable: dict[float, tuple[float, dict[str, Any]]] = {}
+    for row in rows:
+        stamp = datetime.fromisoformat(row["timestamp"]).timestamp()
+        received = datetime.fromisoformat(row["available_at"]).timestamp()
+        if received <= cutoff and stamp + 60 <= cutoff:
+            old = usable.get(stamp)
+            if old is None or old[0] < received:
+                usable[stamp] = (received, row)
+    bars = [usable[t][1] for t in sorted(usable)][-16:]
+    if len(bars) != 16:
+        return None
+    stamps = [datetime.fromisoformat(b["timestamp"]).timestamp() for b in bars]
+    if cutoff - stamps[-1] - 60 > 90 or any(b - a != 60 for a, b in pairwise(stamps)):
+        return None
+    prices = [float(b["closePrice"]) for b in bars]
+    if any(not math.isfinite(p) or p <= 0 for p in prices):
+        return None
+    path = sum(abs(b - a) for a, b in pairwise(prices))
+    return Feature(
+        symbol,
+        prices[-1],
+        bars[-1]["available_at"],
+        datetime.fromtimestamp(stamps[-1] + 60, tz=datetime.fromisoformat(at).tzinfo).isoformat(),
+        prices[-1] / prices[-6] - 1,
+        prices[-1] / prices[0] - 1,
+        max(float(b["highPrice"]) for b in bars[:-1]),
+        sum(prices[:-1]) / 15,
+        abs(prices[-1] - prices[0]) / path if path else 0,
+    )
+
+
+def entry_valid(strategy: str, f: Feature) -> bool:
+    if strategy == "breakout":
+        return f.r5 > 0 and f.price > f.prior_high
+    if strategy == "trend":
+        return f.r5 > 0 and f.r15 > 0 and f.efficiency >= 0.5
+    if strategy == "rebound":
+        return f.r5 > 0 and f.r15 < 0 and f.price < f.mean
+    raise ValueError("Unknown strategy")
+
+
+def assign(f: Feature, policy: str = "router") -> str | None:
+    families = ("breakout", "trend", "rebound") if policy == "router" else (policy,)
+    return next((s for s in families if entry_valid(s, f)), None)
+
+
+def holding_valid(strategy: str, f: Feature, entry: Feature) -> bool:
+    if strategy == "breakout":
+        return f.price >= entry.prior_high * 0.998
+    if strategy == "trend":
+        return f.r15 >= 0
+    if strategy == "rebound":
+        return f.r5 >= -0.003 and f.price < entry.mean
+    raise ValueError("Unknown strategy")
+
+
+class LayeredPaper:
+    """Prototype rule boundaries are hypotheses, not validated return forecasts."""
+
+    def __init__(
+        self,
+        capital: float,
+        *,
+        policy: str = "router",
+        selection: str = "all",
+        allocation: str = "equal",
+        fees: dict[str, float] | None = None,
+    ) -> None:
+        if policy not in ("router", *FAMILIES) or selection not in ("all", "active"):
+            raise ValueError("Unknown signal policy")
+        if allocation not in ("equal", "priority") or not math.isfinite(capital) or capital <= 0:
+            raise ValueError("Invalid allocation or capital")
+        self.policy, self.selection, self.allocation = policy, selection, allocation
+        schedule = {
+            **DEFAULT_FEES,
+            "allow_partial_exits": 1.0,
+            "confirmation_delay_seconds": 1.0,
+            **(fees or {}),
+        }
+        self.context = ExecutionContext("quotes", schedule)
+        config = {
+            "slots": 1,
+            "leverage": 1,
+            "hold": 0,
+            "target": 0.0,
+            "stop": 0.0,
+            "trail": 0.0,
+            "sizing": "equal",
+            "compound": True,
+            "session": "all",
+            "rotate": False,
+            "cooldown": 0,
+            "signal": 0,
+            "id": 0,
+        }
+        self.book = ExecutionBook(
+            config, "US", "layered", True, context=self.context, initial_equity=capital
+        )
+        self.owners: dict[int, tuple[str, Feature]] = {}
+        self.realized_by_strategy = dict.fromkeys(FAMILIES, 0.0)
+        self.seen: set[str] = set()
+        self.decisions: list[dict[str, Any]] = []
+        self.prices: dict[int, float] = {}
+        self.times: dict[int, str] = {}
+        self.last_at: str | None = None
+
+    def step(
+        self,
+        event_id: str,
+        frame: dict[str, Any],
+        features: dict[int, Feature],
+        eligible: set[int],
+        *,
+        entries: bool = True,
+    ) -> None:
+        if event_id in self.seen:
+            return
+        at = frame["at"]
+        if self.last_at is not None and datetime.fromisoformat(at) < datetime.fromisoformat(
+            self.last_at
+        ):
+            raise ValueError("Cannot rewind an account")
+        cutoff = datetime.fromisoformat(frame.get("decision_at", at))
+        fresh = {
+            s: f
+            for s, f in features.items()
+            if datetime.fromisoformat(f.available_at) <= cutoff
+            and 0 <= (cutoff - datetime.fromisoformat(f.bar_end)).total_seconds() <= 90
+        }
+        self.context.frame = frame
+        self.prices.update(frame["quotes"])
+        self.times.update({s: frame.get("source_times", {}).get(s, at) for s in frame["quotes"]})
+        held_before = set(self.book.positions)
+        for symbol in sorted(held_before):
+            if symbol not in fresh:
+                self.decisions.append({"at": at, "symbol": symbol, "action": "unknown"})
+                continue
+            owner, original = self.owners[symbol]
+            if not holding_valid(owner, fresh[symbol], original):
+                before = self.book.realized
+                self.book.fill(
+                    symbol,
+                    -self.book.positions[symbol].quantity,
+                    self.prices[symbol],
+                    at,
+                    frame["tick"],
+                    "invalidated",
+                )
+                self.realized_by_strategy[owner] += self.book.realized - before
+                if symbol not in self.book.positions:
+                    del self.owners[symbol]
+        candidates = []
+        if entries:
+            for symbol, f in sorted(fresh.items()):
+                if symbol in held_before or symbol not in eligible:
+                    continue
+                if self.selection == "active" and abs(f.r5) < 0.001 and abs(f.r15) < 0.003:
+                    continue
+                strategy = assign(f, self.policy)
+                if strategy:
+                    candidates.append((symbol, strategy, f))
+        candidates.sort(key=lambda row: (-abs(row[2].r5), row[0]))
+        budget = self.book.cash / len(candidates) if candidates else 0
+        for symbol, strategy, f in candidates:
+            amount = budget if self.allocation == "equal" else self.book.cash
+            orders = self.book.whole_orders([[symbol, 1, 1.0]], self.prices, 1, amount, amount)
+            quantity = orders[0][1] if orders else 0
+            self.decisions.append(
+                {
+                    "at": at,
+                    "symbol": symbol,
+                    "strategy": strategy,
+                    "action": "buy",
+                    "quantity": quantity,
+                }
+            )
+            if quantity:
+                before = self.book.realized
+                self.book.fill(symbol, quantity, self.prices[symbol], at, frame["tick"], "entry")
+                self.realized_by_strategy[strategy] += self.book.realized - before
+                if symbol in self.book.positions:
+                    self.owners[symbol] = (strategy, f)
+        self.book.mark(self.prices)
+        if self.book.cash < -1e-9 or any(
+            p.quantity <= 0 or not float(p.quantity).is_integer()
+            for p in self.book.positions.values()
+        ):
+            raise RuntimeError("Unfunded or non-integer position")
+        self.seen.add(event_id)
+        self.last_at = at
+
+    def summary(self) -> dict[str, Any]:
+        if self.last_at is None:
+            raise ValueError("No account event has been processed")
+        return {
+            "account": self.book.summary(self.prices, self.times, self.last_at),
+            "realized_by_strategy": self.realized_by_strategy,
+            "owned_positions": {str(s): owner[0] for s, owner in self.owners.items()},
+            "decisions": len(self.decisions),
+        }
