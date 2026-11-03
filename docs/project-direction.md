@@ -61,10 +61,14 @@ The existing market-data-only restrictions remain in force.
 
 - `tools/autotest_supervisor.py` embeds a statement that layered rules override the free-profile
   instructions. Its scope must be reconciled with the profile distinction in `AGENTS.md`.
-- The controller can accept contradictory review fields and can complete after failed tests.
-  Separate diagnostic tests reproduced these paths; fixes are not included in this document.
 - The asynchronous layered engine is currently in memory. Durable position and pending-intent
   recovery is not implemented, as documented in `docs/async-layered-paper.md`.
 
 The existing finite live-data runner and historical comparisons do not by themselves implement
 the agreed fixed-version incumbent/candidate validation and automatic promotion lifecycle.
+
+## Verified controller corrections
+
+Regression tests cover rejection of fix/blocked reviews that authorize code publication and
+completion after explicit mechanical-check failure. These controller guards do not implement
+runtime strategy promotion or its acceptance criteria.

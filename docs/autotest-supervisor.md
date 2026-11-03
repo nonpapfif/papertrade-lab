@@ -48,6 +48,10 @@ specific missing observation. It is not a substitute for testing a changed engin
 
 ## Tests and GitHub
 
+Reviews that request fixes or report a blocked state cannot simultaneously authorize publication.
+An explicit mechanical-check failure prevents completion even if all requirements are listed
+as satisfied. Initial inherited evidence can still be reviewed without scheduling a new test run.
+
 Automated cycles run the layered regression modules plus every test introduced by earlier
 supervisor cycles, and any new tests in the current change. Optional experiments accept one
 `--output` directory. Existing legacy modules outside the layered scope are not modified.

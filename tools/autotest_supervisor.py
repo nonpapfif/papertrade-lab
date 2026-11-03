@@ -424,6 +424,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if role != "implement" and tree_digest(self.worktree) != self.state["review_digest"]:
             raise RuntimeError("Source changed during a read-only model call")
         if role == "review":
+            if value["publish_ok"] and value["decision"] in ("fix", "blocked"):
+                raise RuntimeError("Contradictory review cannot authorize publication")
             self.state["review"] = value
             self.state["satisfied"] = sorted(set(value["satisfied"]))
             self.state["history"].append(
@@ -464,6 +466,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
     def after_review(self) -> None:
         review = self.state["review"]
         if review["decision"] == "complete":
+            if self.state.get("tests_passed") is False:
+                raise RuntimeError("Cannot complete with failed mechanical checks")
             if set(self.state["satisfied"]) != set(REQUIREMENTS):
                 raise RuntimeError("Astra completion omitted pending requirements")
             self.transition("complete")
