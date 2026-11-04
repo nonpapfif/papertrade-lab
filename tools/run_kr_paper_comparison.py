@@ -218,15 +218,18 @@ async def campaign(output: Path, until: datetime) -> None:
     started = now()
     sweeps = calls = approvals = reviews_completed = 0
     symbols: set[str] = set()
-    review: asyncio.Task[tuple[datetime, dict[str, str], dict[str, Decimal]]] | None = None
+    review: (
+        asyncio.Task[tuple[datetime, dict[str, str], dict[str, Decimal], dict[str, str]]] | None
+    ) = None
     reviewing: list[dict[str, Any]] = []
     state, error = "running", None
 
     async def review_signals(
         payload: dict[str, Any],
-    ) -> tuple[datetime, dict[str, str], dict[str, Decimal]]:
-        approved, watches = await decide(settings, payload)
-        return now(), approved, watches
+    ) -> tuple[datetime, dict[str, str], dict[str, Decimal], dict[str, str]]:
+        holds: dict[str, str] = {}
+        approved, watches = await decide(settings, payload, holds=holds)
+        return now(), approved, watches, holds
 
     def status() -> None:
         report = {
@@ -317,16 +320,22 @@ async def campaign(output: Path, until: datetime) -> None:
                     break
                 if review is not None and review.done():
                     try:
-                        decided, accepted, watches = review.result()
+                        decided, accepted, watches, holds = review.result()
                     except SafetyError as exc:
-                        record("ai_review_failed", {"reason": str(exc)})
+                        record("ai_review_failed", {"review_id": calls, "reason": str(exc)})
                     else:
                         approvals += len(accepted)
                         reviews_completed += 1
                         comparison.approve(reviewing, accepted, decided, watches)
                         record(
                             "ai_decision",
-                            {"at": decided, "approvals": accepted, "watches": watches},
+                            {
+                                "review_id": calls,
+                                "at": decided,
+                                "approvals": accepted,
+                                "holds": holds,
+                                "watches": watches,
+                            },
                         )
                     review = None
                 line = encode({"observed_at": observed, "rows": rows}) + "\n"
@@ -352,7 +361,15 @@ async def campaign(output: Path, until: datetime) -> None:
                             encode(comparison.accounts["ai"].summary(comparison.prices))
                         ),
                     }
-                    record("ai_review", {"signals": reviewing, "observed_at": observed})
+                    record(
+                        "ai_review",
+                        {
+                            "review_id": calls + 1,
+                            "model": "gpt-6-astra",
+                            "effort": "medium",
+                            **payload,
+                        },
+                    )
                     review = asyncio.create_task(review_signals(payload))
                     calls += 1
                 status()
@@ -361,9 +378,9 @@ async def campaign(output: Path, until: datetime) -> None:
                 )
             if review is not None and review.done():
                 try:
-                    decided, accepted, watches = review.result()
+                    decided, accepted, watches, holds = review.result()
                 except SafetyError as exc:
-                    record("ai_review_failed", {"reason": str(exc)})
+                    record("ai_review_failed", {"review_id": calls, "reason": str(exc)})
                 else:
                     if decided < until:
                         approvals += len(accepted)
@@ -371,8 +388,10 @@ async def campaign(output: Path, until: datetime) -> None:
                     record(
                         "ai_decision",
                         {
+                            "review_id": calls,
                             "at": decided,
                             "approvals": accepted,
+                            "holds": holds,
                             "watches": watches,
                             "after_last_observation": True,
                         },
@@ -388,7 +407,7 @@ async def campaign(output: Path, until: datetime) -> None:
             if review is not None and not review.done():
                 review.cancel()
                 await asyncio.gather(review, return_exceptions=True)
-                record("ai_review_ended_at_cutoff", {"at": now()})
+                record("ai_review_ended_at_cutoff", {"review_id": calls, "at": now()})
             review = None
             status()
             atomic_json(
