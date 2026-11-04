@@ -272,5 +272,25 @@ class LayeredPaper:
             "account": self.book.summary(self.prices, self.times, self.last_at),
             "realized_by_strategy": self.realized_by_strategy,
             "owned_positions": {str(s): owner[0] for s, owner in self.owners.items()},
+            "positions_as_of": self.last_at,
+            "positions": {
+                str(symbol): {
+                    "strategy": self.owners[symbol][0],
+                    "quantity": position.quantity,
+                    "entry_price": position.entry,
+                    "entry_cost_usd": position.quantity * position.entry,
+                    "remaining_entry_fees_usd": self.book.entry_fees[symbol],
+                    "mark_price": self.prices[symbol],
+                    "mark_at": self.times[symbol],
+                    "mark_age_seconds": (
+                        datetime.fromisoformat(self.last_at)
+                        - datetime.fromisoformat(self.times[symbol])
+                    ).total_seconds(),
+                    "market_value_usd": position.quantity * self.prices[symbol],
+                    "unrealized_usd": position.quantity
+                    * (self.prices[symbol] - position.entry),
+                }
+                for symbol, position in sorted(self.book.positions.items())
+            },
             "decisions": len(self.decisions),
         }

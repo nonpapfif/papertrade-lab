@@ -151,6 +151,53 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         await a.submit(event(at=1))
         self.assertEqual(len(a.pending), 1)
 
+    async def test_position_evidence_reconciles_partial_fills_and_mixed_age_marks(self) -> None:
+        a = await self.account(200)
+        await a.submit(event())
+        await a.submit(event(at=2, volume=5))
+        invalid = event(at=3, price=8)
+        invalid["feature"] = replace(invalid["feature"], r5=-0.01)
+        await a.submit(invalid)
+        await a.submit(event(at=5, price=8, volume=2))
+        await a.submit(event(1, 6, price=20))
+        await a.submit(event(1, 8, price=20, volume=2))
+        await a.advance(stamp(67))
+
+        result = a.summary()
+        first, second = result["positions"]["0"], result["positions"]["1"]
+        self.assertEqual(result["positions_as_of"], stamp(67))
+        self.assertEqual(first["strategy"], "breakout")
+        self.assertEqual(first["quantity"], 3)
+        self.assertEqual(first["entry_price"], 10)
+        self.assertEqual(first["entry_cost_usd"], 30)
+        self.assertAlmostEqual(first["remaining_entry_fees_usd"], 0.03)
+        self.assertAlmostEqual(first["mark_price"], 7.995)
+        self.assertEqual(first["mark_at"], stamp(5))
+        self.assertEqual(first["mark_age_seconds"], 62)
+        self.assertAlmostEqual(first["market_value_usd"], 23.985)
+        self.assertAlmostEqual(first["unrealized_usd"], -6.015)
+        self.assertEqual(second["quantity"], 2)
+        self.assertEqual(second["entry_cost_usd"], 40)
+        self.assertAlmostEqual(second["remaining_entry_fees_usd"], 0.04)
+        self.assertEqual(second["mark_at"], stamp(8))
+        self.assertEqual(second["mark_age_seconds"], 59)
+        account = result["account"]
+        self.assertEqual(account["stale_open_positions"], 1)
+        self.assertAlmostEqual(account["cash"], 125.86402)
+        self.assertAlmostEqual(account["realized"], -4.13598)
+        self.assertAlmostEqual(account["unrealized"], -6.025)
+        self.assertAlmostEqual(account["equity"], 189.83902)
+        positions = result["positions"].values()
+        self.assertAlmostEqual(
+            sum(p["unrealized_usd"] for p in positions), account["unrealized"]
+        )
+        self.assertAlmostEqual(
+            account["cash"] + sum(p["market_value_usd"] for p in positions), account["equity"]
+        )
+        await a.advance(stamp(68))
+        self.assertEqual(first["mark_age_seconds"], 62)
+        self.assertEqual(a.summary()["positions"]["0"]["mark_age_seconds"], 63)
+
     async def test_stale_and_future_quotes_cannot_create_intents(self):
         a = await self.account()
         e = event()
