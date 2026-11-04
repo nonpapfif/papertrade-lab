@@ -44,6 +44,13 @@ REQUIREMENTS = {
     ),
 }
 COMPARISON_POLICY = "trend"
+KR_REQUIREMENTS = {
+    "configuration": "Freeze the KRW rules and equal 100,000 KRW balances before observing.",
+    "shared_input": "Deliver shared Korean snapshots to independent accounts with causal fills.",
+    "comparison_evidence": "Record both KRW results, AI signal decisions and observation coverage.",
+    "live_integration": "Complete a finite Korean market comparison with an actual AI decision.",
+}
+
 CONTRACT = """You work on the existing Finance paper-trading validation project.
 Read docs/autotrade-implementation-plan.md. Only its active M1-M4 milestone is in scope.
 Existing router versus fixed trend is an integration test, not a strategy recommendation.
@@ -124,10 +131,13 @@ PROTECTED = (
     "pyproject.toml",
     "tools/probe_toss_websocket.py",
     "tools/run_async_live_validation.py",
+    "tools/run_kr_paper_comparison.py",
+    "tools/kr_comparison_ai.py",
     "tests/test_autotest_jobs.py",
     "tests/test_autotest_supervisor.py",
 )
 REGRESSION_MODULES = (
+    "tests.test_kr_paper_comparison",
     "tests.test_async_adversarial",
     "tests.test_async_layered_paper",
     "tests.test_async_live_validation",
@@ -307,7 +317,17 @@ def ensure_started(job: Path, argv: list[str], cwd: Path, **options: Any) -> Non
 
 
 class Supervisor:
-    def __init__(self, repo: Path, output: Path, binary: Path, inherited: Path) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        output: Path,
+        binary: Path,
+        inherited: Path,
+        *,
+        kr_until: str | None = None,
+    ) -> None:
+        self.kr_until = kr_until
+        self.requirements = KR_REQUIREMENTS if kr_until else REQUIREMENTS
         self.repo, self.output, self.binary = repo.resolve(), output.resolve(), binary.resolve()
         output.mkdir(parents=True, exist_ok=True)
         self.path = output / "status.json"
@@ -315,16 +335,20 @@ class Supervisor:
             self.state = read_json(self.path)
             if self.state["repo"] != str(self.repo):
                 raise RuntimeError("Supervisor repository does not match saved state")
-            if self.state.get("requirements") != REQUIREMENTS:
+            if (
+                self.state.get("requirements") != self.requirements
+                or self.state.get("kr_until") != kr_until
+            ):
                 raise RuntimeError(
                     "Saved supervisor scope differs; preserve it and use a new output"
                 )
         else:
             self.state = {
                 "phase": "inherit",
-                "requirements": REQUIREMENTS,
+                "requirements": self.requirements,
                 "repo": str(self.repo),
                 "inherited": str(inherited),
+                **({"kr_until": kr_until} if kr_until else {}),
                 "cycle": 0,
                 "created_at": now(),
                 "satisfied": [],
@@ -349,9 +373,13 @@ class Supervisor:
 
     def evidence(self) -> dict[str, Any]:
         return {
-            "requirements": REQUIREMENTS,
+            "requirements": self.requirements,
             "milestone_document": "docs/autotrade-implementation-plan.md",
-            "comparison": {"incumbent_policy": "router", "candidate_policy": COMPARISON_POLICY},
+            "comparison": (
+                {"currency": "KRW", "until": self.kr_until, "strategies": ["fixed", "ai"]}
+                if self.kr_until
+                else {"incumbent_policy": "router", "candidate_policy": COMPARISON_POLICY}
+            ),
             "satisfied": self.state["satisfied"],
             "inherited_run": self.state["inherited"],
             "cycle": self.state["cycle"],
@@ -433,7 +461,13 @@ Save numerical results, provenance, assumptions and reproducible parameters to -
 Do not rewrite source while the experiment runs. Do not change unrelated legacy behavior.
 """,
         }[role]
-        prompt = CONTRACT + instructions + "\nEvidence: " + str(job / "evidence.json")
+        scope = (
+            "\nThis run is the KRW fixed versus AI comparison. Use KR requirements in evidence "
+            "instead of the earlier US milestone. The cutoff is absolute.\n"
+            if self.kr_until
+            else ""
+        )
+        prompt = CONTRACT + scope + instructions + "\nEvidence: " + str(job / "evidence.json")
         (job / "prompt.txt").write_text(prompt)
         self.transition(
             "model_wait", role=role, job=str(job), review_digest=tree_digest(self.worktree)
@@ -517,7 +551,13 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 raise RuntimeError("Cannot complete with failed mechanical checks")
             if self.state.get("live_run") and self.state.get("live_returncode") != 0:
                 raise RuntimeError("Cannot complete with a failed live run")
-            if set(self.state["satisfied"]) != set(REQUIREMENTS):
+            if self.kr_until:
+                report = read_json(
+                    Path(self.state.get("live_run") or self.state["inherited"]) / "status.json"
+                )
+                if not report.get("complete") or not report.get("ai_reviews_completed"):
+                    raise RuntimeError("Korean comparison requires a completed live AI review")
+            if set(self.state["satisfied"]) != set(self.requirements):
                 raise RuntimeError("Astra completion omitted pending requirements")
             self.transition("complete")
         elif review["decision"] == "blocked":
@@ -702,6 +742,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             self.save()
 
     def live_start(self) -> None:
+        if self.kr_until and datetime.now(UTC) >= datetime.fromisoformat(self.kr_until):
+            self.transition("blocked", reason="The authorized Korean observation window has ended")
+            return
         path = self.output / f"cycle-{self.state['cycle']:04d}" / "live"
         run = path / "run"
         trusted = self.output / "trusted-live"
@@ -737,6 +780,16 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             "--candidate-policy",
             COMPARISON_POLICY,
         ]
+        if self.kr_until:
+            argv = [
+                sys.executable,
+                "-m",
+                "tools.run_kr_paper_comparison",
+                "--output",
+                str(run),
+                "--until",
+                self.kr_until,
+            ]
         self.transition(
             "live_wait", job=str(path), live_run=str(run), live_argv=argv, live_cwd=str(trusted)
         )
@@ -762,7 +815,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         command(
             [
                 sys.executable,
-                str(Path.home() / ".codex/skills/github-workflow/scripts/check_staged_language.py"),
+                str(Path.home() / ".agents/skills/github-workflow/scripts/check_staged_language.py"),
                 str(self.worktree),
             ],
             self.worktree,
@@ -773,7 +826,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         command(["git", "push", "-u", "origin", self.state["branch"]], self.worktree)
         body = self.output / f"cycle-{self.state['cycle']:04d}" / "pr-body.md"
         body.write_text(
-            REQUIREMENTS[self.state["plan"]["requirement"]]
+            self.requirements[self.state["plan"]["requirement"]]
             + "\n\nChanged files:\n"
             + "\n".join("- " + path for path in paths)
             + "\n\nValidation: layered regression suite passed. "
@@ -900,11 +953,20 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--inherited", required=True, type=Path)
     parser.add_argument("--codex", required=True, type=Path)
+    parser.add_argument("--kr-until", type=datetime.fromisoformat)
     args = parser.parse_args()
+    if args.kr_until is not None and args.kr_until.tzinfo is None:
+        parser.error("--kr-until requires a timezone offset")
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / "supervisor.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        supervisor = Supervisor(args.repo, args.output, args.codex, args.inherited)
+        supervisor = Supervisor(
+            args.repo,
+            args.output,
+            args.codex,
+            args.inherited,
+            kr_until=args.kr_until.isoformat() if args.kr_until else None,
+        )
         if "trusted_live_commit" not in supervisor.state:
             if command(["git", "status", "--porcelain"], args.repo):
                 raise RuntimeError("Initial trusted live checkout must be clean")
@@ -918,7 +980,8 @@ def main() -> None:
             codex_environment(),
         )
         catalog = {item["model"]: item["efforts"] for item in metadata["models"]}
-        for model, effort in MODELS.values():
+        for role in ("implement", "review"):
+            model, effort = MODELS[role]
             if effort not in catalog.get(model, []):
                 raise RuntimeError(f"Requested model/effort unavailable: {model}/{effort}")
         atomic_json(args.output / "metadata.json", metadata)
