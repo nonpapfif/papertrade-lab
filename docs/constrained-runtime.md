@@ -78,3 +78,32 @@ diagnostic signal runner for full strategy validation. Durable account/intent re
 valuation freshness, cost-aware deterministic entry, and matched live validation remain open.
 There is no crash-resume guarantee in either runner. No new live campaign was launched by this
 implementation. Live-account access and numerical real-money risk policy remain separate gates.
+
+## US adaptive exploration
+
+```sh
+python -m tools.run_async_live_validation \
+  --profile broker-constrained --adaptive \
+  --end-at 2026-11-05T06:00:00+09:00 --capital 100 \
+  --output state/validation/us-adaptive-unique/run
+```
+
+This finite mode creates two fresh USD accounts with identical trend rules, equal allocation,
+starting capital, market observations and execution assumptions. The incumbent stays frozen.
+The adaptive candidate can change new-entry policy between trend and rebound, selection
+between all and active, and allocation between equal and priority. These are combinations of
+existing deterministic rules. Candle-high breakouts, new executable rules, real trades and
+changes to the execution contract are outside this experiment.
+
+A fresh completed feature entering a supported rule for a symbol, or a newly recorded paper fill,
+can trigger an asynchronous review. Repeated matching features do not trigger duplicate reviews.
+Evidence that accumulates while a review is in flight remains available for the next review.
+No clock-only review runs. Sol medium is the default. Astra
+medium receives the same evidence only when Sol identifies a concrete unresolved question.
+The runner validates a closed schema locally and queues approved configuration changes in
+publication order. Earlier decisions, reservations and held positions preserve their original
+strategy and version. No proposal can change the modeled costs, liquidity, calendar or cash.
+
+Controlled delays and disconnects are disabled. Output includes shared input digests, AI
+evidence and responses, the effective policy timeline and intent versions. The comparison is
+descriptive adaptive exploration. It is not fixed-version validation or promotion evidence.

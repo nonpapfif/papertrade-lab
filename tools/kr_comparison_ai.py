@@ -189,14 +189,6 @@ async def decide(
     symbols = {item["symbol"] for item in payload["signals"]}
     if not symbols:
         return {}, {}
-    binary_name = settings.data["ai"].get("binary") or shutil.which("codex")
-    if not binary_name:
-        raise SafetyError("Codex CLI is not available")
-    binary = Path(binary_name).resolve()
-    sandbox = Path("/usr/bin/sandbox-exec")
-    if not binary.is_file() or not sandbox.is_file():
-        raise SafetyError("Codex and macOS sandbox-exec are required for isolated reviews")
-
     response_schema = APPROVAL_SCHEMA
     instructions = INSTRUCTIONS
     if "review_contract" in payload:
@@ -221,9 +213,29 @@ async def decide(
             "A deferred symbol cannot have a watch."
         )
 
-    with tempfile.TemporaryDirectory(prefix="papertrade-kr-ai-") as temporary:
+    response = await request_review(settings, payload, instructions, response_schema, model)
+    return validate_review(response, symbols, deferred=deferred, holds=holds)
+
+
+async def request_review(
+    settings: Settings,
+    payload: dict[str, Any],
+    instructions: str,
+    response_schema: dict[str, Any],
+    model: str,
+) -> Any:
+    """Request schema-bound data using the isolated, tool-disabled Codex CLI."""
+    binary_name = settings.data["ai"].get("binary") or shutil.which("codex")
+    if not binary_name:
+        raise SafetyError("Codex CLI is not available")
+    binary = Path(binary_name).resolve()
+    sandbox = Path("/usr/bin/sandbox-exec")
+    if not binary.is_file() or not sandbox.is_file():
+        raise SafetyError("Codex and macOS sandbox-exec are required for isolated reviews")
+
+    with tempfile.TemporaryDirectory(prefix="papertrade-ai-") as temporary:
         working = Path(temporary)
-        schema = working / "approval.schema.json"
+        schema = working / "response.schema.json"
         schema.write_text(encode(response_schema))
         command = [
             str(sandbox),
@@ -283,12 +295,11 @@ async def decide(
 
     _, final, actions = parse_codex_events(stdout.decode(errors="replace"))
     if process.returncode != 0 or actions or not isinstance(final, str):
-        raise SafetyError("Codex did not complete a tool-free approval review")
+        raise SafetyError("Codex did not complete a tool-free review")
     try:
-        response = json.loads(final)
+        return json.loads(final)
     except json.JSONDecodeError:
-        raise SafetyError("Invalid AI approval JSON") from None
-    return validate_review(response, symbols, deferred=deferred, holds=holds)
+        raise SafetyError("Invalid AI response JSON") from None
 
 
 def validate_review(

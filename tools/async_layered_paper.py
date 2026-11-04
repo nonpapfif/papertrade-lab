@@ -32,6 +32,7 @@ class Intent:
     strategy: str
     feature: Feature
     initial: dict[str, Any]
+    policy_version: int = 0
 
 
 class AsyncLayeredPaper(LayeredPaper):
@@ -46,6 +47,8 @@ class AsyncLayeredPaper(LayeredPaper):
         super().__init__(capital, **kwargs)
         if not math.isfinite(delay) or delay <= 0:
             raise ValueError("Positive confirmation delay required")
+        self.entry_policy_version = 0
+        self.owner_policy_versions: dict[int, int] = {}
         self.delay = delay
         self.context.schedule["confirmation_delay_seconds"] = delay
         self.pending: dict[int, Intent] = {}
@@ -311,6 +314,7 @@ class AsyncLayeredPaper(LayeredPaper):
             strategy,
             f,
             copy.deepcopy(event["book"]),
+            self.entry_policy_version if side == "BUY" else self.owner_policy_versions[symbol],
         )
         self.pending[symbol] = intent
         self.intents.append(intent)
@@ -343,6 +347,7 @@ class AsyncLayeredPaper(LayeredPaper):
                     symbol, count, self.prices[symbol], at, int(seconds(at) * 1000), "entry"
                 )
                 self.owners[symbol] = (intent.strategy, intent.feature)
+                self.owner_policy_versions[symbol] = intent.policy_version
             else:
                 self.book._attempt(symbol, "BUY", requested, 0)
         else:
@@ -378,6 +383,7 @@ class AsyncLayeredPaper(LayeredPaper):
             attempt["status"] = "filled" if requested == count else "partial"
             if symbol not in self.book.positions:
                 del self.owners[symbol]
+                del self.owner_policy_versions[symbol]
         self.realized_by_strategy[intent.strategy] += self.book.realized - before
         self.outcomes.append({"intent_id": intent.id, **self.book.order_attempts[-1]})
         del self.pending[symbol]
