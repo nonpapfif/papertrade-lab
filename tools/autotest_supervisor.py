@@ -238,6 +238,60 @@ def changed_paths(repo: Path) -> list[str]:
     return sorted(set(tracked + new))
 
 
+def staged_paths(repo: Path) -> list[str]:
+    return command(["git", "diff", "--cached", "--name-only", "--no-renames"], repo).splitlines()
+
+
+def verify_index_matches_worktree(
+    repo: Path, expected_paths: list[str], *, require_all: bool = False
+) -> str:
+    staged = staged_paths(repo)
+    if not set(staged) <= set(expected_paths) or (
+        require_all and set(staged) != set(expected_paths)
+    ):
+        raise RuntimeError("Staged paths differ from the reviewed change set")
+    for name in staged:
+        entries = command(["git", "ls-files", "--stage", "--", name], repo).splitlines()
+        matching = [line for line in entries if line.rsplit("\t", 1)[-1] == name]
+        path = repo / name
+        if not matching:
+            if path.exists() or path.is_symlink():
+                raise RuntimeError("Index and working tree differ; inspect staged content")
+            continue
+        if len(matching) != 1:
+            raise RuntimeError("Conflicted index entry cannot be published")
+        mode, oid, _ = matching[0].split("\t", 1)[0].split()
+        if not path.exists() and not path.is_symlink():
+            raise RuntimeError("Index and working tree differ; inspect staged content")
+        if path.is_symlink():
+            working_mode = "120000"
+            working_oid = subprocess.run(
+                ["git", "hash-object", "--stdin"],
+                cwd=repo,
+                input=os.fsencode(os.readlink(path)),
+                capture_output=True,
+                check=True,
+            ).stdout.decode().strip()
+        else:
+            working_mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+            working_oid = command(["git", "hash-object", "--no-filters", "--", name], repo)
+        if mode != working_mode or oid != working_oid:
+            raise RuntimeError("Index and working tree differ; inspect staged content")
+    if require_all:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Could not verify staged content")
+        if any(line[:2] == "??" or line[1] != " " for line in result.stdout.splitlines()):
+            raise RuntimeError("Index and working tree differ; inspect staged content")
+    return command(["git", "write-tree"], repo)
+
+
 def check_changes(repo: Path, generated: list[str] | None = None) -> list[str]:
     paths = changed_paths(repo)
     tracked = set(command(["git", "ls-files"], repo).splitlines())
@@ -555,12 +609,41 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 raise RuntimeError("Cannot complete with failed mechanical checks")
             if self.state.get("live_run") and self.state.get("live_returncode") != 0:
                 raise RuntimeError("Cannot complete with a failed live run")
-            if self.kr_until:
-                report = read_json(
-                    Path(self.state.get("live_run") or self.state["inherited"]) / "status.json"
-                )
-                if not report.get("complete") or not report.get("ai_reviews_completed"):
-                    raise RuntimeError("Korean comparison requires a completed live AI review")
+            run_path = Path(self.state.get("live_run") or self.state["inherited"])
+            report = read_json(run_path / "status.json")
+            if (
+                report.get("state") != "complete"
+                or report.get("complete") is False
+                or report.get("result") == "failed"
+            ):
+                raise RuntimeError("Cannot complete without a completed persisted run")
+            comparison_path = run_path / "comparison.json"
+            comparisons = [report, report.get("comparison", {})]
+            if comparison_path.exists():
+                comparisons.append(read_json(comparison_path))
+            for comparison in comparisons:
+                if comparison.get("state") not in (None, "complete") or comparison.get(
+                    "complete"
+                ) is False:
+                    raise RuntimeError("Cannot complete with incomplete comparison evidence")
+                for field in (
+                    "source_unchanged",
+                    "freeze_matches",
+                    "inputs_aligned",
+                    "configuration_unchanged",
+                    "account_alignment",
+                ):
+                    if comparison.get(field) is False:
+                        raise RuntimeError(f"Cannot complete with failed {field} evidence")
+                checks = comparison.get("checks", {})
+                if checks.get("cash_not_overreserved") is False:
+                    raise RuntimeError("Cannot complete with failed cash reservation evidence")
+            if self.kr_until and (
+                not report.get("complete") or not report.get("ai_reviews_completed")
+            ):
+                raise RuntimeError("Korean comparison requires a completed live AI review")
+            if self.state.get("worktree") and changed_paths(self.worktree):
+                raise RuntimeError("Cannot complete with unpublished changes")
             if set(self.state["satisfied"]) != set(self.requirements):
                 raise RuntimeError("Astra completion omitted pending requirements")
             self.transition("complete")
@@ -806,6 +889,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if self.state.get("tested_digest") != self.state["publication_digest"]:
             raise RuntimeError("Publication source was not tested")
         paths = check_changes(self.worktree, self.state.get("generated_files", []))
+        verify_index_matches_worktree(self.worktree, paths)
         tracked = set(command(["git", "ls-files"], self.worktree).splitlines())
         self.state["generated_files"] = sorted(
             set(self.state.get("generated_files", [])) | (set(paths) - tracked)
@@ -816,6 +900,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         # Persist before external mutations. An interrupted publication requires reconciliation.
         self.transition("publishing", publication_started_at=now())
         command(["git", "add", "--", *paths], self.worktree)
+        frozen_tree = verify_index_matches_worktree(self.worktree, paths, require_all=True)
+        if tree_digest(self.worktree) != self.state["publication_digest"]:
+            raise RuntimeError("Reviewed source changed while staging")
         command(["git", "diff", "--cached", "--check"], self.worktree)
         command(
             [
@@ -829,6 +916,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         )
         title = "Validate layered paper trading: " + self.state["plan"]["requirement"]
         command(["git", "commit", "-m", title], self.worktree)
+        if command(["git", "rev-parse", "HEAD^{tree}"], self.worktree) != frozen_tree:
+            raise RuntimeError("Committed tree differs from the reviewed staged tree")
         sha = command(["git", "rev-parse", "HEAD"], self.worktree)
         command(["git", "push", "-u", "origin", self.state["branch"]], self.worktree)
         body = self.output / f"cycle-{self.state['cycle']:04d}" / "pr-body.md"
@@ -921,7 +1010,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if phase == "inherit":
             path = Path(self.state["inherited"]) / "status.json"
             status = read_json(path)
-            if status.get("state") in ("complete", "failed"):
+            if status.get("state") in ("complete", "failed", "incomplete", "interrupted"):
                 self.transition("review")
             elif time.time() - path.stat().st_mtime > 120:
                 raise RuntimeError("Inherited live status stopped updating; inspect its process")

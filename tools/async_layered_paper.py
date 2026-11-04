@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from tools.layered_paper import Feature, LayeredPaper, assign, holding_valid
-from tools.live_execution import transaction_fees
+from tools.live_execution import transaction_fees, us_limit_price
 
 
 def seconds(at: str) -> float:
@@ -62,7 +62,13 @@ class AsyncLayeredPaper(LayeredPaper):
         self._receipts: dict[int, float] = {}
         self._processed: set[str] = set()
         self._books: dict[int, dict[str, Any]] = {}
-        self._fx: tuple[float, str] = (0.0, "")
+        self._fx: tuple[float, str, str | None, str | None, bool] = (
+            0.0,
+            "",
+            None,
+            None,
+            False,
+        )
 
     @property
     def reserved_cash(self) -> float:
@@ -183,14 +189,13 @@ class AsyncLayeredPaper(LayeredPaper):
         if source < previous_source:
             return
         previous = self._books.get(symbol)
-        if (
+        duplicate_quote = (
             source == previous_source
             and previous is not None
             and all(
                 previous[key] == quote[key] for key in ("timestamp", "currency", "asks", "bids")
             )
-        ):
-            return
+        )
         asks = [(float(r["price"]), int(float(r["volume"]))) for r in quote["asks"]]
         bids = [(float(r["price"]), int(float(r["volume"]))) for r in quote["bids"]]
         if (
@@ -202,13 +207,22 @@ class AsyncLayeredPaper(LayeredPaper):
         ask, bid = min(p for p, _ in asks), max(p for p, _ in bids)
         if bid > ask:
             raise ValueError("Crossed orderbook")
-        self._source_times[symbol] = source
-        self._books[symbol] = copy.deepcopy(quote)
-        self._fx = (event.get("fx", 0.0), event.get("fx_at", at))
-        self.prices[symbol], self.times[symbol] = (ask + bid) / 2, quote["timestamp"]
+        if not duplicate_quote:
+            self._source_times[symbol] = source
+            self._books[symbol] = copy.deepcopy(quote)
+        self._fx = (
+            event.get("fx", 0.0),
+            event.get("fx_at", at),
+            event.get("fx_valid_from"),
+            event.get("fx_valid_until"),
+            event.get("fx_provider_validity_required", False),
+        )
+        if not duplicate_quote:
+            self.prices[symbol], self.times[symbol] = (ask + bid) / 2, quote["timestamp"]
         intent = self.pending.get(symbol)
         if (
-            intent
+            not duplicate_quote
+            and intent
             and tick - seconds(intent.decision_at) >= self.delay
             and source > seconds(intent.decision_at)
         ):
@@ -247,6 +261,9 @@ class AsyncLayeredPaper(LayeredPaper):
         if not prices:
             return
         limit = min(prices) if side == "BUY" else max(prices)
+        limit = us_limit_price(limit)
+        if limit <= 0:
+            return
         if side == "BUY":
             count = event.get("candidate_count", 1) if self.allocation == "equal" else 1
             if not isinstance(count, int) or count < 1:
@@ -304,10 +321,14 @@ class AsyncLayeredPaper(LayeredPaper):
             "at": at,
             "decision_at": intent.decision_at,
             "decision_orderbooks": {symbol: intent.initial},
+            "order_limits": {symbol: intent.limit},
             "orderbooks": {symbol: quote},
             "confirmation_received_at": {symbol: at},
             "fx": event.get("fx", 0),
             "fx_at": event.get("fx_at", at),
+            "fx_valid_from": event.get("fx_valid_from"),
+            "fx_valid_until": event.get("fx_valid_until"),
+            "fx_provider_validity_required": event.get("fx_provider_validity_required", False),
         }
         self.context.frame = frame
         before = self.book.realized
@@ -325,9 +346,36 @@ class AsyncLayeredPaper(LayeredPaper):
             else:
                 self.book._attempt(symbol, "BUY", requested, 0)
         else:
-            self.book.fill(
-                symbol, -requested, self.prices[symbol], at, int(seconds(at) * 1000), "invalidated"
+            levels = self.book._quote(symbol, "SELL", self.prices[symbol])
+            capacity = sum(v for _, v in levels[0]) if levels else 0
+            count = min(requested, capacity)
+            execution = (
+                self.book._execution(symbol, "SELL", count, self.prices[symbol])
+                if count
+                else None
             )
+            other_reserved = self.reserved_cash - intent.reserved
+            reason = "sell_execution_unavailable"
+            if execution is not None and (
+                self.book.cash + count * execution[0] - execution[1]["total_usd"]
+                < other_reserved - 1e-9
+            ):
+                reason = "insufficient_cash_after_sell_costs"
+                execution = None
+            if execution is None:
+                self.book._attempt(symbol, "SELL", requested, 0)
+                self.outcomes.append(
+                    {"intent_id": intent.id, **self.book.order_attempts[-1], "blocked_reason": reason}
+                )
+                del self.pending[symbol]
+                return
+            self.book.fill(
+                symbol, -count, self.prices[symbol], at, int(seconds(at) * 1000), "invalidated"
+            )
+            attempt = self.book.order_attempts[-1]
+            attempt["requested_quantity"] = requested
+            attempt["unfilled_quantity"] = requested - count
+            attempt["status"] = "filled" if requested == count else "partial"
             if symbol not in self.book.positions:
                 del self.owners[symbol]
         self.realized_by_strategy[intent.strategy] += self.book.realized - before
@@ -342,6 +390,9 @@ class AsyncLayeredPaper(LayeredPaper):
             "orderbooks": self._books,
             "fx": self._fx[0],
             "fx_at": self._fx[1],
+            "fx_valid_from": self._fx[2],
+            "fx_valid_until": self._fx[3],
+            "fx_provider_validity_required": self._fx[4],
         }
         result = super().summary()
         assert self.last_at is not None

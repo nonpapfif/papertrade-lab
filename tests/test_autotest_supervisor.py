@@ -329,6 +329,7 @@ class AutotestSupervisorTests(unittest.TestCase):
         self.command.assert_not_called()
 
     def test_inherited_evidence_can_complete_without_scheduled_checks(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "complete"})
         self.completed_review(
             self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
         )
@@ -337,6 +338,81 @@ class AutotestSupervisorTests(unittest.TestCase):
             self.runner.finish_model()
         self.assertEqual(self.runner.state["phase"], "complete")
         self.command.assert_not_called()
+
+    def test_failed_inherited_evidence_cannot_complete(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "failed"})
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
+        )
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "completed persisted run"),
+        ):
+            self.runner.finish_model()
+        self.assertNotEqual(self.runner.state["phase"], "complete")
+
+    def test_incomplete_inherited_run_is_terminal_and_reviewable(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "incomplete"})
+        self.runner.step()
+        self.assertEqual(self.runner.state["phase"], "review")
+
+    def test_failed_comparison_integrity_cannot_complete(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "complete"})
+        atomic_json(self.inherited / "comparison.json", {"state": "complete", "source_unchanged": False})
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
+        )
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "source_unchanged"),
+        ):
+            self.runner.finish_model()
+
+    def test_inconclusive_short_sample_can_complete_as_inconclusive(self) -> None:
+        atomic_json(
+            self.inherited / "status.json",
+            {
+                "state": "complete",
+                "result": "inconclusive",
+                "checks": {"features_observed": False},
+            },
+        )
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
+        )
+        with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
+            self.runner.finish_model()
+        self.assertEqual(self.runner.state["phase"], "complete")
+
+    def test_failed_run_invariant_cannot_complete_as_inconclusive(self) -> None:
+        atomic_json(
+            self.inherited / "status.json",
+            {
+                "state": "complete",
+                "result": "inconclusive",
+                "checks": {"cash_not_overreserved": False},
+            },
+        )
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS))
+        )
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "cash reservation"),
+        ):
+            self.runner.finish_model()
+
+    def test_complete_review_rejects_unpublished_changes(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "complete"})
+        self.completed_review(
+            self.review(decision="complete", satisfied=list(supervisor.REQUIREMENTS)),
+            worktree=str(self.repo),
+        )
+        with (
+            patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
+            self.assertRaisesRegex(RuntimeError, "unpublished changes"),
+        ):
+            self.runner.finish_model()
 
     def test_source_change_after_test_preparation_blocks_start(self) -> None:
         self.runner.prepare_tests("")
@@ -405,7 +481,10 @@ class AutotestSupervisorTests(unittest.TestCase):
             return ""
 
         self.command.side_effect = run
-        with self.assertRaises(subprocess.CalledProcessError):
+        with (
+            patch.object(supervisor, "verify_index_matches_worktree", return_value="tree-sha"),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
             self.runner.publish()
         commands = [call.args[0] for call in self.command.call_args_list]
         self.assertFalse(any(argv[:2] == ["git", "commit"] for argv in commands))
@@ -428,13 +507,16 @@ class AutotestSupervisorTests(unittest.TestCase):
             if argv[:2] == ["git", "ls-files"]:
                 return "tools/task.py"
             if argv[:2] == ["git", "rev-parse"]:
+                if argv[2:] == ["HEAD^{tree}"]:
+                    return "tree-sha"
                 return "base-sha"
             if argv[:3] == ["gh", "pr", "create"]:
                 return "https://github.com/nonpapfif/papertrade-lab/pull/1"
             return ""
 
         self.command.side_effect = run
-        self.runner.publish()
+        with patch.object(supervisor, "verify_index_matches_worktree", return_value="tree-sha"):
+            self.runner.publish()
         body = (cycle / "pr-body.md").read_text()
         self.assertIn(supervisor.REQUIREMENTS["shared_input"], body)
         self.assertIn("tools/task.py", body)
@@ -443,6 +525,7 @@ class AutotestSupervisorTests(unittest.TestCase):
         self.assertEqual(self.runner.state["phase"], "pr_wait")
 
     def test_incomplete_requirements_cannot_be_marked_complete(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "complete"})
         self.completed_review(self.review(decision="complete", satisfied=["shared_input"]))
         with (
             patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
@@ -528,6 +611,7 @@ class AutotestSupervisorTests(unittest.TestCase):
             )
 
     def test_complete_requires_full_current_requirement_set(self) -> None:
+        atomic_json(self.inherited / "status.json", {"state": "complete"})
         self.completed_review(
             self.review(
                 decision="complete",
@@ -551,6 +635,82 @@ class AutotestSupervisorTests(unittest.TestCase):
             self.assertNotEqual(real_tree_digest(self.repo), ordinary)
         self.assertEqual(supervisor.tree_digest(self.repo), "A")
         self.command.assert_not_called()
+
+    def test_index_publication_guard_rejects_hidden_staged_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            protected = repo / "papertrade" / "api.py"
+            protected.parent.mkdir()
+            protected.write_text("BASE\n")
+            allowed = repo / "tools" / "task.py"
+            allowed.parent.mkdir()
+            allowed.write_text("BASE\n")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+
+            def git_command(argv: list[str], cwd: Path) -> str:
+                return subprocess.run(
+                    argv, cwd=cwd, check=True, capture_output=True, text=True
+                ).stdout.strip()
+
+            protected.write_text("STAGED\n")
+            subprocess.run(["git", "add", str(protected)], cwd=repo, check=True)
+            protected.write_text("BASE\n")
+            allowed.write_text("REVIEWED\n")
+            with (
+                patch.object(supervisor, "command", side_effect=git_command),
+                self.assertRaisesRegex(RuntimeError, "Index and working tree differ"),
+            ):
+                supervisor.verify_index_matches_worktree(
+                    repo, ["tools/task.py", "papertrade/api.py"]
+                )
+
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD"], cwd=repo, check=True)
+            extra = repo / "tools" / "extra.py"
+            extra.write_text("EXTRA\n")
+            subprocess.run(["git", "add", str(extra)], cwd=repo, check=True)
+            with (
+                patch.object(supervisor, "command", side_effect=git_command),
+                self.assertRaisesRegex(RuntimeError, "Staged paths differ"),
+            ):
+                supervisor.verify_index_matches_worktree(repo, ["tools/task.py"])
+
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD"], cwd=repo, check=True)
+            protected.chmod(0o755)
+            subprocess.run(["git", "add", str(protected)], cwd=repo, check=True)
+            protected.chmod(0o644)
+            with (
+                patch.object(supervisor, "command", side_effect=git_command),
+                self.assertRaisesRegex(RuntimeError, "Index and working tree differ"),
+            ):
+                supervisor.verify_index_matches_worktree(
+                    repo, ["papertrade/api.py"], require_all=True
+                )
+
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD"], cwd=repo, check=True)
+            protected.unlink()
+            subprocess.run(["git", "add", "-u", "--", "papertrade/api.py"], cwd=repo, check=True)
+            protected.write_text("BASE\n")
+            with (
+                patch.object(supervisor, "command", side_effect=git_command),
+                self.assertRaisesRegex(RuntimeError, "Staged paths differ"),
+            ):
+                supervisor.verify_index_matches_worktree(repo, [], require_all=True)
+
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD"], cwd=repo, check=True)
+            allowed.write_text("REVIEWED\n")
+            with patch.object(supervisor, "command", side_effect=git_command):
+                self.assertEqual(
+                    supervisor.verify_index_matches_worktree(repo, ["tools/task.py"]),
+                    git_command(["git", "write-tree"], repo),
+                )
+                subprocess.run(["git", "add", str(allowed)], cwd=repo, check=True)
+                supervisor.verify_index_matches_worktree(
+                    repo, ["tools/task.py"], require_all=True
+                )
 
     def test_prepare_tests_keeps_old_generated_and_new_changed_test_modules(self) -> None:
         self.runner.state["generated_files"] = [

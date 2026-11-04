@@ -1,13 +1,17 @@
 """Offline coverage for the normal US broker-constrained runtime adapter."""
 
 import asyncio
+import hashlib
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from tools.layered_paper import feature_from_bars
-from tools.run_async_live_validation import Runtime, us_date
+from tools.run_async_live_validation import SOURCES, Runtime, us_date, write_comparison
 
 
 def candles(at: datetime, *, rising: bool = True) -> list[dict[str, str]]:
@@ -123,6 +127,59 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
         await self.publish(self.close_at + timedelta(seconds=30), "clock", None)
         self.assertNotIn(0, account.pending)
         self.assertEqual(account.outcomes[-1]["status"], "expired")
+
+    async def test_unavailable_orderbook_timestamp_is_skipped_and_consumer_continues(self) -> None:
+        at = self.close_at - timedelta(seconds=20)
+        await self.prime(at)
+        for book in (
+            {"timestamp": None, "currency": "USD", "asks": [], "bids": []},
+            {"currency": "USD", "asks": [{"price": "5", "volume": "2"}], "bids": []},
+        ):
+            await self.publish(at, "book", ("A", book))
+        self.assertFalse(self.consumer.done())
+        self.assertNotIn("A", self.runtime.books)
+        self.assertEqual(self.runtime.counts["book_unavailable"], 2)
+        await self.book(at)
+        self.assertFalse(self.consumer.done())
+        self.assertEqual(self.runtime.counts["book_events"], 3)
+
+    async def test_single_constrained_run_records_source_integrity_and_freeze(self) -> None:
+        runtime = self.runtime
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            source_files = {}
+            for name in SOURCES:
+                path = output / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("frozen\n")
+                source_files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            manifest = {
+                "source_sha256": source_files,
+                "account": runtime.configurations["incumbent"],
+            }
+            (output / "manifest.json").write_text(json.dumps(manifest))
+            (output / "market.jsonl.gz").write_bytes(b"market")
+            (output / "events.jsonl").write_text("events\n")
+            with patch("tools.run_async_live_validation.ROOT", output):
+                result = write_comparison(output, {"state": "complete"}, runtime)
+            assert result is not None
+            self.assertTrue(result["source_unchanged"])
+            self.assertTrue(result["freeze_matches"])
+            runtime.account.policy = "breakout"
+            with patch("tools.run_async_live_validation.ROOT", output):
+                changed_config = write_comparison(output, {"state": "complete"}, runtime)
+            assert changed_config is not None
+            self.assertFalse(changed_config["configuration_unchanged"])
+            self.assertFalse(changed_config["complete"])
+            runtime.account.policy = runtime.configurations["incumbent"]["policy"]
+            (output / SOURCES[0]).write_text("changed\n")
+            with patch("tools.run_async_live_validation.ROOT", output):
+                changed = write_comparison(output, {"state": "complete"}, runtime)
+            assert changed is not None
+            self.assertFalse(changed["source_unchanged"])
+            self.assertFalse(changed["complete"])
+            self.assertEqual(changed["state"], "incomplete")
+            self.assertNotEqual(changed["result"], "passed")
 
     async def test_unknown_mismatched_and_holiday_calendars_do_not_dispatch(self) -> None:
         at = self.close_at - timedelta(seconds=20)

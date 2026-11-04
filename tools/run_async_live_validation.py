@@ -170,7 +170,7 @@ class Runtime:
         self.candidates: list[str] = []
         self.desired: list[str] = []
         self.books: dict[str, dict] = {}
-        self.fx: tuple[float, str] = (0, now())
+        self.fx: tuple[float, str, str | None, str | None] = (0, now(), None, None)
         self.queue: asyncio.Queue = asyncio.Queue()
         self.counts: Counter = Counter()
         self.queue_delays: list[float] = []
@@ -262,11 +262,35 @@ class Runtime:
                         "features_valid" if self.features[symbol] else "features_missing"
                     ] += 1
                 elif kind == "fx":
-                    self.fx = (float(payload["midRate"]), received)
+                    try:
+                        rate = float(payload["midRate"])
+                    except (KeyError, TypeError, ValueError):
+                        rate = 0
+                    pair_matches = payload.get("baseCurrency", "USD") == "USD" and payload.get(
+                        "quoteCurrency", "KRW"
+                    ) == "KRW"
+                    if not math.isfinite(rate) or rate <= 0 or not pair_matches:
+                        self.counts["invalid_fx"] += 1
+                        rate = 0
+                    self.fx = (
+                        rate,
+                        received,
+                        payload.get("validFrom"),
+                        payload.get("validUntil"),
+                    )
                 elif kind == "book":
                     symbol, book = payload
                     self.symbol_delays.setdefault(symbol, []).append(started - queued)
                     self.counts["book_events"] += 1
+                    if not isinstance(book, dict) or not isinstance(book.get("timestamp"), str):
+                        self.counts["book_unavailable"] += 1
+                        self.record(
+                            "book_rejected",
+                            reason="unavailable_timestamp",
+                            sequence=sequence,
+                            symbol=symbol,
+                        )
+                        continue
                     source_age = seconds(received) - seconds(book["timestamp"])
                     if not 0 <= source_age <= 60:
                         self.counts["invalid_source_age"] += 1
@@ -341,6 +365,9 @@ class Runtime:
                         "eligible": symbol in self.candidates,
                         "fx": self.fx[0],
                         "fx_at": self.fx[1],
+                        "fx_valid_from": self.fx[2],
+                        "fx_valid_until": self.fx[3],
+                        "fx_provider_validity_required": self.constrained,
                     }
                     observation = (
                         json.dumps(
@@ -458,15 +485,18 @@ def write_comparison(
     output: Path, stats: dict[str, Any], runtime: Runtime
 ) -> dict[str, Any] | None:
     """Save descriptive comparison evidence after the shared recording files close."""
-    if len(runtime.accounts) == 1:
+    if len(runtime.accounts) == 1 and not runtime.constrained:
         return None
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     expected = manifest.get("source_sha256", {})
-    source_unchanged = set(expected) == set(SOURCES) and all(
+    expected_sources = (
+        set(SOURCES) if runtime.constrained or len(runtime.accounts) > 1 else set(LEGACY_SOURCES)
+    )
+    source_unchanged = set(expected) == expected_sources and all(
         (ROOT / name).is_file()
         and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected[name]
-        for name in SOURCES
+        for name in expected_sources
     )
     hashes = {}
     for name in ("manifest.json", "market.jsonl.gz", "events.jsonl"):
@@ -474,24 +504,48 @@ def write_comparison(
         if path.is_file():
             with path.open("rb") as stream:
                 hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-    comparison = runtime.status()["comparison"]
-    freeze_matches = manifest.get("comparison") == runtime.configurations
+    runtime_status = runtime.status()
+    comparison = runtime_status.get("comparison", {})
+    if len(runtime.accounts) == 1:
+        account = runtime.account
+        frozen = runtime.configurations["incumbent"]
+        configuration_unchanged = (
+            account.policy == frozen["policy"]
+            and account.selection == frozen["selection"]
+            and account.allocation == frozen["allocation"]
+            and account.delay == frozen["delay_seconds"]
+            and account.book.initial_equity == frozen["capital"]
+            and account.context.schedule == frozen["fee_schedule"]
+        )
+    else:
+        configuration_unchanged = comparison.get("configuration_unchanged", False)
+    freeze_matches = (
+        manifest.get("comparison") == runtime.configurations
+        if len(runtime.accounts) > 1
+        else manifest.get("account") == runtime.configurations["incumbent"]
+    )
     complete = (
         stats.get("state") == "complete"
         and source_unchanged
         and len(hashes) == 3
         and freeze_matches
-        and comparison["inputs_aligned"]
-        and comparison["configuration_unchanged"]
+        and comparison.get("inputs_aligned", True)
+        and configuration_unchanged
     )
     state = stats.get("state") if stats.get("state") in ("complete", "failed") else "interrupted"
     result = {
         **stats,
         **comparison,
         "state": state if complete or state != "complete" else "incomplete",
+        "result": (
+            "inconclusive"
+            if state == "complete" and not complete and stats.get("result") == "passed"
+            else stats.get("result")
+        ),
         "complete": complete,
         "ended_at": now(),
         "source_unchanged": source_unchanged,
+        "configuration_unchanged": configuration_unchanged,
         "freeze_matches": freeze_matches,
         "observation_status": "observed_short_sample"
         if all(runtime.book_delivered.values())
@@ -902,18 +956,26 @@ async def campaign(
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await runtime.close()
-        private_json(output / "status.json", stats)
+        if stats.get("state") not in ("complete", "failed", "interrupted"):
+            stats.update(state="interrupted", ended_at=now(), **runtime.status())
+        elif stats.get("state") == "complete":
+            stats.setdefault("ended_at", stats.get("at", now()))
+        stats.update(**runtime.status())
         private_json(output / "http-audit.json", {"requests": http_audit})
         files.close()
         comparison = write_comparison(output, stats, runtime)
         if comparison is not None:
-            stats.update(state=comparison["state"], **runtime.status())
-            stats["comparison"].update(
+            stats.update(
+                state=comparison["state"],
+                result=comparison.get("result") or stats.get("result"),
+                **runtime.status(),
+            )
+            stats.setdefault("comparison", {}).update(
                 complete=comparison["complete"],
                 source_unchanged=comparison["source_unchanged"],
                 freeze_matches=comparison["freeze_matches"],
             )
-            private_json(output / "status.json", stats)
+        private_json(output / "status.json", stats)
 
 
 def main() -> None:

@@ -10,8 +10,9 @@ import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from papertrade.api import ApiError
 from tools.layered_paper import Feature
@@ -446,3 +447,45 @@ class ComparisonTests(RuntimeTests):
             self.assertFalse(result["complete"])
             self.assertFalse(result["source_unchanged"])
             self.assertEqual(result["observation_status"], "inconclusive")
+
+    async def test_cancelled_constrained_campaign_persists_terminal_interruption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            settings = SimpleNamespace(data={"limits": {}})
+            websockets = ModuleType("websockets")
+            websocket_asyncio = ModuleType("websockets.asyncio")
+            websocket_client = ModuleType("websockets.asyncio.client")
+            websocket_exceptions = ModuleType("websockets.exceptions")
+            websocket_client.connect = AsyncMock()
+            websocket_exceptions.ConnectionClosed = type("ConnectionClosed", (Exception,), {})
+            websocket_exceptions.WebSocketException = type("WebSocketException", (Exception,), {})
+            with (
+                patch.dict(
+                    "sys.modules",
+                    {
+                        "websockets": websockets,
+                        "websockets.asyncio": websocket_asyncio,
+                        "websockets.asyncio.client": websocket_client,
+                        "websockets.exceptions": websocket_exceptions,
+                    },
+                ),
+                patch("tools.run_async_live_validation.Settings.load", return_value=settings),
+                patch("tools.run_async_live_validation.CachedTokenClient") as client,
+                patch("tools.run_async_live_validation.LiveFeed") as feed,
+                patch("tools.run_async_live_validation.read_spec", return_value=b"{}"),
+                patch(
+                    "tools.run_async_live_validation.asyncio.sleep",
+                    side_effect=asyncio.CancelledError,
+                ),
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                client.return_value.access_token.return_value = "fixture-token"
+                client.return_value.calendar.return_value = {}
+                feed.return_value.universe.return_value = []
+                await campaign(output, 360, 100, profile="broker-constrained")
+            status = json.loads((output / "status.json").read_text())
+            result = json.loads((output / "comparison.json").read_text())
+            self.assertEqual(status["state"], "interrupted")
+            self.assertIn("ended_at", status)
+            self.assertEqual(result["state"], "interrupted")
+            self.assertFalse(result["complete"])
