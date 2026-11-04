@@ -1,11 +1,19 @@
 """Check shared Korean observations and causal fills without market or model calls."""
 
+import asyncio
+import json
+import tempfile
 import unittest
+from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from tools.run_kr_paper_comparison import CAPITAL, Comparison
+from tools.kr_comparison_ai import SOL
+from tools.run_kr_paper_comparison import CAPITAL, Comparison, campaign
 
 
 class ComparisonTests(unittest.TestCase):
@@ -80,3 +88,99 @@ class ComparisonTests(unittest.TestCase):
         self.comparison.review_queue.clear()
         self.observe(5, 74_000)
         self.assertFalse(self.comparison.review_queue)
+
+    def test_four_accounts_fund_strongest_signals_without_splitting_into_dust(self) -> None:
+        pairs = {
+            5: Comparison(Decimal("0.05")),
+            10: Comparison(Decimal("0.10")),
+        }
+        for second in range(14):
+            at = self.at + timedelta(seconds=second)
+            rows = [
+                {
+                    "symbol": f"S{i:02}",
+                    "currency": "KRW",
+                    "lastPrice": 100 + second if second < 12 else 115 + i + second,
+                    "timestamp": at.isoformat(),
+                }
+                for i in range(25)
+            ]
+            for pair in pairs.values():
+                pair.observe(rows, at, warmup=second < 12)
+                if second < 12:
+                    self.assertFalse(pair.review_queue)
+                if second == 12:
+                    candidates = list(pair.review_queue.values())
+                    pair.approve(candidates, {x["symbol"]: "Approved" for x in candidates}, at)
+        for percent, pair in pairs.items():
+            count = 100 // percent
+            expected = {f"S{i:02}" for i in range(25 - count, 25)}
+            for account in pair.accounts.values():
+                self.assertEqual(set(account.positions), expected)
+                self.assertEqual({cost for _, cost in account.positions.values()}, {1000 * percent})
+                self.assertEqual(account.cash, 0)
+
+
+class CampaignTests(unittest.IsolatedAsyncioTestCase):
+    async def test_four_account_mode_uses_one_snapshot_per_sweep(self) -> None:
+        start = datetime(2026, 11, 4, 3, tzinfo=UTC)
+        clock = start
+        symbols = [f"S{i:02}" for i in range(25)]
+        real_sleep = asyncio.sleep
+
+        async def advance(delay: float) -> None:
+            nonlocal clock
+            await real_sleep(0)
+            clock += timedelta(minutes=1)
+
+        def snapshot() -> list[dict[str, Any]]:
+            minute = int((clock - start).total_seconds() // 60)
+            return [
+                {
+                    "symbol": symbol,
+                    "currency": "KRW",
+                    "timestamp": clock.isoformat(),
+                    "lastPrice": 100 + minute if minute < 12 else 115 + minute + i,
+                }
+                for i, symbol in enumerate(symbols)
+            ]
+
+        async def approve(
+            settings: Any,
+            pair: Comparison,
+            signals: list[dict[str, Any]],
+            until: datetime,
+            record: Callable[..., None],
+            calls: Counter[str],
+            completed: Counter[str],
+        ) -> None:
+            calls[SOL] += 1
+            pair.approve(signals, {s["symbol"]: "Approved" for s in signals}, clock)
+            completed[SOL] += 1
+
+        module = "tools.run_kr_paper_comparison"
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch(f"{module}.now", side_effect=lambda: clock),
+            patch(f"{module}.asyncio.sleep", side_effect=advance),
+            patch(f"{module}.CachedTokenClient") as client,
+            patch(f"{module}.LiveFeed") as feed,
+            patch(f"{module}.review_cascade", side_effect=approve),
+        ):
+            client.return_value.listed.return_value = [{"symbol": symbol} for symbol in symbols]
+            feed.return_value.snapshot.side_effect = snapshot
+            output = Path(temp) / "run"
+            await campaign(output, start + timedelta(minutes=14), allocation_comparison=True)
+            result = json.loads((output / "comparison.json").read_text())
+            self.assertEqual(feed.return_value.snapshot.call_count, 14)
+            self.assertEqual(result["sweeps"], 14)
+            self.assertTrue(result["complete"])
+            self.assertEqual(result["ai_reviews_completed"], 2)
+            accounts = result["accounts"]
+            self.assertEqual(set(accounts), {"5pct_fixed", "5pct_ai", "10pct_fixed", "10pct_ai"})
+            for key, data in accounts.items():
+                size = 5 if key.startswith("5pct") else 10
+                self.assertEqual(data["fills"], 100 // size)
+                self.assertEqual(
+                    {Decimal(p["cost_krw"]) for p in data["positions"].values()}, {1000 * size}
+                )
