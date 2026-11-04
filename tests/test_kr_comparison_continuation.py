@@ -142,6 +142,34 @@ class ContinuationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report["shared_input_sha256"], hashlib.sha256(market).hexdigest())
 
             status = old_run / "status.json"
+            failed = json.loads(status.read_text())
+            failed.update(state="failed", complete=False, error_type="SafetyError")
+            status.write_text(encode(failed))
+            (job / "stderr.log").write_text(
+                "papertrade.core.SafetyError: A valid existing cached token is required\n"
+            )
+            recovered = Path(temp) / "recovered"
+            clock = cutoff + timedelta(seconds=1)
+            with (
+                patch(f"{extension}.now", side_effect=timestamp),
+                patch(f"{extension}.asyncio.sleep", side_effect=advance),
+                patch(
+                    f"{extension}.poll_job",
+                    side_effect=lambda path: {"returncode": 1 if path == job else 0},
+                ),
+                patch(f"{extension}.review_cascade"),
+            ):
+                with self.assertRaisesRegex(ValueError, "verified completed comparison"):
+                    await continue_campaign(job, feed, recovered, until)
+                await continue_campaign(job, feed, recovered, until, recover_expired_cache=True)
+            recovery = json.loads((recovered / "comparison.json").read_text())
+            self.assertTrue(recovery["recovered_expired_cache"])
+            self.assertEqual(recovery["accounts"], report["accounts"])
+            self.assertEqual(recovery["shared_input_sha256"], report["shared_input_sha256"])
+            self.assertLess(
+                recovery["previous_last_observation"], recovery["first_extension_observation"]
+            )
+
             tampered = json.loads(status.read_text())
             tampered["accounts"]["5pct_ai"]["cash_krw"] = "1"
             status.write_text(encode(tampered))
