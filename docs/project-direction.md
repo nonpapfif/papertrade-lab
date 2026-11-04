@@ -73,8 +73,6 @@ prevent independent implementation and fault testing with labelled synthetic pol
 
 ## Review findings to resolve
 
-- `tools/autotest_supervisor.py` embeds a statement that layered rules override the free-profile
-  instructions. Its scope must be reconciled with the profile distinction in `AGENTS.md`.
 - The asynchronous layered engine is currently in memory. Durable position and pending-intent
   recovery is not implemented, as documented in `docs/async-layered-paper.md`.
 

@@ -63,7 +63,7 @@ class AutotestSupervisorTests(unittest.TestCase):
             "findings": [],
             "evidence": ["test-0/exit.json"],
             "satisfied": [],
-            "next_objective": "Recovery",
+            "next_objective": "Shared input",
             "publish_ok": False,
             **changes,
         }
@@ -72,9 +72,9 @@ class AutotestSupervisorTests(unittest.TestCase):
     def plan(**changes: Any) -> dict[str, Any]:
         return {
             "kind": "offline",
-            "objective": "Verify recovery",
+            "objective": "Verify independent account inputs",
             "acceptance": ["No duplicate fills"],
-            "requirement": "recovery",
+            "requirement": "shared_input",
             "live_duration_seconds": 360,
             **changes,
         }
@@ -151,6 +151,36 @@ class AutotestSupervisorTests(unittest.TestCase):
                 self.assertNotIn("shell_tool", disabled)
                 self.assertEqual(argv[-1], "-")
 
+    def test_saved_scope_can_resume_but_old_scope_cannot_be_reinterpreted(self) -> None:
+        resumed = supervisor.Supervisor(
+            self.repo, self.runner.output, Path("/test/codex"), self.inherited
+        )
+        self.assertEqual(resumed.state["phase"], "inherit")
+        saved = json.loads(self.runner.path.read_text())
+        del saved["requirements"]
+        atomic_json(self.runner.path, saved)
+        before = self.runner.path.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "scope differs"):
+            supervisor.Supervisor(
+                self.repo, self.runner.output, Path("/test/codex"), self.inherited
+            )
+        self.assertEqual(self.runner.path.read_bytes(), before)
+        self.launch.assert_not_called()
+
+    def test_live_job_uses_frozen_baseline_and_two_account_policy(self) -> None:
+        trusted = self.runner.output / "trusted-live"
+        trusted.mkdir()
+        self.runner.state.update(trusted_live_digest="A", plan=self.plan(kind="live"))
+        self.runner.live_start()
+        job, argv, cwd = self.launch.call_args.args
+        self.assertEqual(cwd, trusted)
+        self.assertEqual(argv[argv.index("--candidate-policy") + 1], "trend")
+        self.assertEqual(argv[argv.index("--capital") + 1], "100")
+        self.assertEqual(self.runner.state["phase"], "live_wait")
+        self.assertEqual(self.runner.state["live_cwd"], str(trusted))
+        self.assertEqual(self.runner.state["job"], str(job))
+        self.command.assert_not_called()
+
     def test_inherited_running_run_waits_then_triggers_one_review(self) -> None:
         with patch.object(self.runner, "invoke") as invoke:
             for _ in range(4):
@@ -224,9 +254,7 @@ class AutotestSupervisorTests(unittest.TestCase):
         self.command.assert_not_called()
 
     def test_fix_review_cannot_authorize_publication(self) -> None:
-        self.completed_review(
-            self.review(decision="fix", publish_ok=True), worktree=str(self.repo)
-        )
+        self.completed_review(self.review(decision="fix", publish_ok=True), worktree=str(self.repo))
         with (
             patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
             self.assertRaisesRegex(RuntimeError, "Contradictory review"),
@@ -332,8 +360,28 @@ class AutotestSupervisorTests(unittest.TestCase):
             self.runner.step()
         self.command.assert_not_called()
 
+    def test_staged_language_failure_prevents_commit_and_github_publication(self) -> None:
+        self.runner.state.update(publication_digest="A", tested_digest="A", base="base-sha")
+
+        def run(argv: list[str], cwd: Path) -> str:
+            if argv[:2] == ["git", "ls-files"]:
+                return "tools/task.py"
+            if argv[:2] == ["git", "rev-parse"]:
+                return "base-sha"
+            if argv[0] == sys.executable:
+                self.assertTrue(argv[1].endswith("scripts/check_staged_language.py"))
+                raise subprocess.CalledProcessError(1, argv)
+            return ""
+
+        self.command.side_effect = run
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.runner.publish()
+        commands = [call.args[0] for call in self.command.call_args_list]
+        self.assertFalse(any(argv[:2] == ["git", "commit"] for argv in commands))
+        self.assertFalse(any(argv[0] == "gh" for argv in commands))
+
     def test_incomplete_requirements_cannot_be_marked_complete(self) -> None:
-        self.completed_review(self.review(decision="complete", satisfied=["recovery"]))
+        self.completed_review(self.review(decision="complete", satisfied=["shared_input"]))
         with (
             patch.object(supervisor, "poll_job", return_value={"returncode": 0}),
             self.assertRaisesRegex(RuntimeError, "pending requirements"),
@@ -384,10 +432,10 @@ class AutotestSupervisorTests(unittest.TestCase):
 
     def test_latest_review_can_invalidate_earlier_satisfied_requirements(self) -> None:
         self.runner.state["satisfied"] = list(supervisor.REQUIREMENTS)
-        self.completed_review(self.review(satisfied=["recovery"]))
+        self.completed_review(self.review(satisfied=["shared_input"]))
         with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
             self.runner.finish_model()
-        self.assertEqual(self.runner.state["satisfied"], ["recovery"])
+        self.assertEqual(self.runner.state["satisfied"], ["shared_input"])
         self.assertEqual(self.runner.state["phase"], "plan")
         self.metadata.assert_called_once()
 
@@ -418,11 +466,18 @@ class AutotestSupervisorTests(unittest.TestCase):
 
     def test_prepare_tests_keeps_old_generated_and_new_changed_test_modules(self) -> None:
         self.runner.state["generated_files"] = [
-            "tests/test_old_generated.py", "tests/test_new_generated.py",
+            "tests/test_old_generated.py",
+            "tests/test_new_generated.py",
         ]
-        with patch.object(supervisor, "changed_paths", return_value=[
-            "tests/test_new_generated.py", "docs/review.md", "tests/test_async_layered_paper.py",
-        ]):
+        with patch.object(
+            supervisor,
+            "changed_paths",
+            return_value=[
+                "tests/test_new_generated.py",
+                "docs/review.md",
+                "tests/test_async_layered_paper.py",
+            ],
+        ):
             self.runner.prepare_tests("")
         jobs = self.runner.state["test_jobs"]
         self.assertEqual(len(jobs), 1)
