@@ -12,6 +12,48 @@ It never starts the legacy live bot or historical collector. Credentials must al
 the cached-token client cannot issue or refresh tokens. Only market-data and stock-information
 endpoints and market WebSocket topics are used. No AI calls occur in the runner.
 
+## Fixed-strategy comparison
+
+Add `--candidate-policy` to run a candidate beside the existing `router` incumbent, using the
+same live collector and two independent paper accounts:
+
+```sh
+uv run --no-project --with websockets==15.0.1 python -m tools.run_async_live_validation \
+  --output state/validation/NEW_COMPARISON/run --duration 1200 --capital 100 \
+  --candidate-policy trend
+```
+
+The shown policy is a usage example, not a validated recommendation. Supported candidates are
+the existing `router`, `trend`, `breakout`, and `rebound` policies. Omitting the option keeps the
+single-account path and its existing status shape. The comparison is descriptive; it does not
+select, optimize, or automatically promote a strategy.
+
+Before collector tasks start, `manifest.json` records both fixed configurations, equal starting
+capital, matching fees/delay/allocation assumptions, and source hashes including execution
+dependencies. Each accepted book and clock event has one common sequence/logical time.
+Accounts use their own positions, pending requests and policy when counting candidates.
+Comparison candidate features use the latest valid known book; shared subscription protection
+is the union of both accounts' held and pending symbols. Accounts do not share cash or depth use.
+
+In comparison mode, `status.json` adds a `comparison` section while `paper` still denotes the
+incumbent. Intent/outcome log records identify the account. `comparison_observation` records
+publication sequence, receipt/decision time and the common book-input digest.
+Per-account delivery counts/hashes include accepted books and idle clock events. They detect
+incomplete fanout; they are not a complete exact-live-replay trace format.
+
+After recording files close, `comparison.json` saves both full summaries, configurations,
+source/freeze checks, account input digests, interval, coverage/status information, and hashes
+of the manifest, raw market recording and event log. Positions, fees, unrealized marks and
+pending reservations remain visible without invented liquidation.
+`complete` requires clean completion, present evidence, aligned inputs and unchanged source
+and configuration. Interrupted/failed runs remain incomplete; missing book activity is reported
+as inconclusive. `qualification=not_assessed` applies even when technical checks pass.
+Start/end file hashes record source consistency; this runner does not load an immutable code
+artifact or calibrate actual broker execution latency.
+
+The new comparison path is covered by offline fixtures. A live comparison has not been run
+as part of this implementation; a separate explicitly started campaign supplies that evidence.
+
 ## Selection and processing
 
 Each REST sweep reads the active US universe in batches of 200. The first sweep establishes a

@@ -1,6 +1,7 @@
 # Autotrade scope and implementation plan
 
-Status: scope review completed; the first live comparison is not implemented or run.
+Status: optional paired execution and reporting are implemented and checked with offline fixtures;
+the first live comparison has not been run.
 This plan supersedes the earlier assumption that all W01-W11 form a mandatory delivery chain.
 The [system design](autotrade-system-design.md) remains a future contract reference, not a list
 of prerequisites for every experiment. Implement only what the active milestone requires.
@@ -15,6 +16,11 @@ results and provenance. Report observations; do not automatically qualify or pro
 The target is a simultaneous live-input comparison. Recorded/synthetic comparisons support
 its tests; they do not satisfy the live demonstration. Exact replay of a live run is separate.
 This scope review does not launch a live campaign or change the current authorization.
+
+The [finite runner](async-live-validation.md#fixed-strategy-comparison) now accepts an explicit
+candidate policy alongside the existing router incumbent. M1-M3 and the offline portion of M4
+have an implementation path; M4's live demonstration remains pending. The milestone is not
+complete until that actual live evidence is reported.
 
 ## Existing capability and smallest gap
 
