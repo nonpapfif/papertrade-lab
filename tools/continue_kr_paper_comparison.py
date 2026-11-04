@@ -135,7 +135,7 @@ class Replay:
                         fills.append({**fill, "account": f"{key}_{fill['account']}"})
                     if key not in pending:
                         awaiting_review[key] = reviewable(pair)
-            if self.status["state"] == "complete" and market.read(1):
+            if self.status["state"] != "running" and market.read(1):
                 raise ValueError("Unexpected market observations after final status")
         advance(updated)
         expected_fills = [
@@ -149,7 +149,7 @@ class Replay:
             or summaries(self.pairs) != self.status["accounts"]
             or json.loads(encode(fills)) != expected_fills
             or self.review_counts() != self.status["ai_by_allocation"]
-            or (self.status["state"] == "complete" and pending)
+            or (self.status["state"] != "running" and pending)
         ):
             raise ValueError("Historical replay differs from saved comparison")
 
@@ -159,7 +159,9 @@ class Replay:
         }
 
 
-async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime) -> None:
+async def continue_campaign(
+    job: Path, feed: Path, output: Path, until: datetime, *, recover_expired_cache: bool = False
+) -> None:
     while (exit_record := poll_job(job)) is None:
         if now() >= until:
             raise ValueError("Original comparison did not finish within extension window")
@@ -168,9 +170,19 @@ async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime
     replay = Replay(source)
     initial = replay.status
     cutoff = datetime.fromisoformat(initial["until"])
+    completed = exit_record["returncode"] == 0 and initial["state"] == "complete"
+    recovered = (
+        recover_expired_cache
+        and exit_record["returncode"] != 0
+        and initial["state"] == "failed"
+        and initial["error_type"] == "SafetyError"
+        and (job / "stderr.log")
+        .read_text()
+        .rstrip()
+        .endswith("SafetyError: A valid existing cached token is required")
+    )
     if (
-        exit_record["returncode"] != 0
-        or initial["state"] != "complete"
+        not (completed or recovered)
         or replay.last_observed is None
         or not replay.last_observed < cutoff <= now() < until
     ):
@@ -195,6 +207,10 @@ async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime
                 "previous_run": str(source),
                 "previous_until": initial["until"],
                 "previous_sweeps": replay.sweeps,
+                "previous_state": initial["state"],
+                "previous_error_type": initial["error_type"],
+                "previous_last_observation": replay.last_observed.isoformat(),
+                "recovered_expired_cache": recovered,
                 "previous_input_sha256": initial["shared_input_sha256"],
                 "shared_market_feed": str(feed),
                 "continuation_source_sha256": hashlib.sha256(
@@ -204,6 +220,8 @@ async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime
         },
     )
     jobs: dict[str, asyncio.Task[None]] = {}
+    prior_last_observed = replay.last_observed
+    first_observed: datetime | None = None
     added_sweeps = 0
     state = "running"
     error = None
@@ -218,6 +236,9 @@ async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime
             "updated_at": now().isoformat(),
             "sweeps": replay.sweeps + added_sweeps,
             "extension_sweeps": added_sweeps,
+            "recovered_expired_cache": recovered,
+            "previous_last_observation": prior_last_observed.isoformat(),
+            "first_extension_observation": first_observed.isoformat() if first_observed else None,
             "shared_input_sha256": replay.digest.hexdigest(),
             "observed_symbols": len(next(iter(replay.pairs.values())).prices),
             "accounts": summaries(replay.pairs),
@@ -254,7 +275,7 @@ async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime
             return json.loads((feed.parent / "status.json").read_text())
 
         def process(line: bytes) -> None:
-            nonlocal added_sweeps
+            nonlocal added_sweeps, first_observed
             snapshot = json.loads(line)
             observed = datetime.fromisoformat(snapshot["observed_at"])
             received = now()
@@ -266,6 +287,8 @@ async def continue_campaign(job: Path, feed: Path, output: Path, until: datetime
             ):
                 raise ValueError("Shared observation falls outside the extension")
             replay.last_observed = observed
+            if first_observed is None:
+                first_observed = observed
             market.write(line)
             replay.digest.update(line)
             added_sweeps += 1
@@ -359,6 +382,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--until", type=datetime.fromisoformat)
     parser.add_argument("--verify-prefix", action="store_true")
+    parser.add_argument("--recover-expired-cache", action="store_true")
     args = parser.parse_args()
     job = args.job.resolve()
     if args.verify_prefix:
@@ -367,7 +391,15 @@ def main() -> None:
         return
     if args.feed is None or args.output is None or args.until is None or args.until.tzinfo is None:
         parser.error("--feed, --output and timezone-aware --until are required")
-    asyncio.run(continue_campaign(job, args.feed.resolve(), args.output.resolve(), args.until))
+    asyncio.run(
+        continue_campaign(
+            job,
+            args.feed.resolve(),
+            args.output.resolve(),
+            args.until,
+            recover_expired_cache=args.recover_expired_cache,
+        )
+    )
 
 
 if __name__ == "__main__":
