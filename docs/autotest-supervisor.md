@@ -19,12 +19,15 @@ Provider limits, authentication, machine uptime and external service availabilit
 
 ## Scope and boundaries
 
-The requirement inventory covers live integration, causal replay, crash recovery, stream faults,
-selection coverage, accounting and out-of-sample performance. Completion requires Astra to
-support every requirement with evidence. Profitability and real queue position are not implied
+The requirement inventory is M1-M4 in [the active implementation plan](autotrade-implementation-plan.md):
+fixed configurations, independent shared-input accounts, comparison evidence, focused tests
+and one finite US live demonstration. Completion requires Astra to support each with evidence.
+The incumbent is `router`; the fixed candidate is `trend`, chosen to exercise comparison plumbing,
+not as a profitability recommendation. Profitability and real queue position are not implied
 by technical success. If all meaningful work is complete, the supervisor records completion.
 If external state prevents progress, it records `blocked`, preserving the exact phase and logs.
-It does not burn tokens rechecking the same failure indefinitely.
+It does not burn tokens rechecking the same failure indefinitely. Recovery platforms, exact
+replay, optimization, promotion and KR rollout remain deferred. Do not add tasks to stay busy.
 
 Only fictional ledgers are permitted. No real broker account or order endpoints are allowed.
 The monthly collector stays paused. Existing ledgers and losses remain intact. The layered
@@ -45,6 +48,7 @@ Live integration always runs from the frozen baseline commit, including its impo
 New engine changes are tested offline until their live deployment is separately reviewed. This
 avoids executing newly generated code with broker network access. A live rerun must address a
 specific missing observation. It is not a substitute for testing a changed engine.
+The frozen runner receives `--candidate-policy trend`, so its live evidence covers two accounts.
 
 ## Tests and GitHub
 
@@ -68,6 +72,8 @@ overwrites a dirty checkout, rewrites history or ignores failing checks. New PR 
 in status/history. The standalone CLI cannot attach artifacts to this Codex chat; attach them
 when inspecting results here. An interrupted external GitHub mutation blocks for reconciliation
 instead of blindly creating or merging a second PR.
+Publication runs the installed GitHub workflow's staged-language guard before committing.
+Branches use the `codex/` prefix.
 
 ## Durable state and operation
 
@@ -87,6 +93,9 @@ second instance. Its independent child jobs survive a controller interruption an
 own exit records. A claimed job with missing or inconsistent identity is never silently rerun.
 A saved transition before an unclaimed launch can resume safely. `status.json` contains the
 current phase, completed requirements, history, model usage and the latest quota snapshot.
+The requirement definitions are saved in that state. A different or missing saved scope is
+rejected before any job starts; preserve earlier audit directories and use a new output for
+this milestone rather than silently reusing the previous broad campaign's progress.
 
 Each model directory contains its prompt, evidence manifest, schema, stdout/stderr, parsed result,
 exit record and quota snapshot. Tests have the same command/exit audit, without AI usage. Exact
