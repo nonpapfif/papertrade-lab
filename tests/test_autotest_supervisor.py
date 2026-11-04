@@ -498,8 +498,34 @@ class AutotestSupervisorTests(unittest.TestCase):
         with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
             self.runner.finish_model()
         self.assertEqual(self.runner.state["satisfied"], ["shared_input"])
-        self.assertEqual(self.runner.state["phase"], "plan")
+        self.assertEqual(self.runner.state["phase"], "review")
         self.metadata.assert_called_once()
+
+    def test_review_directs_named_test_without_a_planner_or_implementation(self) -> None:
+        target = "tests.test_websocket_replay.LocalProtocolTests.test_two_normal_connections_restore_declared_channels"
+        plan = self.plan(kind="test", tests=[target])
+        self.completed_review(self.review(next_plan=plan))
+        with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
+            self.runner.finish_model()
+        self.assertEqual(self.runner.state["phase"], "prepare")
+        with patch.object(supervisor, "changed_paths", return_value=[]):
+            self.runner.step()
+        self.assertEqual(self.runner.state["phase"], "test_wait")
+        jobs = self.runner.state["test_jobs"]
+        self.assertEqual(jobs[0]["argv"][4:], [target])
+        self.runner.state["test_index"] = 1
+        jobs[0]["returncode"] = 0
+        self.runner.test_step()
+        self.assertEqual(self.runner.state["phase"], "review")
+        with self.assertRaisesRegex(RuntimeError, "already checked"):
+            self.runner.prepare_tests("")
+        self.launch.assert_not_called()
+
+    def test_fix_review_requires_an_offline_plan(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires an offline plan"):
+            supervisor.validate_result(
+                "review", self.review(decision="fix", next_plan=self.plan(kind="live", tests=[]))
+            )
 
     def test_complete_requires_full_current_requirement_set(self) -> None:
         self.completed_review(

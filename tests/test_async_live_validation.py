@@ -152,6 +152,30 @@ class ComparisonTests(RuntimeTests):
         at = self.at.isoformat()
         return Feature(self.runtime.identifier(symbol), 10, at, at, 0.01, r15, prior_high, 9, 0.8)
 
+    async def test_crossed_book_is_rejected_before_both_accounts_and_next_book_continues(
+        self,
+    ) -> None:
+        runtime = self.runtime
+        crossed = self.book(self.at, 0.1885)
+        crossed["bids"][0]["price"] = "0.1886"
+        await self.publish_at(0, "book", ("CENN", crossed))
+        self.assertNotIn("CENN", runtime.books)
+        self.assertEqual(list(runtime.book_delivered.values()), [0, 0])
+        self.assertTrue(all(not account.prices for account in runtime.accounts.values()))
+        self.assertIn(
+            {
+                "kind": "book_rejected",
+                "reason": "crossed_orderbook",
+                "sequence": 1,
+                "symbol": "CENN",
+                "source_at": crossed["timestamp"],
+            },
+            self.events,
+        )
+        await self.publish_at(1, "book", ("ONDS", self.book(self.at + timedelta(seconds=1))))
+        self.assertEqual(list(runtime.book_delivered.values()), [1, 1])
+        self.assertTrue(runtime.status()["comparison"]["inputs_aligned"])
+
     async def test_same_observations_use_independent_accounts_and_clock(self) -> None:
         r = self.runtime
         r.features["A"] = self.feature("A")
@@ -331,7 +355,9 @@ class ComparisonTests(RuntimeTests):
             self.assertAlmostEqual(position["mark_price"], 9.295)
             self.assertEqual(position["mark_at"], (self.at + timedelta(seconds=5)).isoformat())
             self.assertEqual(position["mark_age_seconds"], 61)
-            self.assertEqual(paper["positions_as_of"], (self.at + timedelta(seconds=66)).isoformat())
+            self.assertEqual(
+                paper["positions_as_of"], (self.at + timedelta(seconds=66)).isoformat()
+            )
             account = paper["account"]
             self.assertEqual(account["mark_basis"], "book_midpoint_not_liquidated")
             self.assertEqual(account["stale_open_positions"], 1)
