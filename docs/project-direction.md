@@ -17,10 +17,17 @@ Treat currency, sessions, costs, and execution conditions as market-specific req
 Historical simulation is a supporting way to compare strategy candidates.
 Building a historical strategy-search platform is not the primary product goal.
 
-The current milestone is one finite US live-data comparison of two fixed strategies with
-independent paper accounts and saved evidence. See the scope-reviewed implementation plan for
-stop criteria and conditional future work. Exact live replay, persistent recovery and automatic
-promotion remain later capabilities, not prerequisites for that comparison.
+The active milestone is to establish a broker-constrained KR/US paper execution contract and
+validate strategies within it. The [capability evidence](toss-capability-evidence.md) separates
+broker app support, public API support and locally verified behavior. The
+[market and strategy design](kr-us-strategy-design.md) defines the revised layers, market modes,
+costs, data limits and delivery sequence. It supersedes the earlier assumption that a sampled
+price-direction comparison alone satisfies real-money preparation.
+
+Today's recorded comparisons remain useful diagnostic evidence. Their fractional, zero-cost,
+interrupted and counterfactual segments retain their original labels. Historical simulation
+remains supporting work. Complete the first full US path while keeping KR-specific acceptance
+criteria and native-currency accounting.
 
 ## Execution and AI responsibilities
 

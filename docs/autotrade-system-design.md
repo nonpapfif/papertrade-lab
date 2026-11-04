@@ -1,6 +1,9 @@
 # Autotrade operating design
 
 Status: design baseline and implementation plan, not implemented capabilities.
+The [KR/US redesign](kr-us-strategy-design.md) and its
+[capability evidence](toss-capability-evidence.md) govern current market support and strategy
+constraints. The dated component inventory below remains historical implementation evidence.
 The [scope-reviewed plan](autotrade-implementation-plan.md) governs current work. Nine-area
 coverage below is a future contract inventory, not mandatory preparation for the first comparison.
 This design completes the nine operating areas requested during the project review.

@@ -7,6 +7,16 @@ automated trading. Read `docs/project-direction.md` before proposing changes to 
 AI responsibilities, validation, or strategy promotion. These are target requirements, not a
 claim that the current implementation satisfies them or authorization to execute real trades.
 
+## Broker-constrained validation
+
+For KR/US strategy design, sizing, costs, sessions or execution-realism work, first read
+`docs/toss-capability-evidence.md` and `docs/kr-us-strategy-design.md`. Use the constrained
+contract as the default for real-money preparation. Select its runner explicitly and verify
+actual runtime behavior before launch. Broker app support, API support and tested behavior are
+separate evidence levels. KR execution uses integer shares. US fractional execution follows
+its documented API mode and restrictions. Record unknown capabilities and costs as unresolved.
+Keep historical free simulations and counterfactual reconstructions labelled by their own rules.
+
 ## Scope discipline
 
 Use `docs/autotrade-implementation-plan.md` to identify the active milestone and stop criteria.
