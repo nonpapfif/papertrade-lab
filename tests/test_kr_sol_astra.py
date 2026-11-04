@@ -25,7 +25,7 @@ class SolAstraTests(unittest.IsolatedAsyncioTestCase):
                 at = now().isoformat()
                 rows = [
                     {"symbol": symbol, "currency": "KRW", "lastPrice": price, "timestamp": at}
-                    for symbol in ("A", "B")
+                    for symbol in ("A", "B", "C")
                 ]
                 with market.open("a") as stream:
                     stream.write(json.dumps({"observed_at": at, "rows": rows}) + "\n")
@@ -36,13 +36,16 @@ class SolAstraTests(unittest.IsolatedAsyncioTestCase):
                 *,
                 model: str,
                 deferred: dict[str, str] | None = None,
+                holds: dict[str, str] | None = None,
             ) -> tuple[dict, dict]:
                 symbols = [item["symbol"] for item in payload["signals"]]
                 if model == SOL:
-                    self.assertCountEqual(symbols, ["A", "B"])
+                    self.assertCountEqual(symbols, ["A", "B", "C"])
                     self.assertIsNotNone(deferred)
                     assert deferred is not None
                     deferred["B"] = "Conflicting evidence"
+                    assert holds is not None
+                    holds["C"] = "Insufficient momentum"
                     return {"A": "Observed momentum"}, {}
                 self.assertEqual(model, ASTRA)
                 self.assertEqual(symbols, ["B"])
@@ -73,6 +76,16 @@ class SolAstraTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result["ai_reviews_completed"], {SOL: 1})
                     self.assertTrue(result["ai_in_flight"])
                     self.assertEqual(set(result["account"]["positions"]), {"A"})
+                    events = [
+                        json.loads(line)
+                        for line in (output / "events.jsonl").read_text().splitlines()
+                    ]
+                    first, decision, escalation = events[:3]
+                    self.assertEqual(decision["review_id"], first["review_id"])
+                    self.assertEqual(decision["holds"], {"C": "Insufficient momentum"})
+                    self.assertEqual(decision["deferred"], {"B": "Conflicting evidence"})
+                    self.assertEqual(escalation["parent_review_id"], first["review_id"])
+                    self.assertIn("portfolio", first)
                 finally:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)

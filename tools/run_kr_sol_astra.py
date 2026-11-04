@@ -87,24 +87,31 @@ async def campaign(market: Path, output: Path, until: datetime) -> None:
                 "portfolio": account.summary(comparison.prices),
             }
             deferred: dict[str, str] = {}
+            holds: dict[str, str] = {}
             model = SOL
             try:
                 calls[model] += 1
-                record("ai_review", model=model, signals=signals)
-                approved, watches = await decide(settings, payload, model=model, deferred=deferred)
+                review_id = sum(calls.values())
+                record("ai_review", review_id=review_id, model=model, effort="medium", **payload)
+                approved, watches = await decide(
+                    settings, payload, model=model, deferred=deferred, holds=holds
+                )
                 decided = now()
-                if decided >= until:
-                    return
-                completed[model] += 1
-                comparison.approve(signals, approved, decided, watches)
                 record(
                     "ai_decision",
+                    review_id=review_id,
                     model=model,
+                    holds=holds,
                     decision_at=decided,
                     approvals=approved,
                     watches=watches,
                     deferred=deferred,
+                    after_cutoff=decided >= until,
                 )
+                if decided >= until:
+                    return
+                completed[model] += 1
+                comparison.approve(signals, approved, decided, watches)
                 remaining = [
                     {**signal, "sol_reason": deferred[signal["symbol"]]}
                     for signal in signals
@@ -112,14 +119,44 @@ async def campaign(market: Path, output: Path, until: datetime) -> None:
                     and comparison.ai_latest.get(signal["symbol"]) == signal
                     and account.wants(signal)
                 ]
-                if not remaining or now() >= until:
+                selected = {signal["symbol"] for signal in remaining}
+                if not selected or now() >= until:
+                    if deferred:
+                        record(
+                            "ai_handoff_not_started",
+                            review_id=review_id,
+                            symbols=sorted(deferred),
+                            reason="stale_or_cutoff",
+                        )
                     return
+                skipped = sorted(set(deferred) - selected)
+                if skipped:
+                    record(
+                        "ai_handoff_not_started",
+                        review_id=review_id,
+                        symbols=skipped,
+                        reason="stale",
+                    )
                 model = ASTRA
                 calls[model] += 1
-                record("ai_review", model=model, signals=remaining)
-                approved, watches = await decide(
-                    settings, {**payload, "signals": remaining}, model=model
+                parent_review_id = review_id
+                review_id = sum(calls.values())
+                holds = {}
+                escalation = {
+                    **payload,
+                    "signals": remaining,
+                    "observed_at": now(),
+                    "portfolio": account.summary(comparison.prices),
+                }
+                record(
+                    "ai_review",
+                    review_id=review_id,
+                    parent_review_id=parent_review_id,
+                    model=model,
+                    effort="medium",
+                    **escalation,
                 )
+                approved, watches = await decide(settings, escalation, model=model, holds=holds)
                 decided = now()
                 if decided < until:
                     completed[model] += 1
@@ -130,15 +167,18 @@ async def campaign(market: Path, output: Path, until: datetime) -> None:
                         decided,
                         watches,
                     )
-                    record(
-                        "ai_decision",
-                        model=model,
-                        decision_at=decided,
-                        approvals=approved,
-                        watches=watches,
-                    )
+                record(
+                    "ai_decision",
+                    review_id=review_id,
+                    model=model,
+                    holds=holds,
+                    decision_at=decided,
+                    approvals=approved,
+                    watches=watches,
+                    after_cutoff=decided >= until,
+                )
             except SafetyError as error:
-                record("ai_review_failed", model=model, reason=str(error))
+                record("ai_review_failed", review_id=review_id, model=model, reason=str(error))
 
         try:
             status()
@@ -187,7 +227,7 @@ async def campaign(market: Path, output: Path, until: datetime) -> None:
             if job is not None and not job.done():
                 job.cancel()
                 await asyncio.gather(job, return_exceptions=True)
-                record("ai_cancelled_at_end")
+                record("ai_cancelled_at_end", review_id=sum(calls.values()))
             status()
 
 

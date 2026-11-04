@@ -27,3 +27,9 @@ market JSONL file and starts a separate 100,000 KRW virtual account. Sol medium 
 batch. Astra medium receives only signals explicitly deferred by Sol that remain actionable.
 Snapshot processing and fills continue while either model is in flight. The original run
 continues to use its existing policy, and the separate account has a later observation start.
+
+Each AI review records its input snapshot, account context, model, effort, and review ID.
+Responses record approval, hold, escalation reasons and optional watches. Symbols sharing
+the same hold reason can be grouped in the model response. The recorded result maps each
+symbol to its reason. Missing or conflicting decisions invalidate the review and generate
+an error record. An Astra escalation links back to the Sol review that requested it.
