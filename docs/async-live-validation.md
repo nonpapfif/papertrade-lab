@@ -69,6 +69,9 @@ The unmonitored universe is observed by REST only. No claim of continuous whole-
 is made. Candidate candles, initial/resync books, and FX are fetched sequentially in worker threads
 using one shared client and its rate controller. The WebSocket receive task keeps running during
 these REST calls. No account mutation awaits REST or a future market observation.
+A rate limit during a per-symbol candle or book request pauses REST until the client's retry
+time or the observation deadline. Existing WebSocket subscriptions continue during the pause.
+The failed request remains recorded; the sweep proceeds without filling in missing data.
 
 A consumer preserves publication order and stamps the actual decision time when processing starts.
 Late REST snapshots cannot overwrite newer source timestamps. Feature receipt time is retained.
