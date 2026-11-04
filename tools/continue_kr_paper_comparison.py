@@ -17,6 +17,7 @@ from typing import Any
 from papertrade.core import Settings, encode
 from tools.autotest_jobs import atomic_json, poll_job
 from tools.kr_comparison_ai import SOL, review_cascade
+from tools.kr_whole_share_accounts import seed_accounts
 from tools.run_kr_paper_comparison import ALLOCATION_LOOKBACK, ROOT, Comparison, now
 
 
@@ -62,6 +63,11 @@ class Replay:
                 if datetime.fromisoformat(event["recorded_at"]) >= updated:
                     break
                 audit.append(event)
+        received_at = {
+            item["observed_at"]: datetime.fromisoformat(item["recorded_at"])
+            for item in audit
+            if item["kind"] == "shared_observation"
+        }
         ai_events = iter(event for event in audit if event["kind"].startswith("ai_"))
         pending: dict[str, tuple[int, list[dict[str, Any]]]] = {}
         awaiting_review: dict[str, list[dict[str, Any]]] = {}
@@ -126,7 +132,7 @@ class Replay:
                 self.digest.update(line)
                 snapshot = json.loads(line)
                 at = datetime.fromisoformat(snapshot["observed_at"])
-                advance(at)
+                advance(received_at.get(snapshot["observed_at"], at))
                 self.last_observed = at
                 for key, pair in self.pairs.items():
                     for fill in pair.observe(
@@ -160,13 +166,20 @@ class Replay:
 
 
 async def continue_campaign(
-    job: Path, feed: Path, output: Path, until: datetime, *, recover_expired_cache: bool = False
+    job: Path,
+    feed: Path,
+    output: Path,
+    until: datetime,
+    *,
+    recover_expired_cache: bool = False,
+    whole_share_source: Path | None = None,
+    whole_share_listings: Path | None = None,
 ) -> None:
     while (exit_record := poll_job(job)) is None:
         if now() >= until:
             raise ValueError("Original comparison did not finish within extension window")
         await asyncio.sleep(0.5)
-    source = job / "run"
+    source = whole_share_source or job / "run"
     replay = Replay(source)
     initial = replay.status
     cutoff = datetime.fromisoformat(initial["until"])
@@ -181,10 +194,16 @@ async def continue_campaign(
         .rstrip()
         .endswith("SafetyError: A valid existing cached token is required")
     )
+    whole_share = whole_share_source is not None and whole_share_listings is not None
+    stopped_for_handoff = (
+        whole_share and exit_record["returncode"] in (-2, 130) and initial["state"] == "incomplete"
+    )
+    if stopped_for_handoff and replay.last_observed is not None:
+        cutoff = replay.last_observed
     if (
-        not (completed or recovered)
+        not (completed or recovered or stopped_for_handoff)
         or replay.last_observed is None
-        or not replay.last_observed < cutoff <= now() < until
+        or not replay.last_observed <= cutoff <= now() < until
     ):
         raise ValueError("A verified completed comparison is required")
     manifest = json.loads((source / "manifest.json").read_text())
@@ -196,8 +215,13 @@ async def continue_campaign(
             raise ValueError("Original strategy source differs")
     settings = Settings.load(ROOT)
     output.mkdir(parents=True, exist_ok=False)
-    for filename in ("market.jsonl", "events.jsonl"):
-        shutil.copyfile(source / filename, output / filename)
+    shutil.copyfile(source / "market.jsonl", output / "market.jsonl")
+    if whole_share_listings is None:
+        shutil.copyfile(source / "events.jsonl", output / "events.jsonl")
+        seed_fills = None
+    else:
+        seed_fills = seed_accounts(replay.pairs, source / "events.jsonl", whole_share_listings)
+        (output / "events.jsonl").touch(exist_ok=False)
     atomic_json(
         output / "manifest.json",
         {
@@ -205,6 +229,24 @@ async def continue_campaign(
             "until": until.isoformat(),
             "extension": {
                 "previous_run": str(source),
+                "quantity_policy": "Whole shares only" if whole_share else "Legacy fractional",
+                "whole_share_seed_fills": seed_fills,
+                "legacy_fractional_scope": (
+                    "Superseded for Korean execution realism; historical evidence only."
+                    if whole_share
+                    else None
+                ),
+                "whole_share_seed_assumption": (
+                    "Reexecution of legacy proposals with fee-constrained integer quantities; "
+                    "legacy proposals and strategy decisions are retained in previous_run."
+                    if whole_share
+                    else None
+                ),
+                "listing_sha256": (
+                    hashlib.sha256(whole_share_listings.read_bytes()).hexdigest()
+                    if whole_share_listings is not None
+                    else None
+                ),
                 "previous_until": initial["until"],
                 "previous_sweeps": replay.sweeps,
                 "previous_state": initial["state"],
@@ -236,7 +278,9 @@ async def continue_campaign(
             "updated_at": now().isoformat(),
             "sweeps": replay.sweeps + added_sweeps,
             "extension_sweeps": added_sweeps,
-            "recovered_expired_cache": recovered,
+            "quantity_policy": "Whole shares only" if whole_share else "Legacy fractional",
+            "whole_share_seed_fills": seed_fills,
+            "recovered_expired_cache": recovered or initial.get("recovered_expired_cache", False),
             "previous_last_observation": prior_last_observed.isoformat(),
             "first_extension_observation": first_observed.isoformat() if first_observed else None,
             "shared_input_sha256": replay.digest.hexdigest(),
@@ -333,6 +377,11 @@ async def continue_campaign(
                     offset = reader.tell()
                     line = reader.readline()
                     if line.endswith(b"\n"):
+                        if (
+                            whole_share
+                            and datetime.fromisoformat(json.loads(line)["observed_at"]) <= cutoff
+                        ):
+                            continue
                         process(line)
                         await asyncio.sleep(0)
                         continue
@@ -356,7 +405,12 @@ async def continue_campaign(
                     if feed_exit["returncode"] == 0
                     and feed_report["state"] == "complete"
                     and added_sweeps > 0
-                    and added_sweeps == feed_report["counts"]["standalone"]
+                    and (
+                        added_sweeps + initial.get("extension_sweeps", 0)
+                        if whole_share
+                        else added_sweeps
+                    )
+                    == feed_report["counts"]["standalone"]
                     and all(count[SOL] for count in replay.completed.values())
                     else "incomplete"
                 )
@@ -383,6 +437,8 @@ def main() -> None:
     parser.add_argument("--until", type=datetime.fromisoformat)
     parser.add_argument("--verify-prefix", action="store_true")
     parser.add_argument("--recover-expired-cache", action="store_true")
+    parser.add_argument("--whole-share-source", type=Path)
+    parser.add_argument("--whole-share-listings", type=Path)
     args = parser.parse_args()
     job = args.job.resolve()
     if args.verify_prefix:
@@ -391,6 +447,8 @@ def main() -> None:
         return
     if args.feed is None or args.output is None or args.until is None or args.until.tzinfo is None:
         parser.error("--feed, --output and timezone-aware --until are required")
+    if (args.whole_share_source is None) != (args.whole_share_listings is None):
+        parser.error("--whole-share-source and --whole-share-listings must be supplied together")
     asyncio.run(
         continue_campaign(
             job,
@@ -398,6 +456,8 @@ def main() -> None:
             args.output.resolve(),
             args.until,
             recover_expired_cache=args.recover_expired_cache,
+            whole_share_source=args.whole_share_source,
+            whole_share_listings=args.whole_share_listings,
         )
     )
 

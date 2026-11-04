@@ -141,7 +141,61 @@ class ContinuationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((combined / "market.jsonl").read_bytes(), market)
             self.assertEqual(report["shared_input_sha256"], hashlib.sha256(market).hexdigest())
 
+            stopped = json.loads((combined / "status.json").read_text())
+            stopped.update(state="incomplete", complete=False)
+            (combined / "status.json").write_text(encode(stopped))
+            (feed.parent / "status.json").write_text(
+                encode({"state": "complete", "counts": {"standalone": 2}})
+            )
+            clock = cutoff + timedelta(seconds=10)
+            with feed.open("a") as history:
+                history.write(encode({"observed_at": timestamp(), "rows": snapshot()}) + "\n")
+            listings_path = Path(temp) / "listings.json"
+            listings_path.write_text(
+                encode(
+                    {
+                        "KOSPI": [
+                            {"symbol": symbol, "securityType": "STOCK"}
+                            for symbol in ("005930", "000660")
+                        ],
+                        "KOSDAQ": [],
+                        "KR_ETC": [],
+                    }
+                )
+            )
+            integer = Path(temp) / "integer"
+            with (
+                patch(f"{extension}.now", side_effect=timestamp),
+                patch(f"{extension}.asyncio.sleep", side_effect=advance),
+                patch(
+                    f"{extension}.poll_job",
+                    side_effect=lambda path: {"returncode": -2 if path == job else 0},
+                ),
+                patch(f"{extension}.review_cascade") as review,
+            ):
+                await continue_campaign(
+                    job,
+                    feed,
+                    integer,
+                    until,
+                    whole_share_source=combined,
+                    whole_share_listings=listings_path,
+                )
+                review.assert_not_called()
+            integer_result = json.loads((integer / "comparison.json").read_text())
+            self.assertTrue(integer_result["complete"])
+            self.assertEqual(integer_result["sweeps"], 15)
+            self.assertEqual(integer_result["whole_share_seed_fills"]["5pct_fixed"], 2)
+            for account in integer_result["accounts"].values():
+                for position in account["positions"].values():
+                    quantity = Decimal(position["quantity"])
+                    self.assertEqual(quantity, quantity.to_integral_value())
+
             status = old_run / "status.json"
+            feed.write_bytes(feed.read_bytes().splitlines(keepends=True)[0])
+            (feed.parent / "status.json").write_text(
+                encode({"state": "complete", "counts": {"standalone": 1}})
+            )
             failed = json.loads(status.read_text())
             failed.update(state="failed", complete=False, error_type="SafetyError")
             status.write_text(encode(failed))
