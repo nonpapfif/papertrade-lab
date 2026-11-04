@@ -6,8 +6,10 @@ The current task is the broker-constrained KR/US redesign in
 [Market and strategy design](kr-us-strategy-design.md). Its acceptance and delivery order governs
 new work. Confirm capabilities against [primary evidence](toss-capability-evidence.md) before
 choosing quantity, order, session, data or cost assumptions. The next implementation slice is
-one fee-inclusive account contract and explicit constrained runner selection, followed by the
-existing strategy owner and quote/depth execution path.
+the KR layered quote/depth path after the initial explicit profiles. The
+[constrained runtime guide](constrained-runtime.md) records the delivered fresh KR fee-inclusive
+accounts, US layered trend profile and causal AI input corrections. These are offline-verified
+mechanics, not a completed live comparison or durable recovery implementation.
 
 The finite US comparison plan below is retained as the earlier scope decision. Its dated
 implementation observations describe that baseline and are not current run status. Today's KR

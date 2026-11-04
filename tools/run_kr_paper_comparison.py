@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from papertrade.api import SYMBOL, ApiError
 from papertrade.core import SafetyError, Settings, encode
@@ -146,9 +147,34 @@ class Account:
 
 
 class Comparison:
-    def __init__(self, allocation: Decimal | None = None) -> None:
+    def __init__(
+        self,
+        allocation: Decimal | None = None,
+        *,
+        profile: str = "legacy",
+        classification: dict[str, tuple[str, str]] | None = None,
+        session_window: tuple[datetime, datetime] | None = None,
+    ) -> None:
+        if profile not in ("legacy", "broker-constrained"):
+            raise ValueError("Unknown KR execution profile")
+        self.profile = profile
+        self.session_window = session_window
+        self.classification = classification or {}
+        self.price_history: defaultdict[str, deque[dict[str, str]]] = defaultdict(
+            lambda: deque(maxlen=ALLOCATION_LOOKBACK + 2)
+        )
         self.allocation = allocation
         self.accounts = {"fixed": Account(allocation), "ai": Account(allocation)}
+        if profile == "broker-constrained":
+            from tools.kr_whole_share_accounts import WholeShareAccount
+            from tools.replay_kr_paper_costs import Ledger
+
+            if allocation is None or session_window is None:
+                raise ValueError("Constrained comparison requires allocation and session evidence")
+            self.accounts = {
+                name: WholeShareAccount(account, Ledger(), self.classification, {})
+                for name, account in self.accounts.items()
+            }
         self.moves: defaultdict[str, deque[Decimal]] = defaultdict(
             lambda: deque(maxlen=ALLOCATION_LOOKBACK)
         )
@@ -163,6 +189,14 @@ class Comparison:
     ) -> list[dict[str, Any]]:
         quotes = {}
         signals = []
+        if self.profile == "broker-constrained":
+            assert self.session_window is not None
+            if not self.session_window[0] <= observed < self.session_window[1]:
+                self.review_queue.clear()
+                for account in self.accounts.values():
+                    account.pending.clear()
+                    account.budgets.clear()
+                return []
         for row in rows:
             if row.get("currency") != "KRW":
                 continue
@@ -174,10 +208,26 @@ class Comparison:
                 continue
             if not price.is_finite() or price <= 0 or source.tzinfo is None or source > observed:
                 continue
+            if self.profile == "broker-constrained":
+                assert self.session_window is not None
+                if (
+                    symbol not in self.classification
+                    or not self.session_window[0] <= source < self.session_window[1]
+                    or (observed - source).total_seconds() > 90
+                ):
+                    continue
             prior = self.prices.get(symbol)
             if prior is not None and source <= prior[1]:
                 continue
             quotes[symbol] = self.prices[symbol] = (price, source)
+            if self.profile == "broker-constrained":
+                self.price_history[symbol].append(
+                    {
+                        "price_krw": str(price),
+                        "source_at": source.isoformat(),
+                        "observed_at": observed.isoformat(),
+                    }
+                )
             if prior is None:
                 continue
             strength = Decimal(0)
@@ -211,6 +261,16 @@ class Comparison:
             }
             if self.allocation is not None:
                 signal["strength"] = strength
+            if self.profile == "broker-constrained":
+                signal.update(
+                    price_history=list(self.price_history[symbol]),
+                    execution_profile=self.profile,
+                    eligibility="verified_ordinary_common_stock",
+                    session="regular_continuous",
+                    strategy="direction_change_baseline",
+                )
+                if watch is not None and same_direction:
+                    signal["watch_price_krw"] = str(watch[0])
             if not same_direction:
                 self.latest[symbol] = signal
             self.ai_latest[symbol] = signal
@@ -241,6 +301,10 @@ class Comparison:
         decided: datetime,
         watches: dict[str, Decimal] | None = None,
     ) -> None:
+        if self.profile == "broker-constrained":
+            assert self.session_window is not None
+            if not self.session_window[0] <= decided < self.session_window[1]:
+                return
         ai = self.accounts["ai"]
         for signal in signals:
             symbol = signal["symbol"]
@@ -252,7 +316,17 @@ class Comparison:
                 self.watches[symbol] = watches[symbol], decided
 
 
-async def campaign(output: Path, until: datetime, *, allocation_comparison: bool = False) -> None:
+async def campaign(
+    output: Path,
+    until: datetime,
+    *,
+    allocation_comparison: bool = False,
+    profile: str = "legacy",
+) -> None:
+    if profile not in ("legacy", "broker-constrained"):
+        raise ValueError("Unknown KR execution profile")
+    if profile == "broker-constrained":
+        allocation_comparison = True
     if now() >= until:
         raise ValueError("Observation deadline has passed")
     output.mkdir(parents=True, exist_ok=False)
@@ -292,6 +366,7 @@ async def campaign(output: Path, until: datetime, *, allocation_comparison: bool
             "started_at": started.isoformat(),
             "until": until.isoformat(),
             "updated_at": now().isoformat(),
+            "profile": profile,
             "currency": "KRW",
             "initial_capital_krw": str(CAPITAL),
             "real_orders": False,
@@ -351,6 +426,7 @@ async def campaign(output: Path, until: datetime, *, allocation_comparison: bool
         try:
             status()
             client.access_token()
+            listing_market = {}
             for exchange in ("KOSPI", "KOSDAQ", "KR_ETC"):
                 listed = await asyncio.to_thread(client.listed, exchange)
                 for row in listed:
@@ -358,13 +434,72 @@ async def campaign(output: Path, until: datetime, *, allocation_comparison: bool
                     if not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
                         raise ValueError("Invalid Korean market symbol")
                     symbols.add(symbol)
+                    listing_market[symbol] = exchange
             if not symbols:
                 raise ValueError("No listed Korean market symbols")
             feed.symbols = sorted(symbols)
-            source_files = (Path(__file__).resolve(), ROOT / "tools/kr_comparison_ai.py")
+            profile_evidence: dict[str, Any] = {}
+            source_files: tuple[Path, ...] = (
+                Path(__file__).resolve(),
+                ROOT / "tools/kr_comparison_ai.py",
+            )
+            if profile == "broker-constrained":
+                from tools.kr_broker_profile import continuous_window, eligible
+
+                calendar = await asyncio.to_thread(
+                    client.calendar,
+                    "KR",
+                    now().astimezone(ZoneInfo("Asia/Seoul")).date().isoformat(),
+                )
+                window = continuous_window(calendar, now())
+                classification = {}
+                metadata = []
+                for offset in range(0, len(feed.symbols), 50):
+                    metadata.extend(
+                        await asyncio.to_thread(client.stocks, feed.symbols[offset : offset + 50])
+                    )
+                for row in metadata:
+                    market = listing_market.get(row["symbol"])
+                    if market in ("KOSPI", "KOSDAQ") and eligible(row):
+                        classification[row["symbol"]] = (market, "STOCK")
+                if not classification:
+                    raise ValueError("No verified ordinary KR common stocks")
+                pairs = {
+                    key: Comparison(
+                        pair.allocation,
+                        profile=profile,
+                        classification=classification,
+                        session_window=window,
+                    )
+                    for key, pair in pairs.items()
+                }
+                source_files += tuple(
+                    ROOT / name
+                    for name in (
+                        "tools/kr_whole_share_accounts.py",
+                        "tools/replay_kr_paper_costs.py",
+                        "tools/kr_broker_profile.py",
+                        "papertrade/api.py",
+                        "tools/live_feed.py",
+                    )
+                )
+                profile_evidence = {
+                    "profile": profile,
+                    "calendar": calendar,
+                    "instrument_metadata": metadata,
+                    "classification": classification,
+                    "quantity_policy": "whole_shares",
+                    "session_policy": "regular_continuous_before_closing_auction",
+                    "initial_accounts": {
+                        f"{key}_{name}": account.summary({})
+                        for key, pair in pairs.items()
+                        for name, account in pair.accounts.items()
+                    },
+                }
             atomic_json(
                 output / "manifest.json",
                 {
+                    **profile_evidence,
                     "currency": "KRW",
                     "initial_capital_krw": str(CAPITAL),
                     "until": until.isoformat(),
@@ -380,7 +515,11 @@ async def campaign(output: Path, until: datetime, *, allocation_comparison: bool
                     "effort": "medium",
                     "universe": feed.symbols,
                     "rules": "Directional changes propose entry or exit; Astra gates the AI account",
-                    "fill": "Zero-cost fractional paper fill at a newer last trade after decision",
+                    "fill": (
+                        "Whole-share fee-inclusive assumption at a newer last trade; no depth proof"
+                        if profile == "broker-constrained"
+                        else "Zero-cost fractional paper fill at a newer last trade after decision"
+                    ),
                     "sources": {
                         p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files
                     },
@@ -549,12 +688,16 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--until", required=True, type=datetime.fromisoformat)
     parser.add_argument("--allocation-comparison", action="store_true")
+    parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
     args = parser.parse_args()
     if args.until.tzinfo is None:
         parser.error("--until requires a timezone offset")
     asyncio.run(
         campaign(
-            args.output.resolve(), args.until, allocation_comparison=args.allocation_comparison
+            args.output.resolve(),
+            args.until,
+            allocation_comparison=args.allocation_comparison,
+            profile=args.profile,
         )
     )
 

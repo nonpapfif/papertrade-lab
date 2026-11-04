@@ -8,7 +8,7 @@ from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
 
-from tools.replay_kr_paper_costs import COMMISSION, Ledger, listings
+from tools.replay_kr_paper_costs import COMMISSION, STOCK_SELL_TAX, Ledger, listings
 from tools.run_kr_paper_comparison import Account, Comparison
 
 
@@ -31,6 +31,35 @@ class WholeShareAccount(Account):
             if self.wants(signal):
                 self.queue(signal, decided, reason, prices)
 
+    @property
+    def reserved_cash(self) -> Decimal:
+        return sum(self.budgets.values(), Decimal(0))
+
+    @property
+    def available_cash(self) -> Decimal:
+        return max(Decimal(0), self.cash - self.reserved_cash)
+
+    def queue(
+        self,
+        signal: dict[str, Any],
+        decided: datetime,
+        reason: str,
+        prices: dict[str, tuple[Decimal, datetime]],
+    ) -> None:
+        symbol = signal["symbol"]
+        if symbol in self.pending or not self.wants(signal):
+            return
+        if signal["action"] == "BUY":
+            if self.allocation is None:
+                raise ValueError("Whole-share entry requires a frozen allocation")
+            budget = min(self.summary(prices)["equity_krw"] * self.allocation, self.available_cash)
+            price = prices[symbol][0]
+            if budget < price * (1 + COMMISSION):
+                self.ledger.counts["below_one_share"] += 1
+                return
+            self.budgets[symbol] = budget
+        self.pending[symbol] = signal, decided, reason
+
     def execute(
         self,
         quotes: dict[str, tuple[Decimal, datetime]],
@@ -42,7 +71,7 @@ class WholeShareAccount(Account):
             if latest.get(symbol) != signal or not self.wants(signal):
                 del self.pending[symbol]
                 self.budgets.pop(symbol, None)
-            elif symbol in quotes and quotes[symbol][1] > decided:
+            elif symbol in quotes and decided < quotes[symbol][1] <= observed:
                 ready.append((symbol, signal, decided, reason))
                 del self.pending[symbol]
 
@@ -52,7 +81,7 @@ class WholeShareAccount(Account):
         ):
             price, source = quotes[symbol]
             if signal["action"] == "BUY":
-                budget = min(self.budgets.pop(symbol), self.cash)
+                budget = min(self.budgets.pop(symbol), self.cash - self.reserved_cash)
                 proposed = (budget / (price * (1 + COMMISSION))).to_integral_value(
                     rounding=ROUND_DOWN
                 )
@@ -91,6 +120,15 @@ class WholeShareAccount(Account):
             "commission_krw": self.ledger.commissions,
             "transaction_tax_krw": self.ledger.taxes,
             "execution_counts": dict(self.ledger.counts),
+            "reserved_cash_krw": self.reserved_cash,
+            "available_cash_krw": self.available_cash,
+            "quantity_policy": "whole_shares",
+            "commission_rate": COMMISSION,
+            "stock_sale_tax_rate": STOCK_SELL_TAX,
+            "cost_assumptions": "Unrounded KR 0.015% commission and ordinary-stock sale tax; "
+            "account-specific API commission and broker rounding unverified",
+            "execution_model": "newer_last_trade_assumption_not_depth",
+            "mark_basis": "last_observed_price_not_closing_or_liquidation_value",
         }
 
 

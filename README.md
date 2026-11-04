@@ -153,3 +153,6 @@ Keep credentials, datasets, ledgers, snapshots, reports, and run logs outside Gi
 Local results live under ignored `state/`; historical settings are in `tests/fixtures/v2/settings.toml`.
 Committed files and GitHub content are English; user-facing conversation is Korean.
 Follow the branch, commit, push, pull-request, merge, and local fast-forward workflow in AGENTS.md.
+
+The [constrained runtime guide](docs/constrained-runtime.md) documents explicit KR/US profiles,
+verified offline behavior and remaining execution gaps.
