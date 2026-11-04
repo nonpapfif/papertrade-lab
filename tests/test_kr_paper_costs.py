@@ -15,11 +15,11 @@ STOCK = ("KOSPI", "STOCK")
 
 
 class CostTests(unittest.TestCase):
-    def test_fractional_buy_reserves_fee_and_sale_uses_held_quantity(self) -> None:
+    def test_integer_buy_reserves_fee_and_sale_uses_held_quantity(self) -> None:
         ledger = Ledger()
         bought = ledger.apply("005930", Decimal(10), Decimal(10000), STOCK)
         self.assertEqual(bought["outcome"], "filled")
-        self.assertLess(bought["quantity"], 10)
+        self.assertEqual(bought["quantity"], 9)
         self.assertGreaterEqual(ledger.cash, 0)
         quantity = bought["quantity"]
         sold = ledger.apply("005930", Decimal(-10), Decimal(11000), STOCK)
@@ -29,8 +29,15 @@ class CostTests(unittest.TestCase):
         self.assertFalse(ledger.positions)
         self.assertEqual(ledger.counts["resized"], 2)
 
+    def test_fractional_legacy_proposal_below_one_share_is_skipped(self) -> None:
+        ledger = Ledger()
+        outcome = ledger.apply("005930", Decimal("0.9"), Decimal(10000), STOCK)
+        self.assertEqual(outcome["outcome"], "below_one_share")
+        self.assertEqual(ledger.cash, 100000)
+        self.assertFalse(ledger.positions)
+
     def test_layered_whole_shares_and_unpriced_product_are_separate(self) -> None:
-        ledger = Ledger(whole_shares=True)
+        ledger = Ledger()
         proposal = ledger.apply("005930", Decimal(10), Decimal(10000), STOCK)
         self.assertEqual(proposal["quantity"], Decimal(9))
         self.assertEqual(ledger.cash, Decimal("9986.50"))

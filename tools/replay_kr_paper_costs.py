@@ -50,8 +50,7 @@ def sell_tax(
 
 
 class Ledger:
-    def __init__(self, *, whole_shares: bool = False) -> None:
-        self.whole_shares = whole_shares
+    def __init__(self) -> None:
         self.cash = CAPITAL
         self.positions: dict[str, tuple[Decimal, Decimal]] = {}
         self.realized = Decimal(0)
@@ -71,8 +70,6 @@ class Ledger:
     ) -> dict[str, Any]:
         if not proposed.is_finite() or not price.is_finite() or not proposed or price <= 0:
             raise ValueError("Invalid source fill proposal")
-        if self.whole_shares and proposed != proposed.to_integral_value():
-            raise ValueError("Layered proposal must use whole shares")
         self.counts["proposals"] += 1
 
         def skip(reason: str) -> dict[str, Any]:
@@ -96,23 +93,26 @@ class Ledger:
             if held:
                 return skip("existing_position")
             affordable = self.cash / (price * (1 + COMMISSION))
-            if self.whole_shares:
-                affordable = affordable.to_integral_value(rounding=ROUND_DOWN)
-            quantity = min(proposed, affordable)
+            quantity = min(proposed, affordable).to_integral_value(rounding=ROUND_DOWN)
             gross = quantity * price
             commission = gross * COMMISSION
             if gross + commission > self.cash:
-                quantity = quantity - 1 if self.whole_shares else quantity.next_minus()
+                quantity -= 1
                 gross = quantity * price
                 commission = gross * COMMISSION
-            if quantity <= 0 or gross + commission > self.cash:
+            if quantity <= 0:
+                return skip("below_one_share")
+            if gross + commission > self.cash:
                 return skip("insufficient_cash")
             self.cash -= gross + commission
             self.positions[symbol] = quantity, gross + commission
         else:
             if not held:
                 return skip("no_position")
-            quantity = min(-proposed, held)
+            # A legacy full exit can propose a fractional quantity above the integer holding.
+            quantity = min(-proposed, held).to_integral_value(rounding=ROUND_DOWN)
+            if not quantity:
+                return skip("below_one_share")
             gross = quantity * price
             commission = gross * COMMISSION
             tax = gross * tax_rate
@@ -210,7 +210,7 @@ def follow(
 ) -> None:
     classification = listings(listing_path)
     ledgers = {key: Ledger() for key in ALLOCATION_ACCOUNTS}
-    ledgers["layered"] = Ledger(whole_shares=True)
+    ledgers["layered"] = Ledger()
     marks: dict[str, tuple[Decimal, datetime]] = {}
     observed = None
     snapshots = 0
@@ -247,6 +247,8 @@ def follow(
                     symbol = item["symbol"]
                     price = Decimal(str(item.get("assumed_price_krw", item.get("price"))))
                     proposed = Decimal(str(item["quantity"]))
+                    if kind == "assumed_fill" and proposed != proposed.to_integral_value():
+                        raise ValueError("Layered source proposal must use whole shares")
                     if item.get("action") == "SELL":
                         proposed = -proposed
                     result = ledgers[account].apply(
@@ -306,6 +308,7 @@ def follow(
                                 "last_observation": observed,
                                 "market_snapshots": snapshots,
                                 "real_orders": False,
+                                "quantity_policy": "Whole shares only; proposals below one share are skipped",
                                 "scope": "Fee-constrained replay of recorded fill proposals, without strategy or AI recomputation",
                                 "commission_venue_assumption": "KRX",
                                 "commission_rate": COMMISSION,
