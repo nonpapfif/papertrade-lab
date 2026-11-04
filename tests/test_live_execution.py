@@ -13,6 +13,7 @@ from tools.live_execution import (
     ExecutionContext,
     LiveWeekEngine,
     transaction_fees,
+    us_limit_price,
 )
 from tools.run_live_parallel import live_design
 from tools.run_week_experiment import long_policies
@@ -51,6 +52,8 @@ def frame(minute: int = 0, price: float = 10) -> dict[str, Any]:
         "long_features": [[0, [0.01] * 30, [1] * 5, [1] * 5]],
         "fx": 1500,
         "fx_at": at,
+        "fx_valid_from": stamp(-60),
+        "fx_valid_until": stamp(60),
         "orderbooks": {},
     }
 
@@ -81,6 +84,30 @@ def book(mode: str = "quotes", capital: float = 100) -> ExecutionBook:
 
 
 class LiveExecutionTests(unittest.TestCase):
+    def test_provider_fx_validity_controls_krw_reporting_only(self) -> None:
+        target = book("last")
+        target.context.frame = frame(5)
+        self.assertEqual(target._current_fx(), 1500)
+        for valid_from, valid_until, rate in (
+            (stamp(-60), stamp(4), 1500),
+            (stamp(6), stamp(60), 1500),
+            (stamp(-60), stamp(60), 0),
+            (stamp(-60), stamp(60), float("inf")),
+        ):
+            target.context.frame = {
+                **frame(5),
+                "fx": rate,
+                "fx_valid_from": valid_from,
+                "fx_valid_until": valid_until,
+            }
+            self.assertIsNone(target._current_fx())
+        target.context.frame = {**frame(5), "fx_valid_until": stamp(5)}
+        self.assertEqual(target._current_fx(), 1500)
+        target.context.frame = {**frame(5), "fx_valid_from": stamp(6)}
+        target.fill(0, 1, 10, stamp(5), 1, "entry")
+        self.assertEqual(target.positions[0].quantity, 1)
+        self.assertIsNone(target.trades[-1]["observed_fx_krw_per_usd"])
+
     def test_full_live_cohort_reconciles_with_confirmed_partial_exits(self) -> None:
         configs, specs, policies = live_design()
         target = LiveWeekEngine(
@@ -127,6 +154,8 @@ class LiveExecutionTests(unittest.TestCase):
             "confirmation_received_at": {0: arrival},
             "orderbooks": {0: snapshot},
             "fx_at": arrival,
+            "fx_valid_from": stamp(-60),
+            "fx_valid_until": stamp(60),
         }
 
     def test_confirmed_buy_cancels_when_ask_moves_beyond_initial_limit(self) -> None:
@@ -138,6 +167,39 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(target.order_attempts[-1]["status"], "unfilled")
         self.assertEqual(target.order_attempts[-1]["requested_quantity"], 9)
         self.assertEqual(target.fee_totals["total_usd"], 0)
+
+    def test_us_limit_precision_and_confirmation_use_the_frozen_normalized_limit(self) -> None:
+        self.assertEqual(us_limit_price(1.001), 1.0)
+        self.assertEqual(us_limit_price(0.12349), 0.1234)
+
+        target = book()
+        self.confirmed(target, ask=1.001, bid=1.0, initial_ask=1.001, initial_bid=1.0)
+        target.context.frame["order_limits"] = {0: 1.0}
+        source = target.context.frame["orderbooks"][0]["timestamp"]
+        self.assertEqual(
+            target._confirmation_levels(0, "BUY", [(1.001, 5)], source), []
+        )
+        self.assertEqual(target.context.frame["decision_orderbooks"][0]["asks"][0]["price"], 1.001)
+
+        self.confirmed(
+            target,
+            ask=0.12345,
+            bid=0.1234,
+            initial_ask=0.12349,
+            initial_bid=0.1234,
+        )
+        target.context.frame["order_limits"] = {0: 0.1234}
+        source = target.context.frame["orderbooks"][0]["timestamp"]
+        self.assertEqual(
+            target._confirmation_levels(0, "BUY", [(0.12345, 5)], source), []
+        )
+
+        self.confirmed(target, ask=1.0, bid=1.009, initial_ask=1.001, initial_bid=1.009)
+        target.context.frame["order_limits"] = {0: 1.0}
+        source = target.context.frame["orderbooks"][0]["timestamp"]
+        self.assertEqual(
+            target._confirmation_levels(0, "SELL", [(1.009, 5)], source), [(1.009, 5)]
+        )
 
     def test_confirmed_buy_records_partial_quantity_when_visible_depth_shrinks(self) -> None:
         target = book()

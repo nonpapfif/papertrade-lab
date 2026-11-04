@@ -8,7 +8,7 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, localcontext
 from typing import Any
 
 from tools.search_portfolios import Book
@@ -26,6 +26,18 @@ DEFAULT_FEES: dict[str, float] = {
     "max_quote_age_seconds": 60.0,
     "max_fx_age_seconds": 60.0,
 }
+
+
+def us_limit_price(price: float) -> float:
+    """Truncate a US quote to the documented limit-price precision."""
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("US limit price must be positive and finite")
+    precision = 2 if price >= 1 else 4
+    decimal_price = Decimal(str(price))
+    quantum = Decimal(1).scaleb(-precision)
+    with localcontext() as context:
+        context.prec = max(28, len(decimal_price.as_tuple().digits) + abs(decimal_price.adjusted()) + 4)
+        return float(decimal_price.quantize(quantum, rounding=ROUND_DOWN))
 
 
 def transaction_fees(
@@ -103,7 +115,13 @@ class ExecutionBook(Book):
         if initial is None:
             return 0
         try:
-            price = min(float(row["price"]) for row in initial["asks"] if float(row["volume"]) >= 1)
+            price = us_limit_price(
+                min(
+                    float(row["price"])
+                    for row in initial["asks"]
+                    if float(row["volume"]) >= 1
+                )
+            )
             if not math.isfinite(price) or price <= 0:
                 return 0
         except (KeyError, TypeError, ValueError):
@@ -166,7 +184,12 @@ class ExecutionBook(Book):
             ]
             if not values or any(not math.isfinite(p) or p <= 0 for p in values):
                 raise ValueError("Invalid initial depth")
-            limit = min(values) if side == "BUY" else max(values)
+            limit = frame.get("order_limits", {}).get(symbol)
+            if limit is None:
+                limit = min(values) if side == "BUY" else max(values)
+                limit = us_limit_price(limit)
+            if limit <= 0:
+                raise ValueError("Unavailable normalized order limit")
         except (KeyError, TypeError, ValueError):
             self._failure("confirmation_unavailable")
             return []
@@ -385,9 +408,22 @@ class ExecutionBook(Book):
         frame, schedule = self.context.frame, self.context.schedule
         try:
             fx = float(frame["fx"])
-            age = (
-                datetime.fromisoformat(frame["at"]) - datetime.fromisoformat(frame["fx_at"])
-            ).total_seconds()
+            at = datetime.fromisoformat(frame["at"])
+            received_at = datetime.fromisoformat(frame["fx_at"])
+            age = (at - received_at).total_seconds()
+            valid_from_value = frame.get("fx_valid_from")
+            valid_until_value = frame.get("fx_valid_until")
+            if frame.get("fx_provider_validity_required") and (
+                valid_from_value is None or valid_until_value is None
+            ):
+                raise ValueError("Missing provider FX validity")
+            if valid_from_value is not None or valid_until_value is not None:
+                if not isinstance(valid_from_value, str) or not isinstance(valid_until_value, str):
+                    raise ValueError("Invalid provider FX validity")
+                valid_from = datetime.fromisoformat(valid_from_value)
+                valid_until = datetime.fromisoformat(valid_until_value)
+                if not valid_from <= at <= valid_until:
+                    raise ValueError("FX is outside provider validity")
             if not math.isfinite(fx) or fx <= 0 or not 0 <= age <= schedule["max_fx_age_seconds"]:
                 raise ValueError("Unavailable trade-time FX")
         except (KeyError, TypeError, ValueError):

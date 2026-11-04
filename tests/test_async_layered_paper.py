@@ -217,6 +217,81 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(a.intents), 1)
         self.assertEqual(a.intents[0].limit, 9.9)
 
+    async def test_new_exit_feature_is_processed_with_duplicate_quote(self):
+        a = await self.account()
+        await a.submit(event())
+        await a.submit(event(at=2))
+        await a.submit(event(at=3, eligible=False))
+        exit_signal = event(at=4, event_id="new-feature")
+        exit_signal["book"] = copy.deepcopy(a._books[0])
+        exit_signal["feature"] = replace(
+            exit_signal["feature"],
+            price=8,
+            available_at=stamp(4),
+            bar_end=stamp(4),
+            r5=-0.01,
+        )
+        await a.submit(exit_signal)
+        self.assertEqual(a.intents[-1].side, "SELL")
+        self.assertIn(0, a.pending)
+        self.assertEqual(a.book.opened, 1)
+
+    async def test_us_buy_limit_is_normalized_without_changing_quote(self):
+        a = await self.account(100)
+        at_or_above_one = event(price=1.001)
+        at_or_above_one["book"]["bids"][0]["price"] = "1.0"
+        await a.submit(at_or_above_one)
+        self.assertEqual(a.pending[0].limit, 1.0)
+        self.assertEqual(a.pending[0].initial["asks"][0]["price"], "1.001")
+
+        sub_dollar = await self.account(100)
+        quote = event(price=0.12349)
+        quote["book"]["bids"][0]["price"] = "0.1234"
+        await sub_dollar.submit(quote)
+        self.assertEqual(sub_dollar.pending[0].limit, 0.1234)
+        self.assertEqual(sub_dollar.pending[0].initial["asks"][0]["price"], "0.12349")
+
+        unavailable = await self.account(100)
+        tiny = event(price=0.00001)
+        tiny["book"]["bids"][0]["price"] = "0.00001"
+        await unavailable.submit(tiny)
+        self.assertEqual(unavailable.intents, [])
+        self.assertEqual(float(unavailable._books[0]["asks"][0]["price"]), 0.00001)
+
+    async def test_unfunded_sell_leaves_account_unchanged_and_records_attempt(self):
+        a = await self.account(1.006)
+        penny = event(price=0.005, volume=1)
+        penny["book"]["bids"][0]["price"] = "0.005"
+        await a.submit(penny)
+        confirmation = event(at=2, price=0.005, volume=1)
+        confirmation["book"]["bids"][0]["price"] = "0.005"
+        await a.submit(confirmation)
+        reserved_entry = event(1, 3, price=1.0, volume=10)
+        reserved_entry["feature"] = replace(reserved_entry["feature"], prior_high=0.9)
+        await a.submit(reserved_entry)
+        self.assertAlmostEqual(a.reserved_cash, 1.0)
+        before_cash = a.book.cash
+        before_position = copy.deepcopy(a.book.positions[0])
+        invalidation = event(at=4, price=0.005, volume=10)
+        invalidation["book"]["bids"][0]["price"] = "0.005"
+        invalidation["feature"] = replace(
+            invalidation["feature"],
+            price=0.004,
+            available_at=stamp(4),
+            bar_end=stamp(4),
+            r5=-0.01,
+            r15=-0.01,
+        )
+        await a.submit(invalidation)
+        sale = event(at=5, price=0.005, volume=10)
+        sale["book"]["bids"][0]["price"] = "0.005"
+        await a.submit(sale)
+        self.assertEqual(a.book.cash, before_cash)
+        self.assertEqual(a.book.positions[0], before_position)
+        self.assertAlmostEqual(a.reserved_cash, 1.0)
+        self.assertEqual(a.outcomes[-1]["status"], "unfilled")
+        self.assertEqual(a.outcomes[-1]["blocked_reason"], "insufficient_cash_after_sell_costs")
+
     async def test_full_replay_prefix_is_independent_of_future_and_missing_confirmation(self):
         from tools.replay_layered_stream import replay_case
 
