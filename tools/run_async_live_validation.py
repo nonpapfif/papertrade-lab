@@ -13,14 +13,14 @@ import os
 import time
 from collections import Counter
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
 from tools.async_layered_paper import AsyncLayeredPaper, seconds
-from tools.layered_paper import Feature, assign, eligible_stock, feature_from_bars
+from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
 from tools.live_feed import LiveFeed
 from tools.probe_toss_websocket import (
     ROOT,
@@ -30,6 +30,22 @@ from tools.probe_toss_websocket import (
     error_details,
     now,
     read_spec,
+)
+
+LEGACY_SOURCES = (
+    "tools/run_async_live_validation.py",
+    "tools/async_layered_paper.py",
+    "tools/layered_paper.py",
+    "tools/live_execution.py",
+    "papertrade/api.py",
+)
+SOURCES = (
+    *LEGACY_SOURCES,
+    "papertrade/core.py",
+    "tools/live_feed.py",
+    "tools/probe_toss_websocket.py",
+    "tools/search_portfolios.py",
+    "tools/week_hypotheses.py",
 )
 
 
@@ -72,8 +88,26 @@ def latency_summary(values: list[float]) -> dict[str, float | int]:
 
 
 class Runtime:
-    def __init__(self, capital: float, record: Any) -> None:
+    def __init__(self, capital: float, record: Any, *, candidate_policy: str | None = None) -> None:
         self.account = AsyncLayeredPaper(capital)
+        self.accounts = {"incumbent": self.account}
+        if candidate_policy is not None:
+            self.accounts["candidate"] = AsyncLayeredPaper(capital, policy=candidate_policy)
+        self.configurations = {
+            name: {
+                "capital": capital,
+                "policy": account.policy,
+                "selection": account.selection,
+                "allocation": account.allocation,
+                "delay_seconds": account.delay,
+                "fee_schedule": copy.deepcopy(account.context.schedule),
+            }
+            for name, account in self.accounts.items()
+        }
+        self.delivered = dict.fromkeys(self.accounts, 0)
+        self.book_delivered = dict.fromkeys(self.accounts, 0)
+        self.delivery_hashes = {name: hashlib.sha256() for name in self.accounts}
+        self.sequence = 0
         self.record = record
         self.ids: dict[str, int] = {}
         self.features: dict[str, Feature | None] = {}
@@ -94,16 +128,54 @@ class Runtime:
         return self.ids[symbol]
 
     def protected(self) -> set[str]:
-        ids = set(self.account.pending) | set(self.account.book.positions)
+        ids = {
+            symbol
+            for account in self.accounts.values()
+            for symbol in set(account.pending) | set(account.book.positions)
+        }
         return {s for s, i in self.ids.items() if i in ids}
 
     def publish(self, kind: str, payload: Any) -> None:
-        self.queue.put_nowait((kind, payload, now(), time.monotonic()))
+        self.sequence += 1
+        self.queue.put_nowait(
+            (self.sequence, kind, copy.deepcopy(payload), now(), time.monotonic())
+        )
         self.max_queue = max(self.max_queue, self.queue.qsize())
+
+    def _feature_at(self, symbol: str, at: str) -> Feature | None:
+        feature, book = self.features.get(symbol), self.books.get(symbol)
+        tick = seconds(at)
+        if (
+            feature is None
+            or book is None
+            or book.get("currency") != "USD"
+            or seconds(feature.available_at) > tick
+            or not 0 <= tick - seconds(feature.bar_end) <= 90
+            or not 0 <= tick - seconds(book["timestamp"]) <= 60
+        ):
+            return None
+        price = (
+            min(float(r["price"]) for r in book["asks"])
+            + max(float(r["price"]) for r in book["bids"])
+        ) / 2
+        return replace(
+            feature,
+            price=price,
+            r5=price / (feature.price / (1 + feature.r5)) - 1,
+            r15=price / (feature.price / (1 + feature.r15)) - 1,
+        )
+
+    def _record_delivery(self, name: str, observation: bytes) -> None:
+        self.delivered[name] += 1
+        self.delivery_hashes[name].update(observation)
+
+    async def close(self) -> None:
+        for account in self.accounts.values():
+            await account.close()
 
     async def consume(self) -> None:
         while True:
-            kind, payload, received, queued = await self.queue.get()
+            sequence, kind, payload, received, queued = await self.queue.get()
             started = time.monotonic()
             self.queue_delays.append(started - queued)
             try:
@@ -147,46 +219,88 @@ class Runtime:
                             r15=price / (f.price / (1 + f.r15)) - 1,
                         )
                     at = now()
-                    before = len(self.account.intents), len(self.account.outcomes)
+                    paired = len(self.accounts) > 1
+                    prepared = (
+                        {s: self._feature_at(s, at) for s in self.candidates} if paired else {}
+                    )
+                    if paired:
+                        f = self._feature_at(symbol, at)
                     fresh = f is not None and 0 <= seconds(at) - seconds(f.bar_end) <= 90
                     self.counts["fresh_features" if fresh else "unusable_features"] += 1
                     if fresh and f is not None and assign(f):
                         self.counts["signal_observations"] += 1
-                    await self.account.submit(
-                        {
-                            "id": f"live:{self.counts['book_events']}",
-                            "symbol": self.identifier(symbol),
-                            "received_at": at,
-                            "book": book,
-                            "feature": f,
-                            "eligible": symbol in self.candidates,
-                            "candidate_count": max(
-                                1,
-                                sum(
-                                    x not in self.protected()
-                                    and (candidate_feature := self.features.get(x)) is not None
-                                    and 0 <= seconds(at) - seconds(candidate_feature.bar_end) <= 90
-                                    and assign(candidate_feature) is not None
-                                    for x in self.candidates
-                                ),
-                            ),
-                            "fx": self.fx[0],
-                            "fx_at": self.fx[1],
-                        }
+                    shared = {
+                        "id": f"live:{self.counts['book_events']}",
+                        "symbol": self.identifier(symbol),
+                        "received_at": at,
+                        "book": book,
+                        "feature": f,
+                        "eligible": symbol in self.candidates,
+                        "fx": self.fx[0],
+                        "fx_at": self.fx[1],
+                    }
+                    observation = (
+                        json.dumps(
+                            {
+                                "sequence": sequence,
+                                "published_at": received,
+                                **shared,
+                                "feature": asdict(f) if f is not None else None,
+                            },
+                            sort_keys=True,
+                            allow_nan=False,
+                        ).encode()
+                        + b"\n"
                     )
-                    for i in self.account.intents[before[0] :]:
-                        self.record(
-                            "intent",
-                            symbol=symbol,
-                            quantity=i.quantity,
-                            side=i.side,
-                            decision_at=i.decision_at,
-                            reserved=i.reserved,
+                    for name, account in self.accounts.items():
+                        before = len(account.intents), len(account.outcomes)
+                        excluded = set(account.pending) | set(account.book.positions)
+                        candidate_count = max(
+                            1,
+                            sum(
+                                self.ids.get(x) not in excluded
+                                and (
+                                    candidate_feature := (
+                                        prepared.get(x) if paired else self.features.get(x)
+                                    )
+                                )
+                                is not None
+                                and 0 <= seconds(at) - seconds(candidate_feature.bar_end) <= 90
+                                and assign(candidate_feature, account.policy) is not None
+                                for x in self.candidates
+                            ),
                         )
-                    for result in self.account.outcomes[before[1] :]:
-                        self.record("outcome", result=result)
+                        await account.submit({**shared, "candidate_count": candidate_count})
+                        self._record_delivery(name, observation)
+                        self.book_delivered[name] += 1
+                        identity = {"account": name} if paired else {}
+                        for i in account.intents[before[0] :]:
+                            self.record(
+                                "intent",
+                                symbol=symbol,
+                                quantity=i.quantity,
+                                side=i.side,
+                                decision_at=i.decision_at,
+                                reserved=i.reserved,
+                                **identity,
+                            )
+                        for result in account.outcomes[before[1] :]:
+                            self.record("outcome", result=result, **identity)
+                    if paired:
+                        self.record(
+                            "comparison_observation",
+                            sequence=sequence,
+                            symbol=symbol,
+                            received_at=received,
+                            decision_at=at,
+                            input_sha256=hashlib.sha256(observation).hexdigest(),
+                        )
                 elif kind == "clock":
-                    await self.account.advance(now())
+                    at = now()
+                    observation = json.dumps([sequence, "clock", received, at]).encode() + b"\n"
+                    for name, account in self.accounts.items():
+                        await account.advance(at)
+                        self._record_delivery(name, observation)
                 else:
                     raise ValueError("Unknown runtime event")
                 self.desired = subscription_set(self.candidates, self.protected())
@@ -195,7 +309,7 @@ class Runtime:
                 self.queue.task_done()
 
     def status(self) -> dict[str, Any]:
-        return {
+        result = {
             "counts": dict(self.counts),
             "desired": self.desired,
             "protected": sorted(self.protected()),
@@ -209,9 +323,87 @@ class Runtime:
             "processing_seconds": latency_summary(self.processing_times),
             "paper": self.account.summary() if self.account.last_at else None,
         }
+        if len(self.accounts) > 1:
+            result["comparison"] = {
+                "qualification": "not_assessed",
+                "inputs_aligned": len(set(self.delivered.values())) == 1
+                and len({h.hexdigest() for h in self.delivery_hashes.values()}) == 1,
+                "configuration_unchanged": all(
+                    account.policy == self.configurations[name]["policy"]
+                    and account.selection == self.configurations[name]["selection"]
+                    and account.allocation == self.configurations[name]["allocation"]
+                    and account.delay == self.configurations[name]["delay_seconds"]
+                    and account.book.initial_equity == self.configurations[name]["capital"]
+                    and account.context.schedule == self.configurations[name]["fee_schedule"]
+                    for name, account in self.accounts.items()
+                ),
+                "accounts": {
+                    name: {
+                        "configuration": copy.deepcopy(self.configurations[name]),
+                        "observations": self.delivered[name],
+                        "book_observations": self.book_delivered[name],
+                        "input_sha256": self.delivery_hashes[name].hexdigest(),
+                        "paper": account.summary() if account.last_at else None,
+                    }
+                    for name, account in self.accounts.items()
+                },
+            }
+        return result
 
 
-async def campaign(output: Path, duration: int, capital: float) -> None:
+def write_comparison(
+    output: Path, stats: dict[str, Any], runtime: Runtime
+) -> dict[str, Any] | None:
+    """Save descriptive comparison evidence after the shared recording files close."""
+    if len(runtime.accounts) == 1:
+        return None
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    expected = manifest.get("source_sha256", {})
+    source_unchanged = set(expected) == set(SOURCES) and all(
+        (ROOT / name).is_file()
+        and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected[name]
+        for name in SOURCES
+    )
+    hashes = {}
+    for name in ("manifest.json", "market.jsonl.gz", "events.jsonl"):
+        path = output / name
+        if path.is_file():
+            with path.open("rb") as stream:
+                hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    comparison = runtime.status()["comparison"]
+    freeze_matches = manifest.get("comparison") == runtime.configurations
+    complete = (
+        stats.get("state") == "complete"
+        and source_unchanged
+        and len(hashes) == 3
+        and freeze_matches
+        and comparison["inputs_aligned"]
+        and comparison["configuration_unchanged"]
+    )
+    state = stats.get("state") if stats.get("state") in ("complete", "failed") else "interrupted"
+    result = {
+        **stats,
+        **comparison,
+        "state": state if complete or state != "complete" else "incomplete",
+        "complete": complete,
+        "ended_at": now(),
+        "source_unchanged": source_unchanged,
+        "freeze_matches": freeze_matches,
+        "observation_status": "observed_short_sample"
+        if all(runtime.book_delivered.values())
+        else "inconclusive",
+        "input_files_sha256": hashes,
+        "freeze": manifest.get("comparison"),
+        "symbol_ids": runtime.ids,
+    }
+    private_json(output / "comparison.json", result)
+    return result
+
+
+async def campaign(
+    output: Path, duration: int, capital: float, *, candidate_policy: str | None = None
+) -> None:
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -226,17 +418,8 @@ async def campaign(output: Path, duration: int, capital: float) -> None:
     def record(kind: str, **payload: Any) -> None:
         log.write(json.dumps({"at": now(), "kind": kind, **payload}) + "\n")
 
-    settings = Settings.load(ROOT)
-    data = copy.deepcopy(settings.data)
-    data["limits"]["minimum_request_interval"] = 0.08
-    client = CachedTokenClient(Settings(ROOT, data))
     http_audit: list[dict[str, Any]] = []
-    feed = LiveFeed(
-        client.settings,
-        lambda kind, payload: http_audit.append(payload) if kind == "http" else None,
-        client=client,
-    )
-    runtime = Runtime(capital, record)
+    runtime = Runtime(capital, record, candidate_policy=candidate_policy)
     stats: dict[str, Any] = {
         "state": "starting",
         "ai_calls": 0,
@@ -252,6 +435,15 @@ async def campaign(output: Path, duration: int, capital: float) -> None:
     token = ""
     resync = asyncio.Event()
     try:
+        settings = Settings.load(ROOT)
+        data = copy.deepcopy(settings.data)
+        data["limits"]["minimum_request_interval"] = 0.08
+        client = CachedTokenClient(Settings(ROOT, data))
+        feed = LiveFeed(
+            client.settings,
+            lambda kind, payload: http_audit.append(payload) if kind == "http" else None,
+            client=client,
+        )
         token = client.access_token()
         spec = await asyncio.to_thread(read_spec)
         (output / "asyncapi.json").write_bytes(spec)
@@ -264,16 +456,11 @@ async def campaign(output: Path, duration: int, capital: float) -> None:
             expected_end_epoch=time.time() + duration,
             universe_count=len(universe),
         )
-        sources = [
-            "tools/run_async_live_validation.py",
-            "tools/async_layered_paper.py",
-            "tools/layered_paper.py",
-            "tools/live_execution.py",
-            "papertrade/api.py",
-        ]
+        sources = SOURCES if candidate_policy is not None else LEGACY_SOURCES
         private_json(
             output / "manifest.json",
             {
+                **({"comparison": runtime.configurations} if candidate_policy is not None else {}),
                 "source_sha256": {
                     p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources
                 },
@@ -520,8 +707,10 @@ async def campaign(output: Path, duration: int, capital: float) -> None:
         await drain
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
-        await runtime.account.advance(now())
-        await runtime.account.close()
+        at = now()
+        for account in runtime.accounts.values():
+            await account.advance(at)
+        await runtime.close()
         stats.update(state="complete", at=now(), **runtime.status())
         checks = {
             "stream_observed": stats.get("market_messages", 0) > 0,
@@ -536,8 +725,10 @@ async def campaign(output: Path, duration: int, capital: float) -> None:
             "protected_subscription_retained": all(
                 set(a["protected"]) <= set(a["symbols"]) for a in stats["acks"]
             ),
-            "cash_not_overreserved": runtime.account.reserved_cash
-            <= runtime.account.book.cash + 1e-9,
+            "cash_not_overreserved": all(
+                account.reserved_cash <= account.book.cash + 1e-9
+                for account in runtime.accounts.values()
+            ),
         }
         stats.update(checks=checks, result="passed" if all(checks.values()) else "inconclusive")
     except (
@@ -558,10 +749,19 @@ async def campaign(output: Path, duration: int, capital: float) -> None:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await runtime.account.close()
+        await runtime.close()
         private_json(output / "status.json", stats)
         private_json(output / "http-audit.json", {"requests": http_audit})
         files.close()
+        comparison = write_comparison(output, stats, runtime)
+        if comparison is not None:
+            stats.update(state=comparison["state"], **runtime.status())
+            stats["comparison"].update(
+                complete=comparison["complete"],
+                source_unchanged=comparison["source_unchanged"],
+                freeze_matches=comparison["freeze_matches"],
+            )
+            private_json(output / "status.json", stats)
 
 
 def main() -> None:
@@ -569,10 +769,18 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--duration", type=int, default=1200)
     parser.add_argument("--capital", type=float, default=100)
+    parser.add_argument("--candidate-policy", choices=("router", *FAMILIES))
     args = parser.parse_args()
     if args.duration < 360 or not math.isfinite(args.capital) or args.capital <= 0:
         parser.error("Use duration >= 360 and positive finite capital")
-    asyncio.run(campaign(args.output.resolve(), args.duration, args.capital))
+    asyncio.run(
+        campaign(
+            args.output.resolve(),
+            args.duration,
+            args.capital,
+            candidate_policy=args.candidate_policy,
+        )
+    )
 
 
 if __name__ == "__main__":
