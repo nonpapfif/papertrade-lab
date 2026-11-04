@@ -11,13 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from papertrade.core import SafetyError, Settings, encode
+from papertrade.core import Settings, encode
 from tools.autotest_jobs import atomic_json
-from tools.kr_comparison_ai import decide
+from tools.kr_comparison_ai import ASTRA, SOL, decide, review_cascade
 from tools.run_kr_paper_comparison import CAPITAL, ROOT, Comparison, now
-
-SOL = "gpt-6.1-sol"
-ASTRA = "gpt-6-astra"
 
 
 async def campaign(market: Path, output: Path, until: datetime) -> None:
@@ -80,105 +77,16 @@ async def campaign(market: Path, output: Path, until: datetime) -> None:
             )
 
         async def review(signals: list[dict[str, Any]]) -> None:
-            payload = {
-                "signals": signals,
-                "currency": "KRW",
-                "observed_at": now(),
-                "portfolio": account.summary(comparison.prices),
-            }
-            deferred: dict[str, str] = {}
-            holds: dict[str, str] = {}
-            model = SOL
-            try:
-                calls[model] += 1
-                review_id = sum(calls.values())
-                record("ai_review", review_id=review_id, model=model, effort="medium", **payload)
-                approved, watches = await decide(
-                    settings, payload, model=model, deferred=deferred, holds=holds
-                )
-                decided = now()
-                record(
-                    "ai_decision",
-                    review_id=review_id,
-                    model=model,
-                    holds=holds,
-                    decision_at=decided,
-                    approvals=approved,
-                    watches=watches,
-                    deferred=deferred,
-                    after_cutoff=decided >= until,
-                )
-                if decided >= until:
-                    return
-                completed[model] += 1
-                comparison.approve(signals, approved, decided, watches)
-                remaining = [
-                    {**signal, "sol_reason": deferred[signal["symbol"]]}
-                    for signal in signals
-                    if signal["symbol"] in deferred
-                    and comparison.ai_latest.get(signal["symbol"]) == signal
-                    and account.wants(signal)
-                ]
-                selected = {signal["symbol"] for signal in remaining}
-                if not selected or now() >= until:
-                    if deferred:
-                        record(
-                            "ai_handoff_not_started",
-                            review_id=review_id,
-                            symbols=sorted(deferred),
-                            reason="stale_or_cutoff",
-                        )
-                    return
-                skipped = sorted(set(deferred) - selected)
-                if skipped:
-                    record(
-                        "ai_handoff_not_started",
-                        review_id=review_id,
-                        symbols=skipped,
-                        reason="stale",
-                    )
-                model = ASTRA
-                calls[model] += 1
-                parent_review_id = review_id
-                review_id = sum(calls.values())
-                holds = {}
-                escalation = {
-                    **payload,
-                    "signals": remaining,
-                    "observed_at": now(),
-                    "portfolio": account.summary(comparison.prices),
-                }
-                record(
-                    "ai_review",
-                    review_id=review_id,
-                    parent_review_id=parent_review_id,
-                    model=model,
-                    effort="medium",
-                    **escalation,
-                )
-                approved, watches = await decide(settings, escalation, model=model, holds=holds)
-                decided = now()
-                if decided < until:
-                    completed[model] += 1
-                    deferred_symbols = {signal["symbol"] for signal in remaining}
-                    comparison.approve(
-                        [signal for signal in signals if signal["symbol"] in deferred_symbols],
-                        approved,
-                        decided,
-                        watches,
-                    )
-                record(
-                    "ai_decision",
-                    review_id=review_id,
-                    model=model,
-                    holds=holds,
-                    decision_at=decided,
-                    approvals=approved,
-                    watches=watches,
-                    after_cutoff=decided >= until,
-                )
-            except SafetyError as error:
-                record("ai_review_failed", review_id=review_id, model=model, reason=str(error))
+            await review_cascade(
+                settings,
+                comparison,
+                signals,
+                until,
+                record,
+                calls,
+                completed,
+                decide_signal=decide,
+            )
 
         try:
             status()

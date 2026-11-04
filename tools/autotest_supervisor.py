@@ -45,10 +45,10 @@ REQUIREMENTS = {
 }
 COMPARISON_POLICY = "trend"
 KR_REQUIREMENTS = {
-    "configuration": "Freeze the KRW rules and equal 100,000 KRW balances before observing.",
+    "configuration": "Freeze both allocations and equal 100,000 KRW balances across four accounts.",
     "shared_input": "Deliver shared Korean snapshots to independent accounts with causal fills.",
     "comparison_evidence": "Record both KRW results, AI signal decisions and observation coverage.",
-    "live_integration": "Complete a finite Korean market comparison with an actual AI decision.",
+    "live_integration": "Complete a finite Korean comparison with an actual AI decision in each allocation pair.",
 }
 
 CONTRACT = """You work on the existing Finance paper-trading validation project.
@@ -376,7 +376,11 @@ class Supervisor:
             "requirements": self.requirements,
             "milestone_document": "docs/autotrade-implementation-plan.md",
             "comparison": (
-                {"currency": "KRW", "until": self.kr_until, "strategies": ["fixed", "ai"]}
+                {
+                    "currency": "KRW",
+                    "until": self.kr_until,
+                    "strategies": ["5pct_fixed", "5pct_ai", "10pct_fixed", "10pct_ai"],
+                }
                 if self.kr_until
                 else {"incumbent_policy": "router", "candidate_policy": COMPARISON_POLICY}
             ),
@@ -789,6 +793,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 str(run),
                 "--until",
                 self.kr_until,
+                "--allocation-comparison",
             ]
         self.transition(
             "live_wait", job=str(path), live_run=str(run), live_argv=argv, live_cwd=str(trusted)
@@ -815,7 +820,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         command(
             [
                 sys.executable,
-                str(Path.home() / ".agents/skills/github-workflow/scripts/check_staged_language.py"),
+                str(
+                    Path.home() / ".agents/skills/github-workflow/scripts/check_staged_language.py"
+                ),
                 str(self.worktree),
             ],
             self.worktree,

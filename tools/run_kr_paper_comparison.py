@@ -9,6 +9,7 @@ import json
 import math
 import os
 import time
+from collections import Counter, defaultdict, deque
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -17,12 +18,13 @@ from typing import Any
 from papertrade.api import SYMBOL, ApiError
 from papertrade.core import SafetyError, Settings, encode
 from tools.autotest_jobs import atomic_json
-from tools.kr_comparison_ai import decide
+from tools.kr_comparison_ai import SOL, decide, review_cascade
 from tools.live_feed import LiveFeed
 from tools.probe_toss_websocket import CachedTokenClient
 
 ROOT = Path(__file__).resolve().parents[1]
 CAPITAL = Decimal(100_000)
+ALLOCATION_LOOKBACK = 12
 
 
 def now() -> datetime:
@@ -30,12 +32,26 @@ def now() -> datetime:
 
 
 class Account:
-    def __init__(self) -> None:
+    def __init__(self, allocation: Decimal | None = None) -> None:
+        self.allocation = allocation
         self.cash = CAPITAL
         self.positions: dict[str, tuple[Decimal, Decimal]] = {}
         self.realized = Decimal(0)
         self.fills = 0
         self.pending: dict[str, tuple[dict[str, Any], datetime, str]] = {}
+        self.budgets: dict[str, Decimal] = {}
+
+    def queue(
+        self,
+        signal: dict[str, Any],
+        decided: datetime,
+        reason: str,
+        prices: dict[str, tuple[Decimal, datetime]],
+    ) -> None:
+        symbol = signal["symbol"]
+        self.pending[symbol] = signal, decided, reason
+        if self.allocation is not None and signal["action"] == "BUY":
+            self.budgets[symbol] = self.summary(prices)["equity_krw"] * self.allocation
 
     def wants(self, signal: dict[str, Any]) -> bool:
         return (signal["symbol"] in self.positions) == (signal["action"] == "SELL")
@@ -50,6 +66,7 @@ class Account:
         for symbol, (signal, decided, reason) in list(self.pending.items()):
             if latest.get(symbol) != signal or not self.wants(signal):
                 del self.pending[symbol]
+                self.budgets.pop(symbol, None)
                 continue
             if symbol in quotes and quotes[symbol][1] > decided:
                 ready.append((symbol, signal, decided, reason))
@@ -59,7 +76,12 @@ class Account:
         records = []
         budget = Decimal(0)
         for symbol, signal, decided, reason in sorted(
-            ready, key=lambda row: row[1]["action"] == "BUY"
+            ready,
+            key=lambda row: (
+                row[1]["action"] == "BUY",
+                -row[1].get("strength", Decimal(0)) if self.allocation is not None else 0,
+                row[0] if self.allocation is not None else "",
+            ),
         ):
             price, source = quotes[symbol]
             if signal["action"] == "SELL":
@@ -68,9 +90,14 @@ class Account:
                 self.cash += proceeds
                 self.realized += proceeds - basis
             else:
-                if not budget:
-                    budget = self.cash / buy_count
-                cost = min(budget, self.cash)
+                if self.allocation is None:
+                    if not budget:
+                        budget = self.cash / buy_count
+                    cost = min(budget, self.cash)
+                else:
+                    cost = self.budgets.pop(symbol)
+                    if self.cash < cost:
+                        continue
                 if cost <= 0:
                     continue
                 quantity = cost / price
@@ -119,15 +146,21 @@ class Account:
 
 
 class Comparison:
-    def __init__(self) -> None:
-        self.accounts = {"fixed": Account(), "ai": Account()}
+    def __init__(self, allocation: Decimal | None = None) -> None:
+        self.allocation = allocation
+        self.accounts = {"fixed": Account(allocation), "ai": Account(allocation)}
+        self.moves: defaultdict[str, deque[Decimal]] = defaultdict(
+            lambda: deque(maxlen=ALLOCATION_LOOKBACK)
+        )
         self.prices: dict[str, tuple[Decimal, datetime]] = {}
         self.latest: dict[str, dict[str, Any]] = {}
         self.ai_latest: dict[str, dict[str, Any]] = {}
         self.review_queue: dict[str, dict[str, Any]] = {}
         self.watches: dict[str, tuple[Decimal, datetime]] = {}
 
-    def observe(self, rows: list[dict[str, Any]], observed: datetime) -> list[dict[str, Any]]:
+    def observe(
+        self, rows: list[dict[str, Any]], observed: datetime, *, warmup: bool = False
+    ) -> list[dict[str, Any]]:
         quotes = {}
         signals = []
         for row in rows:
@@ -145,7 +178,17 @@ class Comparison:
             if prior is not None and source <= prior[1]:
                 continue
             quotes[symbol] = self.prices[symbol] = (price, source)
-            if prior is None or prior[0] == price:
+            if prior is None:
+                continue
+            strength = Decimal(0)
+            if self.allocation is not None:
+                history = self.moves[symbol]
+                change = abs(price / prior[0] - 1)
+                mean = sum(history, Decimal(0)) / len(history) if history else Decimal(0)
+                if mean:
+                    strength = change / mean
+                history.append(change)
+            if warmup or prior[0] == price:
                 continue
             action = "BUY" if price > prior[0] else "SELL"
             same_direction = self.latest.get(symbol, {}).get("action") == action
@@ -166,6 +209,8 @@ class Comparison:
                 "source_at": source.isoformat(),
                 "observed_at": observed.isoformat(),
             }
+            if self.allocation is not None:
+                signal["strength"] = strength
             if not same_direction:
                 self.latest[symbol] = signal
             self.ai_latest[symbol] = signal
@@ -182,7 +227,7 @@ class Comparison:
             symbol = signal["symbol"]
             fixed, ai = self.accounts["fixed"], self.accounts["ai"]
             if signal["trigger"] == "direction_change" and fixed.wants(signal):
-                fixed.pending[symbol] = signal, observed, "fixed_direction_change"
+                fixed.queue(signal, observed, "fixed_direction_change", self.prices)
             if ai.wants(signal):
                 self.review_queue[symbol] = signal
             else:
@@ -202,18 +247,26 @@ class Comparison:
             if self.ai_latest.get(symbol) != signal or not ai.wants(signal):
                 continue
             if symbol in approvals:
-                ai.pending[symbol] = signal, decided, approvals[symbol]
+                ai.queue(signal, decided, approvals[symbol], self.prices)
             elif watches and symbol in watches:
                 self.watches[symbol] = watches[symbol], decided
 
 
-async def campaign(output: Path, until: datetime) -> None:
+async def campaign(output: Path, until: datetime, *, allocation_comparison: bool = False) -> None:
     if now() >= until:
         raise ValueError("Observation deadline has passed")
     output.mkdir(parents=True, exist_ok=False)
     settings = Settings.load(ROOT)
     client = CachedTokenClient(settings)
     comparison = Comparison()
+    pairs = (
+        {"5pct": Comparison(Decimal("0.05")), "10pct": Comparison(Decimal("0.10"))}
+        if allocation_comparison
+        else {}
+    )
+    pair_jobs: dict[str, asyncio.Task[None]] = {}
+    pair_calls: dict[str, Counter[str]] = {key: Counter() for key in pairs}
+    pair_completed: dict[str, Counter[str]] = {key: Counter() for key in pairs}
     digest = hashlib.sha256()
     started = now()
     sweeps = calls = approvals = reviews_completed = 0
@@ -256,6 +309,24 @@ async def campaign(output: Path, until: datetime) -> None:
                 for name, account in comparison.accounts.items()
             },
         }
+        if pairs:
+            report.update(
+                accounts={
+                    f"{key}_{name}": account.summary(pair.prices)
+                    for key, pair in pairs.items()
+                    for name, account in pair.accounts.items()
+                },
+                observed_symbols=len(next(iter(pairs.values())).prices),
+                ai_calls=sum(sum(count.values()) for count in pair_calls.values()),
+                ai_reviews_completed=sum(sum(count.values()) for count in pair_completed.values()),
+                ai_in_flight=any(not job.done() for job in pair_jobs.values()),
+                ai_by_allocation={
+                    key: {"calls": pair_calls[key], "completed": pair_completed[key]}
+                    for key in pairs
+                },
+            )
+            del report["watch_prices_krw"]
+            del report["ai_approvals"]
         atomic_json(output / "status.json", json.loads(encode(report)))
 
     with (
@@ -265,6 +336,14 @@ async def campaign(output: Path, until: datetime) -> None:
 
         def record(kind: str, data: dict[str, Any]) -> None:
             events.write(encode({"kind": kind, "recorded_at": now(), **data}) + "\n")
+
+        async def run_pair(key: str, signals: list[dict[str, Any]]) -> None:
+            def audit(kind: str, **fields: Any) -> None:
+                record(kind, {"allocation": key, **fields})
+
+            await review_cascade(
+                settings, pairs[key], signals, until, audit, pair_calls[key], pair_completed[key]
+            )
 
         feed = LiveFeed(
             settings, lambda k, data: record(k, data) if k == "http" else None, client=client
@@ -289,7 +368,15 @@ async def campaign(output: Path, until: datetime) -> None:
                     "currency": "KRW",
                     "initial_capital_krw": str(CAPITAL),
                     "until": until.isoformat(),
-                    "model": "gpt-6-astra",
+                    "model": "Sol first, Astra on explicit deferral" if pairs else "gpt-6-astra",
+                    **(
+                        {
+                            "allocations": {"5pct": "0.05", "10pct": "0.10"},
+                            "warmup_sweeps": ALLOCATION_LOOKBACK,
+                        }
+                        if pairs
+                        else {}
+                    ),
                     "effort": "medium",
                     "universe": feed.symbols,
                     "rules": "Directional changes propose entry or exit; Astra gates the AI account",
@@ -342,6 +429,32 @@ async def campaign(output: Path, until: datetime) -> None:
                 raw.write(line)
                 digest.update(line.encode())
                 sweeps += 1
+                if pairs:
+                    for key, pair in pairs.items():
+                        for fill in pair.observe(
+                            rows, observed, warmup=sweeps <= ALLOCATION_LOOKBACK
+                        ):
+                            record("fill", {**fill, "account": f"{key}_{fill['account']}"})
+                        job = pair_jobs.get(key)
+                        if job is not None and not job.done():
+                            continue
+                        if job is not None:
+                            job.result()
+                            del pair_jobs[key]
+                        ai = pair.accounts["ai"]
+                        signals = [
+                            signal
+                            for signal in pair.review_queue.values()
+                            if ai.wants(signal) and (signal["action"] == "SELL" or ai.cash > 0)
+                        ]
+                        pair.review_queue.clear()
+                        if signals and now() < until:
+                            pair_jobs[key] = asyncio.create_task(run_pair(key, signals))
+                    status()
+                    await asyncio.sleep(
+                        max(0, min(60 - (time.monotonic() - tick), (until - now()).total_seconds()))
+                    )
+                    continue
                 for fill in comparison.observe(rows, observed):
                     record("fill", fill)
                 if review is None:
@@ -396,7 +509,10 @@ async def campaign(output: Path, until: datetime) -> None:
                             "after_last_observation": True,
                         },
                     )
-            state = "complete" if sweeps >= 2 and reviews_completed else "incomplete"
+            reviewed = (
+                all(count[SOL] for count in pair_completed.values()) if pairs else reviews_completed
+            )
+            state = "complete" if sweeps >= 2 and reviewed else "incomplete"
         except (ApiError, OSError, SafetyError, ValueError, RuntimeError, KeyError) as exc:
             state, error = "failed", type(exc).__name__
             record("failed", {"error_type": error})
@@ -409,6 +525,18 @@ async def campaign(output: Path, until: datetime) -> None:
                 await asyncio.gather(review, return_exceptions=True)
                 record("ai_review_ended_at_cutoff", {"review_id": calls, "at": now()})
             review = None
+            for key, job in pair_jobs.items():
+                if not job.done():
+                    job.cancel()
+                    await asyncio.gather(job, return_exceptions=True)
+                    record(
+                        "ai_cancelled_at_end",
+                        {"allocation": key, "review_id": sum(pair_calls[key].values())},
+                    )
+                elif not job.cancelled() and (failure := job.exception()) is not None:
+                    state, error = "failed", type(failure).__name__
+                    record("ai_review_failed", {"allocation": key, "error_type": error})
+            pair_jobs.clear()
             status()
             atomic_json(
                 output / "comparison.json", json.loads((output / "status.json").read_text())
@@ -420,10 +548,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--until", required=True, type=datetime.fromisoformat)
+    parser.add_argument("--allocation-comparison", action="store_true")
     args = parser.parse_args()
     if args.until.tzinfo is None:
         parser.error("--until requires a timezone offset")
-    asyncio.run(campaign(args.output.resolve(), args.until))
+    asyncio.run(
+        campaign(
+            args.output.resolve(), args.until, allocation_comparison=args.allocation_comparison
+        )
+    )
 
 
 if __name__ == "__main__":

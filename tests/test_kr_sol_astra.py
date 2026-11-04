@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from tools.run_kr_sol_astra import ASTRA, SOL, campaign, now
+from tools.kr_comparison_ai import ASTRA, SOL
+from tools.run_kr_sol_astra import campaign, now
 
 
 class SolAstraTests(unittest.IsolatedAsyncioTestCase):
