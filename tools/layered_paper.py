@@ -41,12 +41,15 @@ class Feature:
     reference15_age_seconds: float = 0
 
 
-def feature_from_bars(symbol: int, rows: list[dict[str, Any]], at: str) -> Feature | None:
+def feature_from_bars(
+    symbol: int, rows: list[dict[str, Any]], at: str, *, timestamp_is_end: bool = False
+) -> Feature | None:
     """Use as-of time references without manufacturing missing candles or volume."""
     decision = datetime.fromisoformat(at)
     if decision.tzinfo is None:
         raise ValueError("Decision timestamp requires a timezone")
     cutoff = decision.timestamp()
+    end_offset = 0 if timestamp_is_end else 60
     usable: dict[float, tuple[float, dict[str, Any]]] = {}
     for row in rows:
         source = datetime.fromisoformat(row["timestamp"])
@@ -55,7 +58,7 @@ def feature_from_bars(symbol: int, rows: list[dict[str, Any]], at: str) -> Featu
             raise ValueError("Bar timestamps require timezones")
         stamp = source.timestamp()
         received = available.timestamp()
-        if received <= cutoff and stamp + 60 <= cutoff:
+        if received <= cutoff and stamp + end_offset <= cutoff:
             old = usable.get(stamp)
             if old is None or old[0] < received:
                 usable[stamp] = (received, row)
@@ -63,7 +66,7 @@ def feature_from_bars(symbol: int, rows: list[dict[str, Any]], at: str) -> Featu
     if not stamps:
         return None
     latest = stamps[-1]
-    if cutoff - latest - 60 > 90:
+    if cutoff - latest - end_offset > 90:
         return None
 
     def reference(seconds: int) -> float | None:
@@ -91,7 +94,7 @@ def feature_from_bars(symbol: int, rows: list[dict[str, Any]], at: str) -> Featu
         symbol,
         prices[-1],
         max((r["available_at"] for r in bars), key=lambda t: datetime.fromisoformat(t)),
-        datetime.fromtimestamp(latest + 60, tz=decision.tzinfo).isoformat(),
+        datetime.fromtimestamp(latest + end_offset, tz=decision.tzinfo).isoformat(),
         prices[-1] / price5 - 1,
         prices[-1] / prices[0] - 1,
         max(float(usable[t][1]["highPrice"]) for t in window if latest - 900 <= t < latest),

@@ -14,8 +14,10 @@ import time
 from collections import Counter
 from contextlib import ExitStack
 from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
@@ -47,6 +49,43 @@ SOURCES = (
     "tools/search_portfolios.py",
     "tools/week_hypotheses.py",
 )
+
+
+US_TIMEZONE = ZoneInfo("America/New_York")
+US_CAPABILITY_SNAPSHOT = {
+    "source": "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json",
+    "retrieved": "2026-11-04",
+    "version": "1.2.28",
+    "sha256": "18fdc96fdf632e4869c765ed0cb169049c5310a1c48e10b40e47a71f52aa7a45",
+}
+US_COST_EVIDENCE = {
+    "as_of": "2026-11-04",
+    "status": "unverified_toss_api_fee_scenario",
+    "commission": "0.1% app-disclosed rate assumed for API, no exemption applied",
+    "sec": "Regulatory rate assumed passed through with modeled cent rounding and minimum",
+    "taf": "Zero-rate regulatory scenario for October through December 2026",
+    "settlement": "Simulated sale proceeds available immediately; broker buying power unverified",
+    "fx": "Market-data conversion for reporting only; USD-funded, no simulated currency exchange",
+}
+
+
+def us_date(at: str) -> str:
+    return datetime.fromtimestamp(seconds(at), tz=US_TIMEZONE).date().isoformat()
+
+
+def us_regular_window(calendar: dict, day: str) -> tuple[float, float] | None:
+    try:
+        today = calendar["today"]
+        regular = today["regularMarket"]
+        if today["date"] != day or regular is None:
+            return None
+        start, end = regular["startTime"], regular["endTime"]
+        start_tick, end_tick = seconds(start), seconds(end)
+        if start_tick < end_tick and us_date(start) == us_date(end) == day:
+            return start_tick, end_tick
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return None
 
 
 def rank_candidates(
@@ -88,8 +127,25 @@ def latency_summary(values: list[float]) -> dict[str, float | int]:
 
 
 class Runtime:
-    def __init__(self, capital: float, record: Any, *, candidate_policy: str | None = None) -> None:
-        self.account = AsyncLayeredPaper(capital)
+    def __init__(
+        self,
+        capital: float,
+        record: Any,
+        *,
+        candidate_policy: str | None = None,
+        profile: str = "legacy",
+    ) -> None:
+        if profile not in ("legacy", "broker-constrained"):
+            raise ValueError("Unknown validation profile")
+        self.constrained = profile == "broker-constrained"
+        self.regular_window: tuple[float, float] | None = None
+        if self.constrained and candidate_policy is not None:
+            raise ValueError("The broker-constrained profile runs a single trend baseline")
+        self.account = (
+            AsyncLayeredPaper(capital, policy="trend", fees={"commission_exemption_usd": 0.0})
+            if self.constrained
+            else AsyncLayeredPaper(capital)
+        )
         self.accounts = {"incumbent": self.account}
         if candidate_policy is not None:
             self.accounts["candidate"] = AsyncLayeredPaper(capital, policy=candidate_policy)
@@ -154,6 +210,8 @@ class Runtime:
             or not 0 <= tick - seconds(book["timestamp"]) <= 60
         ):
             return None
+        if self.constrained:
+            return feature
         price = (
             min(float(r["price"]) for r in book["asks"])
             + max(float(r["price"]) for r in book["bids"])
@@ -181,12 +239,24 @@ class Runtime:
             try:
                 if kind == "selection":
                     self.candidates = payload
+                elif kind == "calendar":
+                    day, calendar = payload
+                    self.regular_window = us_regular_window(calendar, day)
                 elif kind == "feature":
                     symbol, rows = payload
+                    if self.constrained:
+                        window = self.regular_window
+                        rows = [
+                            row
+                            for row in rows
+                            if window is not None
+                            and window[0] < seconds(row["timestamp"]) <= window[1]
+                        ]
                     self.features[symbol] = feature_from_bars(
                         self.identifier(symbol),
                         [{**r, "available_at": received} for r in rows],
                         received,
+                        timestamp_is_end=self.constrained,
                     )
                     self.counts[
                         "features_valid" if self.features[symbol] else "features_missing"
@@ -201,13 +271,25 @@ class Runtime:
                     if not 0 <= source_age <= 60:
                         self.counts["invalid_source_age"] += 1
                         continue
+                    at = now() if self.constrained else ""
+                    if self.constrained:
+                        window = self.regular_window
+                        if window is None or not all(
+                            window[0] <= seconds(stamp) < window[1]
+                            for stamp in (book["timestamp"], received, at)
+                        ):
+                            self.counts["outside_regular_session"] += 1
+                            continue
+                        if not book["asks"] or not book["bids"]:
+                            self.counts["missing_book_depth"] += 1
+                            continue
                     old = self.books.get(symbol)
                     if old and seconds(old["timestamp"]) > seconds(book["timestamp"]):
                         self.counts["old_snapshot_ignored"] += 1
                         continue
                     paired = len(self.accounts) > 1
                     if (
-                        paired
+                        (paired or self.constrained)
                         and book.get("currency") == "USD"
                         and book["asks"]
                         and book["bids"]
@@ -225,7 +307,7 @@ class Runtime:
                         continue
                     self.books[symbol] = book
                     f = self.features.get(symbol)
-                    if f is not None:
+                    if f is not None and not self.constrained:
                         price = (
                             min(float(r["price"]) for r in book["asks"])
                             + max(float(r["price"]) for r in book["bids"])
@@ -236,15 +318,19 @@ class Runtime:
                             r5=price / (f.price / (1 + f.r5)) - 1,
                             r15=price / (f.price / (1 + f.r15)) - 1,
                         )
-                    at = now()
+                    if not self.constrained:
+                        at = now()
+                    use_prepared = paired or self.constrained
                     prepared = (
-                        {s: self._feature_at(s, at) for s in self.candidates} if paired else {}
+                        {s: self._feature_at(s, at) for s in self.candidates}
+                        if use_prepared
+                        else {}
                     )
-                    if paired:
+                    if use_prepared:
                         f = self._feature_at(symbol, at)
                     fresh = f is not None and 0 <= seconds(at) - seconds(f.bar_end) <= 90
                     self.counts["fresh_features" if fresh else "unusable_features"] += 1
-                    if fresh and f is not None and assign(f):
+                    if fresh and f is not None and assign(f, self.account.policy):
                         self.counts["signal_observations"] += 1
                     shared = {
                         "id": f"live:{self.counts['book_events']}",
@@ -278,7 +364,7 @@ class Runtime:
                                 self.ids.get(x) not in excluded
                                 and (
                                     candidate_feature := (
-                                        prepared.get(x) if paired else self.features.get(x)
+                                        prepared.get(x) if use_prepared else self.features.get(x)
                                     )
                                 )
                                 is not None
@@ -431,7 +517,12 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
 
 
 async def campaign(
-    output: Path, duration: int, capital: float, *, candidate_policy: str | None = None
+    output: Path,
+    duration: int,
+    capital: float,
+    *,
+    candidate_policy: str | None = None,
+    profile: str = "legacy",
 ) -> None:
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -448,7 +539,7 @@ async def campaign(
         log.write(json.dumps({"at": now(), "kind": kind, **payload}) + "\n")
 
     http_audit: list[dict[str, Any]] = []
-    runtime = Runtime(capital, record, candidate_policy=candidate_policy)
+    runtime = Runtime(capital, record, candidate_policy=candidate_policy, profile=profile)
     stats: dict[str, Any] = {
         "state": "starting",
         "ai_calls": 0,
@@ -485,7 +576,11 @@ async def campaign(
             expected_end_epoch=time.time() + duration,
             universe_count=len(universe),
         )
-        sources = SOURCES if candidate_policy is not None else LEGACY_SOURCES
+        calendar_day = us_date(now()) if runtime.constrained else now()[:10]
+        calendar = await asyncio.to_thread(client.calendar, "US", calendar_day)
+        if runtime.constrained:
+            runtime.publish("calendar", (calendar_day, calendar))
+        sources = SOURCES if candidate_policy is not None or runtime.constrained else LEGACY_SOURCES
         private_json(
             output / "manifest.json",
             {
@@ -493,10 +588,30 @@ async def campaign(
                 "source_sha256": {
                     p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources
                 },
-                "selection": "Absolute change between consecutive fresh minute scans; USD common shares",
+                "selection": (
+                    "Absolute change between consecutive fresh minute scans; USD common shares"
+                ),
                 "universe_count": len(universe),
                 "connection_capacity_symbols": 50,
-                "calendar": await asyncio.to_thread(client.calendar, "US", now()[:10]),
+                "calendar": calendar,
+                **(
+                    {
+                        "profile": profile,
+                        "account": runtime.configurations["incumbent"],
+                        "cost_evidence": US_COST_EVIDENCE,
+                        "session_policy": (
+                            "Provider US regular session, open inclusive, close exclusive"
+                        ),
+                        "market": "US",
+                        "currency": "USD",
+                        "instrument": "Active ordinary common shares",
+                        "quantity_mode": "whole_shares",
+                        "order_model": "Simulated limit with delayed depth confirmation",
+                        "capability_snapshot": US_CAPABILITY_SNAPSHOT,
+                    }
+                    if runtime.constrained
+                    else {}
+                ),
                 "limitations": [
                     "One connection, market-data only; not all symbols continuously watched",
                     "No crash-resume implementation; finite isolated paper account",
@@ -506,11 +621,19 @@ async def campaign(
         )
 
         async def collect() -> None:
+            nonlocal calendar_day
             previous: dict[str, float] = {}
             metadata: dict[str, dict] = {}
             cycle = 0
             while time.monotonic() < deadline:
                 begin = time.monotonic()
+                if runtime.constrained and (day := us_date(now())) != calendar_day:
+                    calendar = await asyncio.to_thread(client.calendar, "US", day)
+                    raw.write(
+                        json.dumps({"kind": "calendar", "date": day, "result": calendar}) + "\n"
+                    )
+                    runtime.publish("calendar", (day, calendar))
+                    calendar_day = day
                 if cycle == 2:
                     before = runtime.counts["book_events"]
                     record("rest_delay_start", seconds=5)
@@ -799,15 +922,19 @@ def main() -> None:
     parser.add_argument("--duration", type=int, default=1200)
     parser.add_argument("--capital", type=float, default=100)
     parser.add_argument("--candidate-policy", choices=("router", *FAMILIES))
+    parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
     args = parser.parse_args()
     if args.duration < 360 or not math.isfinite(args.capital) or args.capital <= 0:
         parser.error("Use duration >= 360 and positive finite capital")
+    if args.profile == "broker-constrained" and args.candidate_policy is not None:
+        parser.error("The broker-constrained profile runs a single trend baseline")
     asyncio.run(
         campaign(
             args.output.resolve(),
             args.duration,
             args.capital,
             candidate_policy=args.candidate_policy,
+            profile=args.profile,
         )
     )
 

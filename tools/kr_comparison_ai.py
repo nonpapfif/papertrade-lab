@@ -77,6 +77,105 @@ decimal string without an exponent. A new observed crossing can trigger another 
 Return only the approval envelope. Do not use tools, change quantities or actions, or place orders.
 """
 
+CONSTRAINED_REVIEW = {
+    "history": (
+        "Accepted last-trade samples through the signal observation, oldest first. "
+        "Source time is when the trade was reported and observed_at is when the runner saw it. "
+        "Samples may be irregular and omit intervening trades. They provide no OHLCV, "
+        "bid/ask, or depth evidence."
+    ),
+    "strength": (
+        "Absolute latest percentage move divided by the mean absolute percentage move "
+        "of up to 12 earlier accepted sample-to-sample moves, including zero moves. "
+        "The latest move is excluded from that mean. A zero denominator gives zero strength. "
+        "Strength is a relative movement measure, not a direction or confidence score."
+    ),
+    "modeled_break_even": (
+        "For the stated unrounded cost model, the minimum sale price / entry price "
+        "is (1 + commission_rate) / (1 - commission_rate - stock_sale_tax_rate). "
+        "Spread and slippage are unknown from these samples."
+    ),
+    "criteria": [
+        (
+            "Confirm the action against the sampled path, trigger, instrument eligibility, "
+            "regular continuous session and whole-share execution mode. A direction_change "
+            "means a new signal direction; the first directional signal needs no prior reversal. "
+            "For a watch_crossing, verify the sampled move crosses watch_price_krw."
+        ),
+        (
+            "For BUY, require evidence in the sampled path beyond an isolated move, enough "
+            "available cash within the allocation budget for at least one share including entry "
+            "commission, and an observed movement opportunity that plausibly clears the modeled "
+            "round-trip commission and sell tax. Use the fee-inclusive account and reservations "
+            "in portfolio. Explain the evidence or give the specific reason to hold."
+        ),
+        (
+            "For SELL, require an existing position and sampled evidence supporting the frozen "
+            "directional strategy's exit. A modeled loss is not by itself a reason to hold an exit."
+        ),
+        (
+            "Treat costs and affordability at sampled prices as indicative. Do not assume "
+            "executable spreads, liquidity, or future prices. Hold when evidence is insufficient. "
+            "Defer only when a second opinion could resolve an interpretation of supplied evidence."
+        ),
+    ],
+}
+
+
+def review_payload(
+    comparison: Comparison,
+    signals: list[dict[str, Any]],
+    observed_at: datetime,
+) -> dict[str, Any]:
+    account = comparison.accounts["ai"]
+    portfolio = account.summary(comparison.prices)
+    payload = {
+        "signals": signals,
+        "currency": "KRW",
+        "observed_at": observed_at,
+        "portfolio": portfolio,
+    }
+    if account.allocation is not None:
+        payload["allocation_fraction"] = str(account.allocation)
+    if not any(signal.get("execution_profile") == "broker-constrained" for signal in signals):
+        return payload
+
+    account_ready = (
+        portfolio.get("quantity_policy") == "whole_shares"
+        and {
+            "reserved_cash_krw",
+            "available_cash_krw",
+            "commission_rate",
+            "stock_sale_tax_rate",
+            "cost_assumptions",
+            "execution_model",
+        }
+        <= portfolio.keys()
+    )
+    unavailable = {}
+    ready = []
+    for item in signals:
+        if not account_ready:
+            reason = "missing_constrained_account_context"
+        elif (
+            item.get("eligibility") != "verified_ordinary_common_stock"
+            or item.get("session") != "regular_continuous"
+            or not item.get("strategy")
+        ):
+            reason = "missing_signal_eligibility_session_or_strategy"
+        elif len(item.get("price_history", ())) < 3 or "strength" not in item:
+            reason = "insufficient_sampled_price_path"
+        else:
+            ready.append(item)
+            continue
+        unavailable[item["symbol"]] = reason
+    return {
+        **payload,
+        "signals": ready,
+        "review_contract": CONSTRAINED_REVIEW,
+        "unavailable_context": unavailable,
+    }
+
 
 async def decide(
     settings: Settings,
@@ -100,6 +199,13 @@ async def decide(
 
     response_schema = APPROVAL_SCHEMA
     instructions = INSTRUCTIONS
+    if "review_contract" in payload:
+        instructions += (
+            "\nApply the supplied review_contract. Explain each approval using specific "
+            "observations and the applicable criteria. The frozen strategy is responsible "
+            "for positions; your dispositions are proposals subject to execution checks. "
+            "Only review symbols in signals."
+        )
     if deferred is not None:
         response_schema = {
             **APPROVAL_SCHEMA,
@@ -300,14 +406,12 @@ async def review_cascade(
     decide_signal: Callable[..., Awaitable[tuple[dict[str, str], dict[str, Decimal]]]] = decide,
 ) -> None:
     account = comparison.accounts["ai"]
-    payload = {
-        "signals": signals,
-        "currency": "KRW",
-        "observed_at": datetime.now(UTC),
-        "portfolio": account.summary(comparison.prices),
-    }
-    if account.allocation is not None:
-        payload["allocation_fraction"] = str(account.allocation)
+    payload = review_payload(comparison, signals, datetime.now(UTC))
+    if unavailable := payload.get("unavailable_context"):
+        record("ai_context_unavailable", symbols=unavailable)
+    signals = payload["signals"]
+    if not signals:
+        return
     deferred: dict[str, str] = {}
     holds: dict[str, str] = {}
     model = SOL
@@ -341,6 +445,10 @@ async def review_cascade(
             and comparison.ai_latest.get(signal["symbol"]) == signal
             and account.wants(signal)
         ]
+        escalation = review_payload(comparison, remaining, datetime.now(UTC))
+        if unavailable := escalation.get("unavailable_context"):
+            record("ai_context_unavailable", symbols=unavailable)
+        remaining = escalation["signals"]
         selected = {signal["symbol"] for signal in remaining}
         if not selected or datetime.now(UTC) >= until:
             if deferred:
@@ -364,12 +472,6 @@ async def review_cascade(
         parent_review_id = review_id
         review_id = sum(calls.values())
         holds = {}
-        escalation = {
-            **payload,
-            "signals": remaining,
-            "observed_at": datetime.now(UTC),
-            "portfolio": account.summary(comparison.prices),
-        }
         record(
             "ai_review",
             review_id=review_id,
