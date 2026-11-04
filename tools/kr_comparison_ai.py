@@ -21,7 +21,7 @@ from papertrade.ai import (
 )
 from papertrade.core import SafetyError, Settings, decimal, encode
 
-APPROVAL_SCHEMA = {
+APPROVAL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["approvals", "watches"],
@@ -57,7 +57,11 @@ Return only the approval envelope. Do not use tools, change quantities or action
 
 
 async def decide(
-    settings: Settings, payload: dict[str, Any]
+    settings: Settings,
+    payload: dict[str, Any],
+    *,
+    model: str = "gpt-6-astra",
+    deferred: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, Decimal]]:
     """Return approved signals and optional price watches for declined signals."""
     symbols = {item["symbol"] for item in payload["signals"]}
@@ -71,10 +75,27 @@ async def decide(
     if not binary.is_file() or not sandbox.is_file():
         raise SafetyError("Codex and macOS sandbox-exec are required for isolated reviews")
 
+    response_schema = APPROVAL_SCHEMA
+    instructions = INSTRUCTIONS
+    if deferred is not None:
+        response_schema = {
+            **APPROVAL_SCHEMA,
+            "required": [*APPROVAL_SCHEMA["required"], "deferred"],
+            "properties": {
+                **APPROVAL_SCHEMA["properties"],
+                "deferred": APPROVAL_SCHEMA["properties"]["approvals"],
+            },
+        }
+        instructions += (
+            "\nUse deferred for a concrete unresolved case worth a second opinion. "
+            "Give its reason. Use omission to hold when no action is warranted. "
+            "Approvals, watches, and deferred symbols must be disjoint."
+        )
+
     with tempfile.TemporaryDirectory(prefix="papertrade-kr-ai-") as temporary:
         working = Path(temporary)
         schema = working / "approval.schema.json"
-        schema.write_text(encode(APPROVAL_SCHEMA))
+        schema.write_text(encode(response_schema))
         command = [
             str(sandbox),
             "-p",
@@ -89,7 +110,7 @@ async def decide(
             "--cd",
             str(working),
             "--model",
-            "gpt-6-astra",
+            model,
             "--output-schema",
             str(schema),
             "--json",
@@ -118,7 +139,7 @@ async def decide(
         )
         try:
             process = await asyncio.shield(launch)
-            stdout, _ = await process.communicate((INSTRUCTIONS + "\n" + encode(payload)).encode())
+            stdout, _ = await process.communicate((instructions + "\n" + encode(payload)).encode())
         except asyncio.CancelledError:
             process = await launch
             if process.returncode is None:
@@ -138,7 +159,7 @@ async def decide(
         response = json.loads(final)
     except json.JSONDecodeError:
         raise SafetyError("Invalid AI approval JSON") from None
-    if not isinstance(response, dict) or set(response) != {"approvals", "watches"}:
+    if not isinstance(response, dict) or set(response) != set(response_schema["required"]):
         raise SafetyError("Invalid AI approval envelope")
     approvals = response["approvals"]
     if not isinstance(approvals, list):
@@ -178,4 +199,25 @@ async def decide(
         if level <= 0:
             raise SafetyError("AI price watch must be positive")
         watch_prices[symbol] = level
+    if deferred is not None:
+        pending = response["deferred"]
+        if not isinstance(pending, list):
+            raise SafetyError("Invalid deferred review list")
+        validated: dict[str, str] = {}
+        for item in pending:
+            if not isinstance(item, dict) or set(item) != {"symbol", "reason"}:
+                raise SafetyError("Invalid deferred review fields")
+            symbol, reason = item["symbol"], item["reason"]
+            if (
+                not isinstance(symbol, str)
+                or symbol not in symbols
+                or symbol in result
+                or symbol in watch_prices
+                or symbol in validated
+                or not isinstance(reason, str)
+                or not reason.strip()
+            ):
+                raise SafetyError("Invalid or overlapping deferred review")
+            validated[symbol] = reason.strip()
+        deferred.update(validated)
     return result, watch_prices

@@ -18,3 +18,12 @@ account results under the run output. The supervisor reviews the result through 
 necessary offline implementation to Sol. At the cutoff, unfilled requests and open positions
 remain visible. An unfinished AI request is cancelled. The supervisor requires at least one
 completed live AI review to accept the Korean milestone.
+
+## Parallel Sol-first account
+
+Run `python -m tools.run_kr_sol_astra --market INPUT --output OUTPUT --until TIMESTAMP`
+beside a running Korean comparison. It reads newly published snapshots from the comparison's
+market JSONL file and starts a separate 100,000 KRW virtual account. Sol medium handles each
+batch. Astra medium receives only signals explicitly deferred by Sol that remain actionable.
+Snapshot processing and fills continue while either model is in flight. The original run
+continues to use its existing policy, and the separate account has a later observation start.
