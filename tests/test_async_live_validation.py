@@ -298,6 +298,24 @@ class ComparisonTests(RuntimeTests):
         self.assertFalse(r.status()["comparison"]["configuration_unchanged"])
 
     @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
+    async def test_configuration_failure_saves_an_incomplete_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with (
+                patch(
+                    "tools.run_async_live_validation.Settings.load",
+                    side_effect=ValueError("fixture"),
+                ),
+                self.assertRaisesRegex(SystemExit, "Live validation failed"),
+            ):
+                await campaign(output, 360, 100, candidate_policy="trend")
+            status = json.loads((output / "status.json").read_text())
+            result = json.loads((output / "comparison.json").read_text())
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(result["state"], "failed")
+            self.assertFalse(result["complete"])
+
+    @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
     async def test_campaign_setup_failure_saves_an_incomplete_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "run"

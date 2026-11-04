@@ -418,16 +418,7 @@ async def campaign(
     def record(kind: str, **payload: Any) -> None:
         log.write(json.dumps({"at": now(), "kind": kind, **payload}) + "\n")
 
-    settings = Settings.load(ROOT)
-    data = copy.deepcopy(settings.data)
-    data["limits"]["minimum_request_interval"] = 0.08
-    client = CachedTokenClient(Settings(ROOT, data))
     http_audit: list[dict[str, Any]] = []
-    feed = LiveFeed(
-        client.settings,
-        lambda kind, payload: http_audit.append(payload) if kind == "http" else None,
-        client=client,
-    )
     runtime = Runtime(capital, record, candidate_policy=candidate_policy)
     stats: dict[str, Any] = {
         "state": "starting",
@@ -444,6 +435,15 @@ async def campaign(
     token = ""
     resync = asyncio.Event()
     try:
+        settings = Settings.load(ROOT)
+        data = copy.deepcopy(settings.data)
+        data["limits"]["minimum_request_interval"] = 0.08
+        client = CachedTokenClient(Settings(ROOT, data))
+        feed = LiveFeed(
+            client.settings,
+            lambda kind, payload: http_audit.append(payload) if kind == "http" else None,
+            client=client,
+        )
         token = client.access_token()
         spec = await asyncio.to_thread(read_spec)
         (output / "asyncapi.json").write_bytes(spec)
