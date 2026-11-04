@@ -28,6 +28,10 @@ by technical success. If all meaningful work is complete, the supervisor records
 If external state prevents progress, it records `blocked`, preserving the exact phase and logs.
 It does not burn tokens rechecking the same failure indefinitely. Recovery platforms, exact
 replay, optimization, promotion and KR rollout remain deferred. Do not add tasks to stay busy.
+Luna's `blocked` plan is a proposal: Python records it and requests a fresh Astra review,
+preserving the worktree and failed-test evidence. Only Astra can confirm an external blocker.
+Failed assertions and repairable code remain offline fix work. Repeated unchanged plans and
+mechanical orchestration failures retain their existing fail-closed behavior.
 
 Only fictional ledgers are permitted. No real broker account or order endpoints are allowed.
 The monthly collector stays paused. Existing ledgers and losses remain intact. The layered
@@ -74,6 +78,8 @@ when inspecting results here. An interrupted external GitHub mutation blocks for
 instead of blindly creating or merging a second PR.
 Publication runs the installed GitHub workflow's staged-language guard before committing.
 Branches use the `codex/` prefix.
+PR bodies use the English requirement, changed file paths and test/review status. Localized
+model response prose stays in the private audit rather than being copied into GitHub content.
 
 ## Durable state and operation
 

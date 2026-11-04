@@ -40,6 +40,16 @@ producer must call `advance(receipt_time)` on its health timer even if no symbol
 drains queues and stops workers; it neither liquidates holdings nor pretends pending requests filled.
 Pending reservations remain visible at recording end. Intent and outcome logs are included in results.
 
+Layered summaries include `positions_as_of` and a `positions` mapping keyed by symbol ID.
+Each remaining holding records its strategy, quantity, entry price, entry cost, remaining entry
+fees, mark price and source time, mark age in seconds, market value, and unrealized P&L.
+`entry_cost_usd` excludes fees. Fees are already expensed in account realized P&L;
+`remaining_entry_fees_usd` is attribution evidence and must not be deducted again.
+Position market values plus cash reconcile to mark equity. Position unrealized P&L sums to
+account unrealized P&L. Partial sales report only the remaining quantity and entry cost.
+Async marks use the observed book midpoint, including old marks with their original source
+times and current ages. They do not imply liquidation or a fresh executable quote.
+
 ## Validation
 
 `tests/test_async_layered_paper.py` covers delayed-symbol independence, concurrent reservation,

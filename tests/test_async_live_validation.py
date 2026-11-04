@@ -297,6 +297,54 @@ class ComparisonTests(RuntimeTests):
         r.accounts["candidate"].policy = "rebound"
         self.assertFalse(r.status()["comparison"]["configuration_unchanged"])
 
+    async def test_saved_comparison_preserves_each_accounts_partial_position_and_stale_mark(
+        self,
+    ) -> None:
+        r = self.runtime
+        r.features["A"] = self.feature("A", prior_high=9.5, r15=0.2)
+        await self.publish_at(0, "selection", ["A"])
+        for offset, price, volume in ((0, 10, 100), (2, 10, 100), (3, 9.3, 100), (5, 9.3, 1)):
+            book = self.book(self.at + timedelta(seconds=offset), price)
+            book["bids"][0]["volume"] = str(volume)
+            await self.publish_at(offset, "book", ("A", book))
+        await self.publish_at(66, "clock", None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            write_comparison(output, {"state": "failed"}, r)
+            saved = json.loads((output / "comparison.json").read_text())
+        self.assertFalse(saved["complete"])
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["symbol_ids"], {"A": 0})
+        self.assertTrue(saved["inputs_aligned"])
+        for name, quantity, realized, equity in (
+            ("incumbent", 8, -0.81, 93.55),
+            ("candidate", 9, -0.09, 93.565),
+        ):
+            paper = saved["accounts"][name]["paper"]
+            position = paper["positions"]["0"]
+            self.assertEqual(position["quantity"], quantity)
+            self.assertEqual(position["strategy"], "breakout" if name == "incumbent" else "trend")
+            self.assertEqual(position["entry_price"], 10)
+            self.assertEqual(position["entry_cost_usd"], quantity * 10)
+            self.assertAlmostEqual(position["remaining_entry_fees_usd"], quantity * 0.01)
+            self.assertAlmostEqual(position["mark_price"], 9.295)
+            self.assertEqual(position["mark_at"], (self.at + timedelta(seconds=5)).isoformat())
+            self.assertEqual(position["mark_age_seconds"], 61)
+            self.assertEqual(paper["positions_as_of"], (self.at + timedelta(seconds=66)).isoformat())
+            account = paper["account"]
+            self.assertEqual(account["mark_basis"], "book_midpoint_not_liquidated")
+            self.assertEqual(account["stale_open_positions"], 1)
+            self.assertAlmostEqual(account["realized"], realized)
+            self.assertAlmostEqual(account["equity"], equity)
+            self.assertAlmostEqual(account["unrealized"], position["unrealized_usd"])
+            self.assertAlmostEqual(
+                account["equity"], account["cash"] + position["market_value_usd"]
+            )
+            self.assertAlmostEqual(
+                account["equity"], 100 + account["realized"] + position["unrealized_usd"]
+            )
+
     @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
     async def test_configuration_failure_saves_an_incomplete_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

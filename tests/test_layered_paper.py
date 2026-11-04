@@ -120,9 +120,25 @@ class LayerTests(unittest.TestCase):
         self.assertEqual(a.book.positions[0].quantity, qty - 1)
         self.assertIn(0, a.owners)
         self.assertAlmostEqual(sum(a.realized_by_strategy.values()), a.book.realized)
+        summary = a.summary()
+        position = summary["positions"]["0"]
+        self.assertEqual(position["quantity"], qty - 1)
+        self.assertEqual(position["entry_price"], 10)
+        self.assertEqual(position["entry_cost_usd"], (qty - 1) * 10)
+        self.assertEqual(position["mark_price"], 9)
+        self.assertEqual(position["mark_at"], frame(1)["at"])
+        self.assertEqual(position["mark_age_seconds"], 0)
+        self.assertAlmostEqual(position["remaining_entry_fees_usd"], (qty - 1) * 0.01)
+        self.assertAlmostEqual(position["unrealized_usd"], -(qty - 1))
+        self.assertAlmostEqual(
+            summary["account"]["cash"] + position["market_value_usd"],
+            summary["account"]["equity"],
+        )
         a.step("c", frame(2, 9, 100), {0: replace(feature(2), price=9, r5=-0.1)}, {0})
         self.assertNotIn(0, a.owners)
         self.assertNotIn(0, a.book.positions)
+        self.assertEqual(a.summary()["positions"], {})
+        self.assertEqual(position["quantity"], qty - 1)
 
     def test_cannot_afford_one_share_is_zero_not_debt(self) -> None:
         a = LayeredPaper(5)

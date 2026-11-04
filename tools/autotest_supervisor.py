@@ -365,6 +365,8 @@ Return the full set of requirements still satisfied, not merely newly completed 
 Only mark satisfied with actual evidence; invalidate earlier claims affected by code changes.
 For initial live evidence assess its actual scope, then continue with missing requirements.
 Use fix for actionable defects. Use blocked only when no independent offline work can proceed.
+A blocked plan is a proposal, not a confirmed blocker. Verify its concrete external cause.
+Failed tests and repairable code are fix work, not external blockers.
 publish_ok requires tested changes with no actionable correctness findings; failures block merge.
 complete requires all requirements satisfied, with residual real-market limits documented.
 Propose the single most useful next objective. Do not invent work merely to stay busy.
@@ -372,6 +374,10 @@ Propose the single most useful next objective. Do not invent work merely to stay
             "plan": """Read evidence.json and Astra's review. Choose the next useful task.
 Do not override Astra's findings. Prefer offline work using existing recorded data.
 Offline means a Sol worker will implement tests/fixes and an optional experiment script.
+Choose offline for a failed assertion or repairable defect identified by Astra.
+Do not choose blocked merely because tests failed or your role cannot publish changes.
+Python handles publication after passing tests and Astra approval; you do not publish yourself.
+Blocked requires a concrete external prerequisite preventing all useful in-scope work.
 Live means the existing trusted paired live adapter will run, without source changes.
 Live runs need a concrete coverage gap, not a repeat of an unchanged successful test.
 Keep tasks bounded by acceptance criteria, not by token or arbitrary iteration limits.
@@ -497,7 +503,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
     def prepare(self) -> None:
         plan = self.state["plan"]
         if plan["kind"] == "blocked":
-            self.transition("blocked", reason=plan["objective"])
+            self.transition("review", cycle=self.state["cycle"] + 1)
             return
         cycle = self.state["cycle"] + 1
         if (
@@ -682,15 +688,17 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         command(["git", "push", "-u", "origin", self.state["branch"]], self.worktree)
         body = self.output / f"cycle-{self.state['cycle']:04d}" / "pr-body.md"
         body.write_text(
-            self.state["worker"]["summary"] + "\n\nValidation: layered regression suite "
-            "passed. "
+            REQUIREMENTS[self.state["plan"]["requirement"]]
+            + "\n\nChanged files:\n"
+            + "\n".join("- " + path for path in paths)
+            + "\n\nValidation: layered regression suite passed. "
             + (
                 "The recorded offline experiment also passed. "
                 if self.state["worker"]["experiment"]
                 else "No separate offline experiment was run. "
             )
             + "Astra reviewed this "
-            "source and evidence before publication.\n\n" + self.state["review"]["summary"]
+            "source and evidence before publication.\n"
         )
         url = command(
             [

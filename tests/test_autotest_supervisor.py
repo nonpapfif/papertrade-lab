@@ -242,6 +242,37 @@ class AutotestSupervisorTests(unittest.TestCase):
         self.launch.assert_not_called()
         self.assertEqual(self.runner.state["phase"], "live_wait")
 
+    def test_planner_block_proposal_requires_review_without_discarding_failed_work(self) -> None:
+        self.runner.transition(
+            "prepare",
+            cycle=1,
+            worktree=str(self.repo),
+            branch="codex/preserved-fix",
+            plan=self.plan(kind="blocked", objective="Correct the failed assertion"),
+            review=self.review(decision="fix"),
+            tested_digest="A",
+            tests_passed=False,
+            test_jobs=[{"returncode": 1}],
+        )
+        self.runner.step()
+        self.assertEqual(self.runner.state["phase"], "review")
+        self.assertEqual(self.runner.state["cycle"], 2)
+        self.assertEqual(self.runner.state["branch"], "codex/preserved-fix")
+        self.assertEqual(self.runner.state["test_jobs"], [{"returncode": 1}])
+        self.assertEqual(self.runner.state["tested_digest"], "A")
+        with patch.object(self.runner, "invoke") as invoke:
+            self.runner.step()
+            invoke.assert_called_once_with("review")
+        self.launch.assert_not_called()
+        self.command.assert_not_called()
+
+    def test_reviewer_confirmed_external_blocker_stops(self) -> None:
+        self.completed_review(self.review(decision="blocked", summary="Credentials unavailable"))
+        with patch.object(supervisor, "poll_job", return_value={"returncode": 0}):
+            self.runner.finish_model()
+        self.assertEqual(self.runner.state["phase"], "blocked")
+        self.assertEqual(self.runner.state["reason"], "Credentials unavailable")
+
     def test_failed_checks_cannot_be_overridden_by_astra(self) -> None:
         self.completed_review(self.review(publish_ok=True), worktree=str(self.repo))
         self.runner.state["tests_passed"] = False
@@ -379,6 +410,37 @@ class AutotestSupervisorTests(unittest.TestCase):
         commands = [call.args[0] for call in self.command.call_args_list]
         self.assertFalse(any(argv[:2] == ["git", "commit"] for argv in commands))
         self.assertFalse(any(argv[0] == "gh" for argv in commands))
+
+    def test_publication_uses_requirement_and_paths_without_copying_model_prose(self) -> None:
+        self.runner.state.update(
+            publication_digest="A",
+            tested_digest="A",
+            base="base-sha",
+            branch="codex/verified-fix",
+            plan=self.plan(),
+            worker={"summary": "worker-private-prose", "experiment": ""},
+            review=self.review(summary="review-private-prose"),
+        )
+        cycle = self.runner.output / "cycle-0000"
+        cycle.mkdir()
+
+        def run(argv: list[str], cwd: Path) -> str:
+            if argv[:2] == ["git", "ls-files"]:
+                return "tools/task.py"
+            if argv[:2] == ["git", "rev-parse"]:
+                return "base-sha"
+            if argv[:3] == ["gh", "pr", "create"]:
+                return "https://github.com/nonpapfif/papertrade-lab/pull/1"
+            return ""
+
+        self.command.side_effect = run
+        self.runner.publish()
+        body = (cycle / "pr-body.md").read_text()
+        self.assertIn(supervisor.REQUIREMENTS["shared_input"], body)
+        self.assertIn("tools/task.py", body)
+        self.assertIn("No separate offline experiment was run", body)
+        self.assertNotIn("private-prose", body)
+        self.assertEqual(self.runner.state["phase"], "pr_wait")
 
     def test_incomplete_requirements_cannot_be_marked_complete(self) -> None:
         self.completed_review(self.review(decision="complete", satisfied=["shared_input"]))
