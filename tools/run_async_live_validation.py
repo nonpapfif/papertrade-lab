@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import time
 from collections import Counter
 from contextlib import ExitStack
@@ -33,6 +34,7 @@ from tools.probe_toss_websocket import (
     now,
     read_spec,
 )
+from tools.us_adaptive_ai import ASTRA, ENTRY_OPTIONS, SOL, propose
 
 LEGACY_SOURCES = (
     "tools/run_async_live_validation.py",
@@ -50,6 +52,12 @@ SOURCES = (
     "tools/week_hypotheses.py",
 )
 
+ADAPTIVE_SOURCES = (
+    *SOURCES,
+    "tools/us_adaptive_ai.py",
+    "tools/kr_comparison_ai.py",
+    "papertrade/ai.py",
+)
 
 US_TIMEZONE = ZoneInfo("America/New_York")
 US_CAPABILITY_SNAPSHOT = {
@@ -126,6 +134,23 @@ def latency_summary(values: list[float]) -> dict[str, float | int]:
     }
 
 
+class CampaignCutoff(Exception):
+    """The absolute adaptive deadline prevented another REST request."""
+
+
+class DeadlineMarketClient(CachedTokenClient):
+    def __init__(self, settings: Settings, end_epoch: float) -> None:
+        super().__init__(settings)
+        self.end_epoch = end_epoch
+
+    def _reserve(self, group: str) -> None:
+        if time.time() >= self.end_epoch:
+            raise CampaignCutoff
+        super()._reserve(group)
+        if time.time() >= self.end_epoch:
+            raise CampaignCutoff
+
+
 class Runtime:
     def __init__(
         self,
@@ -134,10 +159,23 @@ class Runtime:
         *,
         candidate_policy: str | None = None,
         profile: str = "legacy",
+        adaptive: bool = False,
+        end_epoch: float | None = None,
     ) -> None:
         if profile not in ("legacy", "broker-constrained"):
             raise ValueError("Unknown validation profile")
         self.constrained = profile == "broker-constrained"
+        self.adaptive = adaptive
+        if adaptive and (not self.constrained or candidate_policy is not None or end_epoch is None):
+            raise ValueError("Adaptive experiment requires a constrained profile and fixed end")
+        self.end_epoch = end_epoch
+        self.review_settings: Settings | None = None
+        self.review_task: asyncio.Task | None = None
+        self.review_calls: Counter = Counter()
+        self.active_opportunities: set[tuple[str, str]] = set()
+        self.new_opportunities: list[dict[str, Any]] = []
+        self.reviewed_fills = dict.fromkeys(("incumbent", "candidate"), 0)
+        self.policy_history: list[dict[str, Any]] = []
         self.regular_window: tuple[float, float] | None = None
         if self.constrained and candidate_policy is not None:
             raise ValueError("The broker-constrained profile runs a single trend baseline")
@@ -147,7 +185,11 @@ class Runtime:
             else AsyncLayeredPaper(capital)
         )
         self.accounts = {"incumbent": self.account}
-        if candidate_policy is not None:
+        if adaptive:
+            self.accounts["candidate"] = AsyncLayeredPaper(
+                capital, policy="trend", fees={"commission_exemption_usd": 0.0}
+            )
+        elif candidate_policy is not None:
             self.accounts["candidate"] = AsyncLayeredPaper(capital, policy=candidate_policy)
         self.configurations = {
             name: {
@@ -228,8 +270,178 @@ class Runtime:
         self.delivery_hashes[name].update(observation)
 
     async def close(self) -> None:
+        if self.review_task is not None:
+            self.review_task.cancel()
+            await asyncio.gather(self.review_task, return_exceptions=True)
+            self.review_task = None
         for account in self.accounts.values():
             await account.close()
+
+    def _entry_configuration(self) -> dict[str, str]:
+        account = self.accounts["candidate"]
+        return {key: getattr(account, key) for key in ENTRY_OPTIONS}
+
+    def _consider_review(self, sequence: int, at: str, prepared: dict[str, Feature | None]) -> None:
+        if (
+            self.review_settings is None
+            or self.end_epoch is None
+            or seconds(at) >= self.end_epoch
+        ):
+            return
+        candidate = self.accounts["candidate"]
+        excluded = set(candidate.pending) | set(candidate.book.positions)
+        observed = {
+            symbol: feature
+            for symbol, feature in prepared.items()
+            if feature is not None and symbol in self.desired
+        }
+        for symbol, feature in observed.items():
+            for family in ENTRY_OPTIONS["policy"]:
+                key = (symbol, family)
+                if assign(feature, family) is None:
+                    self.active_opportunities.discard(key)
+                elif key not in self.active_opportunities:
+                    self.active_opportunities.add(key)
+                    self.new_opportunities.append(
+                        {
+                            "symbol": symbol,
+                            "family": family,
+                            "observed_at": at,
+                            "feature": asdict(feature),
+                        }
+                    )
+        if self.review_task is not None:
+            return
+        trades = {
+            name: copy.deepcopy(account.book.trades[self.reviewed_fills[name] :])
+            for name, account in self.accounts.items()
+        }
+        if not self.new_opportunities and not any(trades.values()):
+            return
+        opportunities, self.new_opportunities = self.new_opportunities, []
+        for name, fills in trades.items():
+            self.reviewed_fills[name] += len(fills)
+        payload = {
+            "evidence_sequence": sequence,
+            "evidence_at": at,
+            "base_version": candidate.entry_policy_version,
+            "current": self._entry_configuration(),
+            "new_rule_opportunities": opportunities,
+            "completed_bar_features": {
+                symbol: {
+                    **asdict(feature),
+                    "unowned_and_unreserved": feature.symbol not in excluded,
+                }
+                for symbol, feature in observed.items()
+            },
+            "orderbooks": {symbol: self.books[symbol] for symbol in observed},
+            "accounts": {
+                name: {
+                    "cash_usd": account.book.cash,
+                    "reserved_cash_usd": account.reserved_cash,
+                    "realized_usd": account.book.realized,
+                    "new_fills": trades[name],
+                    "positions": {
+                        symbol: {
+                            "quantity": position.quantity,
+                            "entry_price_usd": position.entry,
+                            "last_mark_usd": account.prices[symbol],
+                            "mark_at": account.times[symbol],
+                            "entry_fee_usd": account.book.entry_fees[symbol],
+                            "strategy": account.owners[symbol][0],
+                            "policy_version": account.owner_policy_versions[symbol],
+                        }
+                        for symbol, position in account.book.positions.items()
+                    },
+                    "pending": [
+                        {
+                            "symbol_id": intent.symbol,
+                            "side": intent.side,
+                            "quantity": intent.quantity,
+                            "limit_usd": intent.limit,
+                            "decision_at": intent.decision_at,
+                            "policy_version": intent.policy_version,
+                        }
+                        for intent in account.pending.values()
+                    ],
+                }
+                for name, account in self.accounts.items()
+            },
+            "symbol_ids": self.ids.copy(),
+            "cost_scenario": candidate.context.schedule.copy(),
+        }
+        self.review_task = asyncio.create_task(self._review(self.review_settings, payload))
+
+    async def _review(self, settings: Settings, payload: dict[str, Any]) -> None:
+        model = SOL
+        try:
+            while True:
+                self.review_calls[model] += 1
+                review_id = sum(self.review_calls.values())
+                self.record(
+                    "ai_review", review_id=review_id, model=model, effort="medium", **payload
+                )
+                response = await propose(settings, payload, model)
+                after_cutoff = self.end_epoch is None or time.time() >= self.end_epoch
+                self.record(
+                    "ai_decision",
+                    review_id=review_id,
+                    model=model,
+                    response=response,
+                    after_cutoff=after_cutoff,
+                )
+                if after_cutoff:
+                    break
+                if response["action"] != "defer":
+                    self.publish("policy_review", (review_id, payload["base_version"], response))
+                    return
+                payload = {**payload, "sol_question": response["reason"]}
+                model = ASTRA
+        except (SafetyError, OSError) as error:
+            self.record(
+                "ai_review_failed",
+                model=model,
+                error=type(error).__name__,
+                **({"reason": str(error)} if isinstance(error, SafetyError) else {}),
+            )
+        except asyncio.CancelledError:
+            self.record("ai_review_cancelled", model=model)
+            raise
+        self.publish("policy_review", None)
+
+    def _apply_review(self, sequence: int, received: str, result: Any) -> None:
+        self.review_task = None
+        if result is None:
+            return
+        review_id, base_version, response = result
+        candidate = self.accounts["candidate"]
+        at = now()
+        if (
+            self.end_epoch is None
+            or seconds(at) >= self.end_epoch
+            or self.regular_window is None
+            or not self.regular_window[0] <= seconds(at) < self.regular_window[1]
+            or candidate.entry_policy_version != base_version
+        ):
+            self.record("ai_application_skipped", review_id=review_id, reason="cutoff_or_stale")
+            return
+        if response["action"] != "change":
+            return
+        config = {key: response[key] for key in ENTRY_OPTIONS}
+        for key, value in config.items():
+            setattr(candidate, key, value)
+        candidate.entry_policy_version += 1
+        applied = {
+            "sequence": sequence,
+            "published_at": received,
+            "applied_at": at,
+            "review_id": review_id,
+            "version": candidate.entry_policy_version,
+            "configuration": config,
+            "reason": response["reason"],
+        }
+        self.policy_history.append(applied)
+        self.record("ai_policy_applied", **applied)
 
     async def consume(self) -> None:
         while True:
@@ -266,9 +478,10 @@ class Runtime:
                         rate = float(payload["midRate"])
                     except (KeyError, TypeError, ValueError):
                         rate = 0
-                    pair_matches = payload.get("baseCurrency", "USD") == "USD" and payload.get(
-                        "quoteCurrency", "KRW"
-                    ) == "KRW"
+                    pair_matches = (
+                        payload.get("baseCurrency", "USD") == "USD"
+                        and payload.get("quoteCurrency", "KRW") == "KRW"
+                    )
                     if not math.isfinite(rate) or rate <= 0 or not pair_matches:
                         self.counts["invalid_fx"] += 1
                         rate = 0
@@ -278,6 +491,8 @@ class Runtime:
                         payload.get("validFrom"),
                         payload.get("validUntil"),
                     )
+                elif kind == "policy_review":
+                    self._apply_review(sequence, received, payload)
                 elif kind == "book":
                     symbol, book = payload
                     self.symbol_delays.setdefault(symbol, []).append(started - queued)
@@ -296,6 +511,13 @@ class Runtime:
                         self.counts["invalid_source_age"] += 1
                         continue
                     at = now() if self.constrained else ""
+                    if (
+                        self.adaptive
+                        and self.end_epoch is not None
+                        and seconds(at) >= self.end_epoch
+                    ):
+                        self.counts["after_experiment_cutoff"] += 1
+                        continue
                     if self.constrained:
                         window = self.regular_window
                         if window is None or not all(
@@ -362,7 +584,8 @@ class Runtime:
                         "received_at": at,
                         "book": book,
                         "feature": f,
-                        "eligible": symbol in self.candidates,
+                        "eligible": symbol in self.candidates
+                        and (not self.adaptive or symbol in self.desired),
                         "fx": self.fx[0],
                         "fx_at": self.fx[1],
                         "fx_valid_from": self.fx[2],
@@ -397,6 +620,17 @@ class Runtime:
                                 is not None
                                 and 0 <= seconds(at) - seconds(candidate_feature.bar_end) <= 90
                                 and assign(candidate_feature, account.policy) is not None
+                                and (
+                                    not self.adaptive
+                                    or (
+                                        x in self.desired
+                                        and (
+                                            account.selection != "active"
+                                            or abs(candidate_feature.r5) >= 0.001
+                                            or abs(candidate_feature.r15) >= 0.003
+                                        )
+                                    )
+                                )
                                 for x in self.candidates
                             ),
                         )
@@ -412,10 +646,22 @@ class Runtime:
                                 side=i.side,
                                 decision_at=i.decision_at,
                                 reserved=i.reserved,
+                                **(
+                                    {
+                                        "intent_id": i.id,
+                                        "policy_version": i.policy_version,
+                                        "strategy": i.strategy,
+                                        "sequence": sequence,
+                                    }
+                                    if self.adaptive
+                                    else {}
+                                ),
                                 **identity,
                             )
                         for result in account.outcomes[before[1] :]:
                             self.record("outcome", result=result, **identity)
+                    if self.adaptive:
+                        self._consider_review(sequence, at, prepared)
                     if paired:
                         self.record(
                             "comparison_observation",
@@ -478,6 +724,26 @@ class Runtime:
                     for name, account in self.accounts.items()
                 },
             }
+        if self.adaptive:
+            candidate = self.accounts["candidate"]
+            result["ai_calls"] = sum(self.review_calls.values())
+            result["adaptive"] = {
+                "model_calls": dict(self.review_calls),
+                "policy_version": candidate.entry_policy_version,
+                "current": self._entry_configuration(),
+                "policy_history": self.policy_history,
+                "position_policy_versions": candidate.owner_policy_versions.copy(),
+                "execution_contract_preserved": all(
+                    account.delay == self.configurations[name]["delay_seconds"]
+                    and account.book.initial_equity == self.configurations[name]["capital"]
+                    and account.context.schedule == self.configurations[name]["fee_schedule"]
+                    for name, account in self.accounts.items()
+                )
+                and all(
+                    getattr(self.account, key) == self.configurations["incumbent"][key]
+                    for key in ENTRY_OPTIONS
+                ),
+            }
         return result
 
 
@@ -490,9 +756,8 @@ def write_comparison(
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     expected = manifest.get("source_sha256", {})
-    expected_sources = (
-        set(SOURCES) if runtime.constrained or len(runtime.accounts) > 1 else set(LEGACY_SOURCES)
-    )
+    sources = SOURCES if runtime.constrained or len(runtime.accounts) > 1 else LEGACY_SOURCES
+    expected_sources = set(ADAPTIVE_SOURCES if runtime.adaptive else sources)
     source_unchanged = set(expected) == expected_sources and all(
         (ROOT / name).is_file()
         and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected[name]
@@ -524,13 +789,34 @@ def write_comparison(
         if len(runtime.accounts) > 1
         else manifest.get("account") == runtime.configurations["incumbent"]
     )
+    policy_trace_valid = True
+    if runtime.adaptive:
+        adaptive_status = runtime_status["adaptive"]
+        history = adaptive_status["policy_history"]
+        baseline = {key: runtime.configurations["candidate"][key] for key in ENTRY_OPTIONS}
+        policy_trace_valid = (
+            adaptive_status["execution_contract_preserved"]
+            and adaptive_status["policy_version"] == len(history)
+            and runtime.configurations["incumbent"] == runtime.configurations["candidate"]
+            and adaptive_status["current"]
+            == (history[-1]["configuration"] if history else baseline)
+            and all(
+                row["version"] == index + 1
+                and (index == 0 or row["sequence"] > history[index - 1]["sequence"])
+                and (index == 0 or row["applied_at"] >= history[index - 1]["applied_at"])
+                and all(
+                    row["configuration"][key] in values for key, values in ENTRY_OPTIONS.items()
+                )
+                for index, row in enumerate(history)
+            )
+        )
     complete = (
         stats.get("state") == "complete"
         and source_unchanged
         and len(hashes) == 3
         and freeze_matches
         and comparison.get("inputs_aligned", True)
-        and configuration_unchanged
+        and (policy_trace_valid if runtime.adaptive else configuration_unchanged)
     )
     state = stats.get("state") if stats.get("state") in ("complete", "failed") else "interrupted"
     result = {
@@ -547,6 +833,7 @@ def write_comparison(
         "source_unchanged": source_unchanged,
         "configuration_unchanged": configuration_unchanged,
         "freeze_matches": freeze_matches,
+        **({"policy_trace_valid": policy_trace_valid} if runtime.adaptive else {}),
         "observation_status": "observed_short_sample"
         if all(runtime.book_delivered.values())
         else "inconclusive",
@@ -577,7 +864,17 @@ async def campaign(
     *,
     candidate_policy: str | None = None,
     profile: str = "legacy",
+    adaptive: bool = False,
+    end_epoch: float | None = None,
 ) -> None:
+    if adaptive and (
+        profile != "broker-constrained"
+        or candidate_policy is not None
+        or end_epoch is None
+        or not math.isfinite(end_epoch)
+        or time.time() >= end_epoch
+    ):
+        raise ValueError("Adaptive campaign requires a constrained profile and future cutoff")
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -593,7 +890,14 @@ async def campaign(
         log.write(json.dumps({"at": now(), "kind": kind, **payload}) + "\n")
 
     http_audit: list[dict[str, Any]] = []
-    runtime = Runtime(capital, record, candidate_policy=candidate_policy, profile=profile)
+    runtime = Runtime(
+        capital,
+        record,
+        candidate_policy=candidate_policy,
+        profile=profile,
+        adaptive=adaptive,
+        end_epoch=end_epoch,
+    )
     stats: dict[str, Any] = {
         "state": "starting",
         "ai_calls": 0,
@@ -610,9 +914,16 @@ async def campaign(
     resync = asyncio.Event()
     try:
         settings = Settings.load(ROOT)
+        if adaptive:
+            runtime.review_settings = settings
         data = copy.deepcopy(settings.data)
         data["limits"]["minimum_request_interval"] = 0.08
-        client = CachedTokenClient(Settings(ROOT, data))
+        market_settings = Settings(ROOT, data)
+        client = (
+            DeadlineMarketClient(market_settings, end_epoch)
+            if adaptive and end_epoch is not None
+            else CachedTokenClient(market_settings)
+        )
         feed = LiveFeed(
             client.settings,
             lambda kind, payload: http_audit.append(payload) if kind == "http" else None,
@@ -623,22 +934,42 @@ async def campaign(
         (output / "asyncapi.json").write_bytes(spec)
         universe = await asyncio.to_thread(feed.universe)
         started = time.monotonic()
-        deadline = started + duration
+        remaining = (end_epoch - time.time()) if end_epoch is not None else duration
+        if remaining <= 0:
+            raise ValueError("Campaign cutoff reached during initialization")
+        deadline = started + remaining
         stats.update(
             state="running",
+            duration_seconds=remaining,
             started_at=now(),
-            expected_end_epoch=time.time() + duration,
+            expected_end_epoch=end_epoch if end_epoch is not None else time.time() + duration,
             universe_count=len(universe),
         )
         calendar_day = us_date(now()) if runtime.constrained else now()[:10]
         calendar = await asyncio.to_thread(client.calendar, "US", calendar_day)
         if runtime.constrained:
             runtime.publish("calendar", (calendar_day, calendar))
-        sources = SOURCES if candidate_policy is not None or runtime.constrained else LEGACY_SOURCES
+        sources: tuple[str, ...] = (
+            SOURCES if candidate_policy is not None or runtime.constrained else LEGACY_SOURCES
+        )
+        if adaptive:
+            sources = ADAPTIVE_SOURCES
         private_json(
             output / "manifest.json",
             {
-                **({"comparison": runtime.configurations} if candidate_policy is not None else {}),
+                **({"comparison": runtime.configurations} if len(runtime.accounts) > 1 else {}),
+                **(
+                    {
+                        "experiment": "adaptive_exploration",
+                        "controlled_faults": False,
+                        "end_epoch": end_epoch,
+                        "entry_options": ENTRY_OPTIONS,
+                        "ai_models": [SOL, ASTRA],
+                        "ai_reasoning_effort": "medium",
+                    }
+                    if adaptive
+                    else {}
+                ),
                 "source_sha256": {
                     p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources
                 },
@@ -688,7 +1019,7 @@ async def campaign(
                     )
                     runtime.publish("calendar", (day, calendar))
                     calendar_day = day
-                if cycle == 2:
+                if not adaptive and cycle == 2:
                     before = runtime.counts["book_events"]
                     record("rest_delay_start", seconds=5)
                     await asyncio.sleep(5)
@@ -785,6 +1116,12 @@ async def campaign(
                 except TimeoutError:
                     pass
 
+        async def collect_until_cutoff() -> None:
+            try:
+                await collect()
+            except CampaignCutoff:
+                record("rest_cutoff")
+
         async def stream() -> None:
             injected = False
             while time.monotonic() < deadline:
@@ -816,7 +1153,7 @@ async def campaign(
                             if not runtime.desired:
                                 await ws.close(code=1000, reason="No candidates or holdings")
                                 break
-                            if not injected and tick - started >= duration / 2:
+                            if not adaptive and not injected and tick - started >= duration / 2:
                                 injected = True
                                 stats["faults"].append(
                                     {"kind": "controlled_disconnect", "at": now()}
@@ -884,7 +1221,7 @@ async def campaign(
                     await asyncio.sleep(2)
 
         consumer = asyncio.create_task(runtime.consume())
-        collector = asyncio.create_task(collect())
+        collector = asyncio.create_task(collect_until_cutoff() if adaptive else collect())
         streamer = asyncio.create_task(stream())
         tasks = [consumer, collector, streamer]
         while time.monotonic() < deadline:
@@ -897,10 +1234,15 @@ async def campaign(
             private_json(output / "status.json", {**stats, "at": now(), **runtime.status()})
             raw.flush()
             await asyncio.sleep(1)
+        if runtime.review_task is not None:
+            runtime.review_task.cancel()
         for producer in (collector, streamer):
             if producer.done():
                 producer.result()
-            producer.cancel()
+            if not adaptive or producer is streamer:
+                producer.cancel()
+        if adaptive:
+            await collector
         await asyncio.gather(collector, streamer, return_exceptions=True)
         if consumer.done():
             consumer.result()
@@ -936,6 +1278,10 @@ async def campaign(
                 for account in runtime.accounts.values()
             ),
         }
+        if adaptive:
+            for key in ("rest_delay_did_not_stop_books", "reconnected", "subscription_replaced"):
+                del checks[key]
+            checks["matched_inputs"] = runtime.status()["comparison"]["inputs_aligned"]
         stats.update(checks=checks, result="passed" if all(checks.values()) else "inconclusive")
     except (
         OSError,
@@ -946,6 +1292,7 @@ async def campaign(
         SafetyError,
         ApiError,
         WebSocketException,
+        CampaignCutoff,
     ) as error:
         stats.update(state="failed", at=now(), **runtime.status(), **error_details(error, token))
         record("failed", **error_details(error, token))
@@ -985,20 +1332,54 @@ def main() -> None:
     parser.add_argument("--capital", type=float, default=100)
     parser.add_argument("--candidate-policy", choices=("router", *FAMILIES))
     parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
+    parser.add_argument("--adaptive", action="store_true")
+    parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
     args = parser.parse_args()
-    if args.duration < 360 or not math.isfinite(args.capital) or args.capital <= 0:
+    if (
+        (not args.adaptive and args.duration < 360)
+        or not math.isfinite(args.capital)
+        or args.capital <= 0
+    ):
         parser.error("Use duration >= 360 and positive finite capital")
+    end_epoch = None
+    if args.adaptive:
+        if args.profile != "broker-constrained" or args.end_at is None:
+            parser.error("--adaptive requires --profile broker-constrained and --end-at")
+        try:
+            end_epoch = seconds(args.end_at)
+        except ValueError:
+            parser.error("--end-at must be an ISO timestamp with UTC offset")
+        if end_epoch <= time.time():
+            parser.error("--end-at must be in the future")
+    elif args.end_at is not None:
+        parser.error("--end-at requires --adaptive")
     if args.profile == "broker-constrained" and args.candidate_policy is not None:
         parser.error("The broker-constrained profile runs a single trend baseline")
-    asyncio.run(
-        campaign(
-            args.output.resolve(),
-            args.duration,
-            args.capital,
-            candidate_policy=args.candidate_policy,
-            profile=args.profile,
-        )
-    )
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        if args.adaptive:
+            assert task is not None
+            loop.add_signal_handler(signal.SIGTERM, task.cancel)
+        try:
+            await campaign(
+                args.output.resolve(),
+                args.duration,
+                args.capital,
+                candidate_policy=args.candidate_policy,
+                profile=args.profile,
+                adaptive=args.adaptive,
+                end_epoch=end_epoch,
+            )
+        finally:
+            if args.adaptive:
+                loop.remove_signal_handler(signal.SIGTERM)
+
+    try:
+        asyncio.run(run())
+    except asyncio.CancelledError:
+        raise SystemExit("Live validation interrupted") from None
+
 
 
 if __name__ == "__main__":
