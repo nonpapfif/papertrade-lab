@@ -273,6 +273,12 @@ class ComparisonTests(RuntimeTests):
         ):
             await self.publish_at(0, "book", ("A", self.book(self.at)))
         self.assertFalse(r.status()["comparison"]["inputs_aligned"])
+        failure = next(event for event in self.events if event["kind"] == "runtime_event_failed")
+        self.assertEqual(failure["symbol"], "A")
+        self.assertEqual(failure["event_kind"], "book")
+        self.assertIsInstance(failure["sequence"], int)
+        self.assertTrue(failure["failure_frames"])
+        self.assertNotIn("fixture", json.dumps(failure))
 
     async def test_published_observation_is_copied_before_fanout(self) -> None:
         r = self.runtime

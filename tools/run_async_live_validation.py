@@ -680,6 +680,16 @@ class Runtime:
                 else:
                     raise ValueError("Unknown runtime event")
                 self.desired = subscription_set(self.candidates, self.protected())
+            except (ValueError, TypeError, KeyError, RuntimeError, OverflowError) as error:
+                self.record(
+                    "runtime_event_failed",
+                    sequence=sequence,
+                    event_kind=kind,
+                    published_at=received,
+                    symbol=payload[0] if kind == "book" else None,
+                    **error_details(error, ""),
+                )
+                raise
             finally:
                 self.processing_times.append(time.monotonic() - started)
                 self.queue.task_done()
@@ -1288,6 +1298,7 @@ async def campaign(
         ValueError,
         KeyError,
         TypeError,
+        OverflowError,
         RuntimeError,
         SafetyError,
         ApiError,

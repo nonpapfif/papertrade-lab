@@ -40,6 +40,20 @@ def read_spec() -> bytes:
 
 def error_details(error: BaseException, token: str) -> dict[str, Any]:
     details: dict[str, Any] = {"error_type": type(error).__name__}
+    frames = []
+    trace = error.__traceback__
+    while trace is not None:
+        code = trace.tb_frame.f_code
+        frames.append(
+            {
+                "file": Path(code.co_filename).name,
+                "function": code.co_name,
+                "line": trace.tb_lineno,
+            }
+        )
+        trace = trace.tb_next
+    if frames:
+        details["failure_frames"] = frames
     for name in ("rcvd", "sent"):
         close = getattr(error, name, None)
         if close is not None:

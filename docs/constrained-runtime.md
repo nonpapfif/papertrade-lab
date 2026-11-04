@@ -107,3 +107,33 @@ strategy and version. No proposal can change the modeled costs, liquidity, calen
 Controlled delays and disconnects are disabled. Output includes shared input digests, AI
 evidence and responses, the effective policy timeline and intent versions. The comparison is
 descriptive adaptive exploration. It is not fixed-version validation or promotion evidence.
+
+## Adaptive failure audit and recovery prerequisites
+
+A terminal error records the exception class and traceback locations without dumping exception
+arguments or local variables. A consumer failure also records the observation sequence, type,
+publication time, and book symbol in `runtime_event_failed`. Use these fields to locate the
+recorded provider observation and reproduce it offline against the manifest's source version.
+Past runs containing only an exception class cannot recover the missing traceback.
+
+The one-shot scheduler intentionally refuses to recreate an already claimed run. Its JSON status
+and compressed market stream are diagnostic artifacts, not a recovery checkpoint. In particular,
+a status snapshot cannot reconstruct both accounts' pending intent objects, feature timing,
+original owner state, and exact ordering of policy changes.
+
+The next implementation slice is a durable journal for the paired paper engine:
+
+1. Commit one ordered record of both accounts' exact decision inputs and applied policy changes
+   per financial event. Preserve schema, source, settings, and stable event identity. Use the
+   existing execution assumptions rather than changing rounding as part of recovery.
+2. Replay committed inputs without market or AI calls, verify both accounts and policy versions,
+   then acquire exclusive ownership before accepting fresh observations. Persist the restart gap
+   and apply the existing expiry rules to pending intents. Do not replay skipped market time.
+3. Allow the service manager to restart only an eligible interrupted run with a verified journal
+   before its original deadline. Leave completed, paused, corrupt, or incompatible runs stopped.
+   A repeated deterministic failure at the same cursor must block instead of spinning.
+
+Before enabling automatic recovery, kill and restore the paper worker around a reservation,
+partial fill, and policy change. Require exact agreement with uninterrupted account results
+when given identical inputs, no duplicated effects on repeated recovery, and no restart after
+the session cutoff. Keep the active one-shot run isolated from this development.
