@@ -53,6 +53,8 @@ No offline command starts the continuous trading workers.
 
 | Guide | Purpose |
 |---|---|
+| [Toss capability evidence](docs/toss-capability-evidence.md) | Official API and broker support, restrictions, uncertainty and sources |
+| [KR/US strategy redesign](docs/kr-us-strategy-design.md) | Constrained market modes, strategy layers, execution gaps and acceptance order |
 | [Project direction](docs/project-direction.md) | Agreed product goal, AI role, strategy validation, and open decisions |
 | [Domain glossary](GLOSSARY.md) | Shared project terminology |
 | [Shared observation design](docs/shared-observation-design.md) | Live/replay preparation, actual timing, and parity acceptance criteria |

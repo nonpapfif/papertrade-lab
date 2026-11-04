@@ -1,12 +1,29 @@
 # Autotrade scope and implementation plan
 
+## Active revision on 2026-11-04
+
+The current task is the broker-constrained KR/US redesign in
+[Market and strategy design](kr-us-strategy-design.md). Its acceptance and delivery order governs
+new work. Confirm capabilities against [primary evidence](toss-capability-evidence.md) before
+choosing quantity, order, session, data or cost assumptions. The next implementation slice is
+one fee-inclusive account contract and explicit constrained runner selection, followed by the
+existing strategy owner and quote/depth execution path.
+
+The finite US comparison plan below is retained as the earlier scope decision. Its dated
+implementation observations describe that baseline and are not current run status. Today's KR
+integer successor and cost companions establish partial mechanics, while their sampled fills
+and counterfactual seeds prevent claiming a full realistic comparison. See the new design's
+implementation table. Live-order authorization and user-defined live risk limits remain separate.
+
+## Earlier finite-comparison milestone
+
 Status: optional paired execution and reporting are implemented and checked with offline fixtures;
 the first live comparison has not been run.
 This plan supersedes the earlier assumption that all W01-W11 form a mandatory delivery chain.
 The [system design](autotrade-system-design.md) remains a future contract reference, not a list
 of prerequisites for every experiment. Implement only what the active milestone requires.
 
-## Active milestone
+## Earlier comparison objective
 
 Complete one finite US live-data paper comparison of an incumbent and a candidate strategy.
 Freeze both definitions/configurations before observations arrive. Give independent accounts
