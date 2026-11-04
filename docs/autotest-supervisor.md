@@ -7,7 +7,7 @@ then runs a persistent validation loop without keeping a chat open.
 | --- | --- | --- |
 | Wait for a test or child process | Python | Process completion, not an AI timer |
 | Review evidence and acceptance criteria | `gpt-6-astra`, medium | New results |
-| Choose the next useful test | `gpt-6-luna`, low | A review with unfinished work |
+| Specify the next change and unittest targets | `gpt-6-astra`, medium | A review with unfinished work |
 | Implement tests or a targeted fix | `gpt-6.1-sol`, medium | A concrete offline plan |
 | Execute regression tests and experiments | Python | Implementation ready |
 | Publish reviewed changes | Python and GitHub CLI | Tests pass and Astra approves the same source |
@@ -28,10 +28,11 @@ by technical success. If all meaningful work is complete, the supervisor records
 If external state prevents progress, it records `blocked`, preserving the exact phase and logs.
 It does not burn tokens rechecking the same failure indefinitely. Recovery platforms, exact
 replay, optimization, promotion and KR rollout remain deferred. Do not add tasks to stay busy.
-Luna's `blocked` plan is a proposal: Python records it and requests a fresh Astra review,
-preserving the worktree and failed-test evidence. Only Astra can confirm an external blocker.
-Failed assertions and repairable code remain offline fix work. Repeated unchanged plans and
-mechanical orchestration failures retain their existing fail-closed behavior.
+Astra supplies an executable next plan for each continuing review. Python schedules the named
+tests directly for a clean source tree or runs the regression suite after Sol implements a fix.
+Unchanged source and test targets already checked with the same interpreter stop for new evidence.
+A legacy review without an executable plan gets a fresh Astra review before scheduling work.
+Failed assertions remain offline fix work, and mechanical safety guards still stop the controller.
 
 Only fictional ledgers are permitted. No real broker account or order endpoints are allowed.
 The monthly collector stays paused. Existing ledgers and losses remain intact. The layered

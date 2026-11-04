@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,22 @@ def schema(properties: dict[str, Any]) -> dict[str, Any]:
 
 STRING = {"type": "string"}
 STRINGS = {"type": "array", "items": STRING}
+PLAN = schema(
+    {
+        "kind": {"type": "string", "enum": ["offline", "live", "blocked"]},
+        "objective": STRING,
+        "acceptance": STRINGS,
+        "requirement": {"type": "string", "enum": list(REQUIREMENTS)},
+        "live_duration_seconds": {"type": "integer", "minimum": 360},
+    }
+)
+NEXT_PLAN = schema(
+    {
+        **PLAN["properties"],
+        "kind": {"type": "string", "enum": ["offline", "live", "test"]},
+        "tests": STRINGS,
+    }
+)
 SCHEMAS = {
     "review": schema(
         {
@@ -82,18 +99,11 @@ SCHEMAS = {
             "evidence": STRINGS,
             "satisfied": {"type": "array", "items": {"type": "string", "enum": list(REQUIREMENTS)}},
             "next_objective": STRING,
+            "next_plan": {"anyOf": [NEXT_PLAN, {"type": "null"}]},
             "publish_ok": {"type": "boolean"},
         }
     ),
-    "plan": schema(
-        {
-            "kind": {"type": "string", "enum": ["offline", "live", "blocked"]},
-            "objective": STRING,
-            "acceptance": STRINGS,
-            "requirement": {"type": "string", "enum": list(REQUIREMENTS)},
-            "live_duration_seconds": {"type": "integer", "minimum": 360},
-        }
-    ),
+    "plan": PLAN,
     "implement": schema(
         {
             "status": {"type": "string", "enum": ["ready", "blocked"]},
@@ -156,10 +166,31 @@ def command(argv: list[str], cwd: Path) -> str:
 
 def validate_result(role: str, value: dict[str, Any]) -> None:
     fields = SCHEMAS[role]["properties"]
+    if role == "review" and "next_plan" not in value:
+        # A review already launched by an older controller used the earlier schema.
+        fields = {name: field for name, field in fields.items() if name != "next_plan"}
+    validate_fields(fields, value)
+    if role == "review" and "next_plan" in value:
+        plan = value["next_plan"]
+        if value["decision"] in ("continue", "fix"):
+            if not isinstance(plan, dict):
+                raise ValueError("Continuing review requires an executable next plan")
+            validate_fields(NEXT_PLAN["properties"], plan)
+            if value["decision"] == "fix" and plan["kind"] != "offline":
+                raise ValueError("Fix review requires an offline plan")
+            if plan["kind"] == "test" and not plan["tests"]:
+                raise ValueError("Test plan requires named tests")
+        elif plan is not None:
+            raise ValueError("Terminal review cannot schedule another test")
+
+
+def validate_fields(fields: dict[str, Any], value: dict[str, Any]) -> None:
     if set(value) != set(fields):
         raise ValueError("Unexpected model result fields")
     for name, field in fields.items():
         item = value[name]
+        if name == "next_plan":
+            continue
         kind = field["type"]
         expected = {"string": str, "array": list, "boolean": bool, "integer": int}[kind]
         if type(item) is not expected:
@@ -369,7 +400,12 @@ A blocked plan is a proposal, not a confirmed blocker. Verify its concrete exter
 Failed tests and repairable code are fix work, not external blockers.
 publish_ok requires tested changes with no actionable correctness findings; failures block merge.
 complete requires all requirements satisfied, with residual real-market limits documented.
-Propose the single most useful next objective. Do not invent work merely to stay busy.
+For continue or fix, set next_plan to the single necessary action. Specify the change objective,
+acceptance criteria, and exact unittest targets under tests.test_*. Use offline for Sol changes,
+test for targeted Python checks without edits, and live for a finite frozen-baseline run.
+Choose test targets compatible with the offline runner. If a prerequisite is unavailable there
+and no independent work remains, report the blocker. A skip is not evidence of a passing test.
+Use null next_plan for complete or blocked. Do not invent work merely to stay busy.
 """,
             "plan": """Read evidence.json and Astra's review. Choose the next useful task.
 Do not override Astra's findings. Prefer offline work using existing recorded data.
@@ -464,21 +500,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             else:
                 self.after_review()
         elif role == "plan":
-            fingerprint = hashlib.sha256(
-                json.dumps(
-                    [
-                        value,
-                        tree_digest(self.worktree),
-                        self.state.get("review", {}).get("findings"),
-                    ],
-                    sort_keys=True,
-                ).encode()
-            ).hexdigest()
-            if fingerprint == self.state.get("last_plan_fingerprint"):
-                raise RuntimeError(
-                    "Unchanged plan repeated; require new evidence before another call"
-                )
-            self.transition("prepare", plan=value, last_plan_fingerprint=fingerprint)
+            # Finish the audit for a legacy in-flight planner without applying its plan.
+            self.transition("review", cycle=self.state["cycle"] + 1)
         else:
             self.state["worker"] = value
             if value["status"] == "blocked":
@@ -492,13 +515,17 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if review["decision"] == "complete":
             if self.state.get("tests_passed") is False:
                 raise RuntimeError("Cannot complete with failed mechanical checks")
+            if self.state.get("live_run") and self.state.get("live_returncode") != 0:
+                raise RuntimeError("Cannot complete with a failed live run")
             if set(self.state["satisfied"]) != set(REQUIREMENTS):
                 raise RuntimeError("Astra completion omitted pending requirements")
             self.transition("complete")
         elif review["decision"] == "blocked":
             self.transition("blocked", reason=review["summary"])
+        elif (plan := review.get("next_plan")) is not None:
+            self.transition("prepare", plan=plan)
         else:
-            self.transition("plan")
+            self.transition("review", cycle=self.state["cycle"] + 1)
 
     def prepare(self) -> None:
         plan = self.state["plan"]
@@ -506,6 +533,12 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             self.transition("review", cycle=self.state["cycle"] + 1)
             return
         cycle = self.state["cycle"] + 1
+        if plan["kind"] == "test":
+            if changed_paths(self.worktree):
+                raise RuntimeError("Unpublished changes require the offline regression suite")
+            self.state.update(cycle=cycle, tests_passed=False, worker=None, live_run=None)
+            self.prepare_tests("")
+            return
         if (
             self.state.get("worktree")
             and self.state["review"]["decision"] == "fix"
@@ -539,19 +572,34 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             branch=branch,
             base=base,
             test_jobs=[],
-            tests_passed=False,
+            tests_passed=self.state.get("tests_passed") if plan["kind"] == "live" else False,
             worker=None,
             live_run=None,
         )
 
     def prepare_tests(self, experiment: str) -> None:
         cycle_dir = self.output / f"cycle-{self.state['cycle']:04d}"
+        plan = self.state.get("plan", {})
+        targeted = plan.get("tests", [])
+        for name in targeted:
+            if not re.fullmatch(
+                r"tests\.test_[A-Za-z0-9_]+(?:\.[A-Za-z_][A-Za-z0-9_]*){0,2}", name
+            ):
+                raise ValueError("Invalid unittest target")
         modules = list(REGRESSION_MODULES)
         for name in changed_paths(self.worktree) + self.state.get("generated_files", []):
             if re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", name):
                 module = name[:-3].replace("/", ".")
                 if module not in modules:
                     modules.append(module)
+        if plan.get("kind") == "test":
+            modules = sorted(set(targeted))
+        else:
+            modules.extend(
+                name
+                for name in sorted(set(targeted))
+                if ".".join(name.split(".")[:2]) not in modules
+            )
         tests = [[sys.executable, "-m", "unittest", "-q", *modules]]
         if experiment:
             path = self.worktree / experiment
@@ -571,11 +619,37 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 ]
             )
         digest = tree_digest(self.worktree)
+        try:
+            websocket_version = version("websockets")
+        except PackageNotFoundError:
+            websocket_version = None
+        signature = hashlib.sha256(
+            json.dumps(
+                [
+                    digest,
+                    sys.executable,
+                    sys.version,
+                    websocket_version,
+                    sorted(modules),
+                    experiment,
+                ]
+            ).encode()
+        ).hexdigest()
+        if signature in self.state.get("completed_test_signatures", []):
+            raise RuntimeError(
+                "Same source and test targets were already checked; new evidence required"
+            )
         jobs = []
         for index, argv in enumerate(tests):
             directory = cycle_dir / f"test-{index}"
             jobs.append({"path": str(directory), "argv": argv, "started": False})
-        self.transition("test_wait", test_jobs=jobs, tested_digest=digest, test_index=0)
+        self.transition(
+            "test_wait",
+            test_jobs=jobs,
+            tested_digest=digest,
+            test_index=0,
+            test_signature=signature,
+        )
 
     def test_step(self) -> None:
         jobs = self.state["test_jobs"]
@@ -583,7 +657,14 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if tree_digest(self.worktree) != self.state["tested_digest"]:
             raise RuntimeError("Source changed after tests were prepared")
         if index == len(jobs):
-            self.transition("review", tests_passed=all(j["returncode"] == 0 for j in jobs))
+            if signature := self.state.get("test_signature"):
+                completed = self.state.setdefault("completed_test_signatures", [])
+                if signature not in completed:
+                    completed.append(signature)
+            self.transition(
+                "review",
+                tests_passed=all(j["returncode"] == 0 and not j.get("skipped") for j in jobs),
+            )
             return
         job = jobs[index]
         path = Path(job["path"])
@@ -613,6 +694,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         result = poll_job(path)
         if result is not None:
             job["returncode"] = result["returncode"]
+            if self.state.get("plan", {}).get("kind") == "test":
+                job["skipped"] = bool(
+                    re.search(r"\bskipped=\d+", (path / "stderr.log").read_text())
+                )
             self.state["test_index"] += 1
             self.save()
 
@@ -780,6 +865,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 self.transition("review")
             elif time.time() - path.stat().st_mtime > 120:
                 raise RuntimeError("Inherited live status stopped updating; inspect its process")
+        elif phase == "plan":
+            self.transition("review", cycle=self.state["cycle"] + 1)
         elif phase in MODELS:
             self.invoke(phase)
         elif phase == "model_wait":

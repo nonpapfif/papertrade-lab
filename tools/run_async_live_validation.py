@@ -205,6 +205,24 @@ class Runtime:
                     if old and seconds(old["timestamp"]) > seconds(book["timestamp"]):
                         self.counts["old_snapshot_ignored"] += 1
                         continue
+                    paired = len(self.accounts) > 1
+                    if (
+                        paired
+                        and book.get("currency") == "USD"
+                        and book["asks"]
+                        and book["bids"]
+                        and max(float(row["price"]) for row in book["bids"])
+                        > min(float(row["price"]) for row in book["asks"])
+                    ):
+                        self.counts["crossed_orderbook_rejected"] += 1
+                        self.record(
+                            "book_rejected",
+                            reason="crossed_orderbook",
+                            sequence=sequence,
+                            symbol=symbol,
+                            source_at=book["timestamp"],
+                        )
+                        continue
                     self.books[symbol] = book
                     f = self.features.get(symbol)
                     if f is not None:
@@ -219,7 +237,6 @@ class Runtime:
                             r15=price / (f.price / (1 + f.r15)) - 1,
                         )
                     at = now()
-                    paired = len(self.accounts) > 1
                     prepared = (
                         {s: self._feature_at(s, at) for s in self.candidates} if paired else {}
                     )
