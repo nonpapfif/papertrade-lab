@@ -418,6 +418,18 @@ def write_comparison(
     return result
 
 
+async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
+    if error.status in (401, 403):
+        raise error
+    if error.status != 429 and error.code != "cooldown":
+        return
+    if error.retry_at is None or not math.isfinite(error.retry_at):
+        raise error
+    delay = min(error.retry_at - time.time(), deadline - time.monotonic())
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
 async def campaign(
     output: Path, duration: int, capital: float, *, candidate_policy: str | None = None
 ) -> None:
@@ -573,9 +585,9 @@ async def campaign(
                             symbol=symbol,
                             status=error.status,
                             code=error.code,
+                            retry_at=error.retry_at,
                         )
-                        if error.status in (401, 403, 429):
-                            raise
+                        await wait_for_rest_cooldown(error, deadline)
                 elapsed = time.monotonic() - begin
                 stats["rest_cycles"].append(
                     {

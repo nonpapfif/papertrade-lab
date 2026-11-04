@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from papertrade.api import ApiError
 from tools.layered_paper import Feature
 from tools.run_async_live_validation import (
     SOURCES,
@@ -21,6 +22,7 @@ from tools.run_async_live_validation import (
     latency_summary,
     rank_candidates,
     subscription_set,
+    wait_for_rest_cooldown,
     write_comparison,
 )
 
@@ -147,6 +149,44 @@ class ComparisonTests(RuntimeTests):
         with patch("tools.run_async_live_validation.now", return_value=at):
             self.runtime.publish(kind, payload)
             await self.drain()
+
+    async def test_rest_rate_limit_wait_preserves_paired_book_delivery(self) -> None:
+        for offset, error in enumerate(
+            (
+                ApiError("Rate limit", status=429, retry_at=102),
+                ApiError("Request cooldown", code="cooldown", retry_at=102),
+            )
+        ):
+
+            async def deliver_book(delay: float, offset: int = offset) -> None:
+                self.assertEqual(delay, 2)
+                at = self.at + timedelta(seconds=offset)
+                await self.publish_at(offset, "book", ("A", self.book(at)))
+
+            with (
+                patch("tools.run_async_live_validation.time") as clock,
+                patch("tools.run_async_live_validation.asyncio.sleep", side_effect=deliver_book),
+            ):
+                clock.time.return_value = 100
+                clock.monotonic.return_value = 50
+                await wait_for_rest_cooldown(error, deadline=60)
+            self.assertEqual(list(self.runtime.book_delivered.values()), [offset + 1] * 2)
+            self.assertTrue(self.runtime.status()["comparison"]["inputs_aligned"])
+
+    async def test_rest_rate_limit_wait_stops_at_observation_deadline(self) -> None:
+        with (
+            patch("tools.run_async_live_validation.time") as clock,
+            patch("tools.run_async_live_validation.asyncio.sleep") as sleep,
+        ):
+            clock.time.return_value = 100
+            clock.monotonic.return_value = 50
+            await wait_for_rest_cooldown(ApiError("Rate limit", status=429, retry_at=120), 53)
+            sleep.assert_awaited_once_with(3)
+            clock.monotonic.return_value = 53
+            await wait_for_rest_cooldown(ApiError("Rate limit", status=429, retry_at=120), 53)
+            sleep.assert_awaited_once()
+            with self.assertRaises(ApiError):
+                await wait_for_rest_cooldown(ApiError("Unauthorized", status=401, retry_at=120), 60)
 
     def feature(self, symbol: str, *, prior_high: float = 9, r15: float = 0.02) -> Feature:
         at = self.at.isoformat()
