@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from papertrade.api import ApiError, private_json
+from papertrade.api import ApiError, MarketClient, private_json
 from papertrade.core import SafetyError, Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
 from tools.async_layered_paper import AsyncLayeredPaper, ProcessingClock, seconds
@@ -170,6 +170,14 @@ class DeadlineMarketClient(CachedTokenClient):
         super()._reserve(group)
         if time.time() >= self.end_epoch:
             raise CampaignCutoff
+
+    def recovery_token(self) -> str:
+        if time.time() >= self.end_epoch:
+            raise CampaignCutoff
+        token = MarketClient.access_token(self)
+        if time.time() >= self.end_epoch:
+            raise CampaignCutoff
+        return token
 
 
 class Runtime:
@@ -1347,7 +1355,11 @@ async def _campaign(
             client=client,
             market=market,
         )
-        token = client.access_token()
+        token = (
+            client.recovery_token()
+            if resume and isinstance(client, DeadlineMarketClient)
+            else client.access_token()
+        )
         spec = await asyncio.to_thread(read_spec)
         (output / "asyncapi.json").write_bytes(spec)
         universe = await asyncio.to_thread(feed.universe)

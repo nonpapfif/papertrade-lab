@@ -189,6 +189,10 @@ expires old intents under their existing rules and is reported separately from o
 An event interrupted before commit may appear in attempt logs without being part of the
 restored account. The journal is authoritative for the committed boundary.
 
+After replay and source verification, a resumed worker checks the OAuth cache for the configured
+client and can obtain a fresh token before requesting market data. The original cutoff still
+applies. Fresh worker starts and standalone probes require an existing valid cached token.
+
 The scheduler can restart a killed runner or a classified transient market-data failure.
 It waits for recorded provider cooldowns and keeps the original deadline. A repeated failure
 without journal progress, invalid journal, unknown process identity, explicit interruption,

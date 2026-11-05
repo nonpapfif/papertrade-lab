@@ -1,6 +1,8 @@
 """Offline crash and replay tests for the adaptive paired paper worker."""
 
 import asyncio
+import importlib.util
+import json
 import os
 import signal
 import sqlite3
@@ -10,10 +12,11 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from papertrade.core import Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, read_status
+from tools.paper_market import KR
 from tools.run_async_live_validation import Runtime, campaign
 
 BASE = datetime(2026, 11, 5, 15, tzinfo=UTC)
@@ -340,6 +343,70 @@ class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await original.close()
                 await restored.close()
+
+    @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
+    async def test_expired_cached_token_refreshes_only_after_journal_replay(self) -> None:
+        runner = "tools.run_async_live_validation"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            secrets = root / "secrets"
+            secrets.mkdir(mode=0o700)
+            for name, value in {
+                "TOSS_CLIENT_ID": "fixture-client",
+                "TOSS_CLIENT_SECRET": "fixture-secret",
+                "TOSS_ACCESS_TOKEN.json": json.dumps(
+                    {"access_token": "expired", "expires_at": BASE.timestamp() - 1}
+                ),
+            }.items():
+                path = secrets / name
+                path.write_text(value)
+                path.chmod(0o600)
+            output = root / "initial"
+            journal_path = root / "journal.db"
+
+            def oauth(method: str, path: str, **_kwargs: object) -> dict:
+                self.assertEqual((method, path), ("POST", "/oauth2/token"))
+                event_log = (root / "resumed" / "events.jsonl").read_text()
+                self.assertIn('"kind": "recovery_gap"', event_log)
+                return {"access_token": "fixture-renewed", "expires_in": 3600}
+
+            async def run(output: Path, resume: bool) -> None:
+                with self.assertRaisesRegex(SystemExit, "Live validation failed"):
+                    await campaign(
+                        output,
+                        1200,
+                        100,
+                        profile="broker-constrained",
+                        adaptive=True,
+                        end_epoch=DEADLINE,
+                        journal_path=journal_path,
+                        resume=resume,
+                        market=KR,
+                    )
+
+            with (
+                patch.object(
+                    Settings, "secrets_dir", new_callable=PropertyMock, return_value=secrets
+                ),
+                patch(f"{runner}.time.time", return_value=BASE.timestamp()),
+                patch(f"{runner}.now", return_value=stamp(0)),
+                patch(f"{runner}.MarketClient._request", side_effect=oauth) as request,
+                patch(f"{runner}.read_spec", side_effect=OSError("stop before market I/O")) as spec,
+            ):
+                await run(output, resume=False)
+                request.assert_not_called()
+                spec.assert_not_called()
+                self.assertEqual(
+                    json.loads((output / "status.json").read_text())["error_type"], "SafetyError"
+                )
+
+                await run(root / "resumed", resume=True)
+                request.assert_called_once()
+                spec.assert_called_once_with()
+                self.assertEqual(
+                    json.loads((secrets / "TOSS_ACCESS_TOKEN.json").read_text())["access_token"],
+                    "fixture-renewed",
+                )
 
     async def test_expired_recovery_does_not_open_journal_or_load_market_settings(self) -> None:
         with (
