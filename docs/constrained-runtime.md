@@ -5,6 +5,23 @@ trend baseline. It does not complete the full [market design](kr-us-strategy-des
 Both commands require `--profile broker-constrained`. Omitting it preserves legacy behavior.
 Only market-data and stock-information endpoints are used. Real orders remain forbidden.
 
+## Market profiles and engine integration
+
+Both constrained runners use `tools.paper_market` for market identity, currency, local
+trading date, and the continuous-session window. The US profile reads the regular close.
+The KR profile reads the integrated regular session and stops before the closing auction.
+The profile module is included in the frozen source evidence for both runners.
+
+The target is one layered execution engine with separate processes, journals and output
+directories for each market. Move native currency accounting, valid price increments,
+quantity units and costs behind market rules before connecting the KR quote feed to the
+shared engine. Keep product eligibility and provider message normalization at the feed
+boundary. The existing KR last-trade diagnostic remains a separate runner until then.
+
+An additional market needs verified provider quotes, calendar, instrument eligibility,
+quantity units, tick rules and costs before its profile can be used for an experiment.
+A timezone and currency alone do not enable a market. There is no JP live adapter today.
+
 ## KR diagnostic comparison
 
 ```sh
