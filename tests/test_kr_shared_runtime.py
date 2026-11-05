@@ -172,6 +172,11 @@ class KrRuntimeTests(unittest.IsolatedAsyncioTestCase):
             assert feature is not None
             self.assertEqual(datetime.fromisoformat(feature.bar_end), BASE)
             self.assertEqual(feature.observations, 16)
+            draft = incumbent.intents[0].order_request
+            assert draft is not None
+            self.assertEqual(
+                (draft["symbol"], draft["quantity"], draft["price"]), (SYMBOL, "9", "1000")
+            )
             self.assertEqual(incumbent.book.positions[0].quantity, 1)
             self.assertAlmostEqual(incumbent.book.cash, 8999.85)
             self.assertEqual(incumbent.book.cash, candidate.book.cash)

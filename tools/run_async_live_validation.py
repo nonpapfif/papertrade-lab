@@ -46,6 +46,7 @@ LEGACY_SOURCES = (
     "tools/live_execution.py",
     "papertrade/api.py",
     "tools/paper_market.py",
+    "tools/toss_order_contract.py",
 )
 SOURCES = (
     *LEGACY_SOURCES,
@@ -676,6 +677,8 @@ class Runtime:
                 "fx_valid_until": self.fx[3],
                 "fx_provider_validity_required": self.constrained,
             }
+            if self.constrained:
+                shared["provider_symbol"] = symbol
             observation = (
                 json.dumps(
                     {
@@ -743,6 +746,7 @@ class Runtime:
                         side=i.side,
                         decision_at=i.decision_at,
                         reserved=i.reserved,
+                        **({"order_request": i.order_request} if i.order_request else {}),
                         **(
                             {
                                 "intent_id": i.id,

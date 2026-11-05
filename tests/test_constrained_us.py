@@ -61,12 +61,14 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
             if self.consumer.done():
                 self.consumer.result()
 
-    async def book(self, at: datetime, source: datetime | None = None, volume: int = 10) -> None:
+    async def book(
+        self, at: datetime, source: datetime | None = None, volume: int = 10, *, symbol: str = "A"
+    ) -> None:
         await self.publish(
             at,
             "book",
             (
-                "A",
+                symbol,
                 {
                     "timestamp": (source or at).isoformat(),
                     "currency": "USD",
@@ -91,6 +93,19 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(constrained.price, 8.6)
         self.assertEqual(constrained.bar_end, at.isoformat())
 
+    async def test_invalid_order_draft_does_not_create_intent_or_reserve_cash(self) -> None:
+        at = self.close_at - timedelta(seconds=20)
+        symbol = "BAD SYMBOL"
+        await self.publish(at, "calendar", (self.day, self.calendar))
+        await self.publish(at, "selection", [symbol])
+        await self.publish(at, "feature", (symbol, candles(at)))
+        await self.book(at, symbol=symbol)
+        account = self.runtime.account
+        self.assertEqual(account.decisions[-1]["blocked_reason"], "Invalid order symbol")
+        self.assertEqual(account.pending, {})
+        self.assertEqual(account.reserved_cash, 0)
+        self.assertEqual(account.book.cash, 25)
+
     async def test_regular_trend_buy_uses_fee_budget_and_later_visible_depth(self) -> None:
         at = self.close_at - timedelta(seconds=20)
         await self.prime(at)
@@ -98,6 +113,18 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
         account = self.runtime.account
         intent = account.pending[0]
         self.assertEqual((intent.quantity, intent.strategy), (4, "trend"))
+        self.assertEqual(
+            intent.order_request,
+            {
+                "clientOrderId": "live-1",
+                "symbol": "A",
+                "side": "BUY",
+                "orderType": "LIMIT",
+                "timeInForce": "DAY",
+                "quantity": "4",
+                "price": "5",
+            },
+        )
         self.assertAlmostEqual(intent.reserved, 20.02)
         await self.book(at + timedelta(seconds=2), volume=2)
         self.assertEqual(account.book.positions[0].quantity, 2)
@@ -114,6 +141,9 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
         await self.publish(sell_at, "feature", ("A", candles(sell_at, rising=False)))
         await self.book(sell_at)
         self.assertEqual(account.pending[0].side, "SELL")
+        sell_request = account.pending[0].order_request
+        assert sell_request is not None
+        self.assertEqual((sell_request["side"], sell_request["quantity"]), ("SELL", "2"))
         await self.book(sell_at + timedelta(seconds=2), volume=1)
         self.assertEqual(account.book.positions[0].quantity, 1)
         self.assertEqual(account.owners[0][0], "trend")

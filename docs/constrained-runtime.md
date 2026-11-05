@@ -112,6 +112,21 @@ does not establish venue-level execution or auction/VI eligibility.
 
 ## Validation and remaining work
 
+The constrained layered runner validates an ordinary whole-share DAY LIMIT request draft
+before reserving cash or creating an intent. Intent records include the draft with the provider
+symbol, decimal-string quantity and price, and a paper-run-local client order ID. The existing
+market rules normalize the limit before validation. The draft rejects off-grid KR prices,
+unsupported US precision, sells above holdings, and KR orders requiring high-value confirmation.
+It is generated locally. Market quotes remain the sole input to paper fills.
+
+Offline fixtures derived from Toss OpenAPI 1.2.28 exercise submission acknowledgements,
+insufficient buying power, invalid KR ticks, and cumulative order details. A submission
+acknowledgement establishes a pending order without a fill. The order-detail checkpoint
+deduplicates repeated and older cumulative quantities and returns only new shares and gross fill
+amount. Terminal snapshots preserve earlier partial fills. These fixtures do not change the
+paper ledger or establish broker idempotency, account buying power, commissions, taxes, or
+settlement. Fee and tax fields can be null in the API and are excluded from these gross deltas.
+
 Offline fixtures cover cash reservation, whole-share affordability, account isolation, partial
 fills and retained ownership, calendar boundaries, stale/future prices, provider candle end
 semantics and causal AI context. A passing fixture does not establish live profitability.
