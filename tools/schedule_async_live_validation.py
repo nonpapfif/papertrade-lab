@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from tools.adaptive_journal import read_status as read_journal_status
-from tools.autotest_jobs import ROOT, atomic_json, poll_job, start_job
+from tools.autotest_jobs import ROOT, STOP_SECONDS, atomic_json, poll_job, start_job
 from tools.autotest_supervisor import command, read_json, tree_digest
 from tools.slot_control import SPOOL_NAME, SlotControl
+
+CUTOFF_DRAIN_SECONDS = 60
 
 
 def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
@@ -43,17 +45,33 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     slot_spool = output / SPOOL_NAME
     restarts: list[dict[str, Any]] = []
 
+    def paths(attempt: int) -> tuple[Path, Path]:
+        base = output / "attempts" / str(attempt) if attempt > 1 else output
+        return base / "job", base / "run"
+
     def save(state: str, **details: Any) -> None:
         if recovery:
             details["restarts"] = restarts
+        if state in ("failed", "blocked", "incomplete"):
+            attempt = len(restarts) + 1
+            job, run_output = paths(attempt)
+            details["failure_handoff"] = {
+                "attempt": attempt,
+                "source_commit": spec.get("source_commit"),
+                "source_digest": spec.get("source_digest"),
+                "evidence": {
+                    label: str(path.relative_to(output)) if path.is_file() else None
+                    for label, path in (
+                        ("worker_status", run_output / "status.json"),
+                        ("exit_record", job / "exit.json"),
+                        ("launch_claim", job / "start.claim"),
+                    )
+                },
+            }
         atomic_json(
             status,
             {"schedule": spec, "state": state, "at": time.time(), **details},
         )
-
-    def paths(attempt: int) -> tuple[Path, Path]:
-        base = output / "attempts" / str(attempt) if attempt > 1 else output
-        return base / "job", base / "run"
 
     if dynamic_slots and slot_spool.exists() and not status.exists():
         raise RuntimeError("Slot command spool already exists without its saved schedule")
@@ -92,6 +110,8 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             raise RuntimeError("Saved schedule state is inconsistent with its launch claim")
 
     result = None
+    stop_after = spec["end_epoch"] + CUTOFF_DRAIN_SECONDS
+    poll_until = stop_after + 2 * STOP_SECONDS
     try:
         while True:
             job, run_output = paths(len(restarts) + 1)
@@ -155,11 +175,24 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                         return 1
                     save("expired")
                     return 0
-                start_job(job, argv, ROOT)
+                start_job(job, argv, ROOT, stop_after=stop_after)
 
             save("running")
+            # Wall time determines the approved cutoff. Monotonic time also bounds the wait
+            # if the wall clock moves backward while the job is running.
+            poll_deadline = time.monotonic() + max(0, poll_until - time.time())
             while (result := poll_job(job)) is None:
-                time.sleep(2)
+                remaining = min(poll_until - time.time(), poll_deadline - time.monotonic())
+                if remaining <= 0:
+                    save(
+                        "incomplete",
+                        reason="Worker exit unverified after the approved window and drain",
+                    )
+                    return 1
+                time.sleep(min(remaining, 2))
+            if result.get("cutoff_stop") is True:
+                save("incomplete", job_exit=result, reason="Worker stopped after cutoff drain")
+                return 1
             if result["returncode"] == 0:
                 break
             if not recovery:
@@ -249,7 +282,7 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
         RuntimeError,
         TypeError,
         sqlite3.Error,
-        subprocess.CalledProcessError,
+        subprocess.SubprocessError,
     ) as error:
         save("blocked", reason=str(error), job_exit=result)
         return 1

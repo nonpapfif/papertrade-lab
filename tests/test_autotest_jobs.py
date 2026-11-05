@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,33 @@ class AutotestJobsTests(unittest.TestCase):
         self.assertEqual((self.directory / "stdout.log").read_text(), "request\nprivate-value\n")
         self.assertNotIn("private-value", (self.directory / "spec.json").read_text())
         self.assertEqual((self.directory / "environment.json").stat().st_mode & 0o777, 0o600)
+
+    def test_cutoff_kills_its_child_if_it_ignores_terminate(self) -> None:
+        atomic_json(
+            self.directory / "spec.json",
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import signal, time; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "print('ready', flush=True); time.sleep(60)"
+                    ),
+                ],
+                "cwd": str(ROOT),
+                "stdin": None,
+                "stop_after": time.time() + 1,
+            },
+        )
+        atomic_json(self.directory / "environment.json", {})
+        with patch("tools.autotest_jobs.STOP_SECONDS", 0.1):
+            self.assertEqual(_child(self.directory), 0)
+        result = poll_job(self.directory)
+        assert result is not None
+        self.assertTrue(result["cutoff_stop"])
+        self.assertEqual(result["returncode"], -signal.SIGKILL)
+        self.assertEqual((self.directory / "stdout.log").read_text(), "ready\n")
 
     def test_dead_identity_fails_closed(self) -> None:
         atomic_json(

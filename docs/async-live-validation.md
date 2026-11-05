@@ -136,7 +136,12 @@ received market frames and REST prices, candles, metadata, FX, and books. `manif
 hashes, selection assumptions, and the provider calendar. Missing activity or unexercised replacement
 is inconclusive rather than a pass. Existing ledgers are untouched.
 
-The end time is an observation deadline. In-flight HTTP transport cleanup can take slightly longer.
-Open positions and reservations are reported without invented liquidations. Durable crash resume
-is available with an adaptive journal. Broker queue priority and multi-session generalization
+The end time is an observation deadline. The scheduler gives the worker 60 seconds to drain
+after cutoff, then the job parent sends SIGTERM to its own child and escalates to SIGKILL if
+the child has not exited after another 5 seconds. A forced stop or unverified exit leaves
+the schedule incomplete and prevents another attempt. Open positions and reservations are
+reported without invented liquidations. With durable recovery enabled, HTTP 429 or 503 at
+WebSocket handshake follows the same journal and window checks as other recoverable API
+failures. The scheduler honors a valid Retry-After and waits at least two seconds.
+HTTP 401 and 403 remain terminal. Broker queue priority and multi-session generalization
 remain unverified.
