@@ -75,7 +75,7 @@ KR = PaperMarket(
 )
 
 
-def kr_stock_tick(price: float) -> int:
+def kr_stock_tick(price: float | Decimal) -> int:
     """KRX ordinary-stock tick sizes, shared by the modeled KR continuous market."""
     for ceiling, tick in (
         (2_000, 1),

@@ -7,9 +7,11 @@ import copy
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from tools.layered_paper import Feature, LayeredPaper, assign, holding_valid
+from tools.toss_order_contract import whole_share_limit
 
 
 def seconds(at: str) -> float:
@@ -32,6 +34,7 @@ class Intent:
     feature: Feature
     initial: dict[str, Any]
     policy_version: int = 0
+    order_request: dict[str, str] | None = None
 
 
 class AsyncLayeredPaper(LayeredPaper):
@@ -304,6 +307,21 @@ class AsyncLayeredPaper(LayeredPaper):
         )
         if not quantity:
             return
+        order_request = None
+        if "provider_symbol" in event:
+            try:
+                order_request = whole_share_limit(
+                    self.context.market,
+                    event["provider_symbol"],
+                    side,
+                    quantity,
+                    Decimal(str(limit)),
+                    client_order_id=event["id"].replace(":", "-"),
+                    held_quantity=quantity if side == "SELL" else 0,
+                )
+            except ValueError as error:
+                self.decisions[-1]["blocked_reason"] = str(error)
+                return
         intent = Intent(
             event["id"],
             symbol,
@@ -316,6 +334,7 @@ class AsyncLayeredPaper(LayeredPaper):
             f,
             copy.deepcopy(event["book"]),
             self.entry_policy_version if side == "BUY" else self.owner_policy_versions[symbol],
+            order_request,
         )
         self.pending[symbol] = intent
         self.intents.append(intent)
