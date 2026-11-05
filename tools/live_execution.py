@@ -8,9 +8,11 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, localcontext
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
+from tools.paper_market import KR, US, PaperMarket
+from tools.paper_market import us_limit_price as us_limit_price  # noqa: PLC0414 - public import
 from tools.search_portfolios import Book
 from tools.week_hypotheses import WeekEngine
 
@@ -28,24 +30,34 @@ DEFAULT_FEES: dict[str, float] = {
 }
 
 
-def us_limit_price(price: float) -> float:
-    """Truncate a US quote to the documented limit-price precision."""
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError("US limit price must be positive and finite")
-    precision = 2 if price >= 1 else 4
-    decimal_price = Decimal(str(price))
-    quantum = Decimal(1).scaleb(-precision)
-    with localcontext() as context:
-        context.prec = max(28, len(decimal_price.as_tuple().digits) + abs(decimal_price.adjusted()) + 4)
-        return float(decimal_price.quantize(quantum, rounding=ROUND_DOWN))
+KR_FEES: dict[str, float] = {
+    "commission_rate": 0.00015,
+    "stock_sale_tax_rate": 0.002,
+    "max_quote_age_seconds": 60.0,
+}
 
 
 def transaction_fees(
-    notional: float, quantity: int, side: str, schedule: dict[str, float]
+    notional: float,
+    quantity: int,
+    side: str,
+    schedule: dict[str, float],
+    *,
+    market: PaperMarket = US,
 ) -> dict[str, float]:
     """SEC cent rounding and its minimum are pass-through estimates, not confirmed Toss rules."""
     if not math.isfinite(notional) or notional < 0 or quantity < 0 or side not in {"BUY", "SELL"}:
         raise ValueError("Invalid virtual fee calculation")
+    if market == KR:
+        commission = notional * schedule["commission_rate"]
+        tax = notional * schedule["stock_sale_tax_rate"] if side == "SELL" else 0.0
+        return {
+            "commission_krw": commission,
+            "stock_sale_tax_krw": tax,
+            "total_krw": commission + tax,
+        }
+    if market != US:
+        raise ValueError("No fee schedule for this market")
     commission = (
         notional * schedule["commission_rate"]
         if notional > schedule["commission_exemption_usd"]
@@ -75,6 +87,7 @@ class ExecutionContext:
     requested: set[int] = field(default_factory=set)
     tax_realized_krw: dict[str, float] = field(default_factory=dict)
     tax_missing_fx: set[str] = field(default_factory=set)
+    market: PaperMarket = US
 
 
 class ExecutionBook(Book):
@@ -95,18 +108,40 @@ class ExecutionBook(Book):
         )
         self.context = context
         self.training_proxy = phase == "daily_shadow"
-        self.fee_totals = {
-            key: 0.0 for key in ("commission_usd", "sec_usd", "taf_usd", "total_usd")
-        }
+        if context.market not in (KR, US) or market != context.market.code:
+            raise ValueError("Execution market does not match the account")
+        self.currency_suffix = context.market.currency.lower()
+        self.total_fee_key = f"total_{self.currency_suffix}"
+        self.fee_totals = self.fees(0, 0, "BUY")
         self.entry_fees: dict[int, float] = {}
         self.entry_cost_krw: dict[int, float | None] = {}
         self.quote_failure_counts: Counter[str] = Counter()
         self.depth_at: str | None = None
         self.depth_used: dict[tuple[int, str], int] = {}
-        self.closed_net_usd = 0.0
+        self.closed_net = 0.0
         self.order_attempts: list[dict[str, Any]] = []
-        self.position_net_usd: dict[int, float] = {}
+        self.position_net: dict[int, float] = {}
+        self.position_net_usd = self.position_net
         self.entry_requested: dict[int, int] = {}
+
+    def fees(self, notional: float, quantity: int, side: str) -> dict[str, float]:
+        return transaction_fees(
+            notional, quantity, side, self.context.schedule, market=self.context.market
+        )
+
+    def entry_cost(self, quantity: int, price: float) -> float:
+        notional = quantity * price
+        return notional + self.fees(notional, quantity, "BUY")[self.total_fee_key]
+
+    def affordable_shares(self, budget: float, price: float) -> int:
+        low, high = 0, math.floor(budget / price)
+        while low < high:
+            quantity = (low + high + 1) // 2
+            if self.entry_cost(quantity, price) <= budget:
+                low = quantity
+            else:
+                high = quantity - 1
+        return low
 
     def _entry_intent_quantity(self, symbol: int, budget: float) -> int:
         if self.training_proxy or self.context.probing:
@@ -115,32 +150,15 @@ class ExecutionBook(Book):
         if initial is None:
             return 0
         try:
-            price = us_limit_price(
-                min(
-                    float(row["price"])
-                    for row in initial["asks"]
-                    if float(row["volume"]) >= 1
-                )
+            price = self.context.market.limit_price(
+                min(float(row["price"]) for row in initial["asks"] if float(row["volume"]) >= 1),
+                "BUY",
             )
             if not math.isfinite(price) or price <= 0:
                 return 0
         except (KeyError, TypeError, ValueError):
             return 0
-        budget = max(0.0, min(budget, self.cash))
-        low, high = 0, math.floor(budget / price)
-        while low < high:
-            quantity = (low + high + 1) // 2
-            cost = (
-                quantity * price
-                + transaction_fees(quantity * price, quantity, "BUY", self.context.schedule)[
-                    "total_usd"
-                ]
-            )
-            if cost <= budget:
-                low = quantity
-            else:
-                high = quantity - 1
-        return low
+        return self.affordable_shares(max(0.0, min(budget, self.cash)), price)
 
     def _attempt(self, symbol: int, side: str, requested: int, filled: int) -> None:
         if self.context.probing or not self.detailed:
@@ -175,7 +193,7 @@ class ExecutionBook(Book):
                 raise ValueError("No post-decision quote update")
             initial = frame["decision_orderbooks"][symbol]
             age = (decision - datetime.fromisoformat(initial["timestamp"])).total_seconds()
-            if initial.get("currency") != "USD" or not 0 <= age <= 60:
+            if initial.get("currency") != self.context.market.currency or not 0 <= age <= 60:
                 raise ValueError("Invalid initial quote")
             values = [
                 float(row["price"])
@@ -187,8 +205,8 @@ class ExecutionBook(Book):
             limit = frame.get("order_limits", {}).get(symbol)
             if limit is None:
                 limit = min(values) if side == "BUY" else max(values)
-                limit = us_limit_price(limit)
-            if limit <= 0:
+                limit = self.context.market.limit_price(limit, side)
+            if limit <= 0 or not self.context.market.valid_quote_level(limit, 1):
                 raise ValueError("Unavailable normalized order limit")
         except (KeyError, TypeError, ValueError):
             self._failure("confirmation_unavailable")
@@ -246,16 +264,20 @@ class ExecutionBook(Book):
                     reason = "quote_future"
                 elif age > self.context.schedule["max_quote_age_seconds"]:
                     reason = "quote_stale"
-                elif snapshot.get("currency") != "USD":
+                elif snapshot.get("currency") != self.context.market.currency:
                     reason = "quote_currency"
                 else:
                     levels = []
                     for row in snapshot["asks" if side == "BUY" else "bids"]:
                         price, volume = float(row["price"]), float(row["volume"])
+                        if self.context.market.code == "KR" and volume == 0:
+                            continue
                         if not math.isfinite(price) or price <= 0 or not math.isfinite(volume):
                             raise ValueError("Invalid depth level")
                         if volume < 0:
                             raise ValueError("Negative depth volume")
+                        if volume and not self.context.market.valid_quote_level(price, volume):
+                            raise ValueError("Invalid depth tick or quantity")
                         if math.floor(volume):
                             levels.append((price, math.floor(volume)))
                     levels.sort(reverse=side == "SELL")
@@ -308,7 +330,7 @@ class ExecutionBook(Book):
                 self._failure("quote_notional_invalid")
             return None
         fees = (
-            transaction_fees(notional, quantity, side, self.context.schedule)
+            self.fees(notional, quantity, side)
             if self.context.mode == "quotes"
             else {key: 0.0 for key in self.fee_totals}
         )
@@ -337,7 +359,7 @@ class ExecutionBook(Book):
                 high = quantity - 1
                 continue
             price, fees, _ = execution
-            if quantity * price + fees["total_usd"] <= budget:
+            if quantity * price + fees[self.total_fee_key] <= budget:
                 low = quantity
             else:
                 high = quantity - 1
@@ -394,7 +416,7 @@ class ExecutionBook(Book):
                     if execution is None:
                         raise RuntimeError("A planned virtual entry lost its immutable depth")
                     price, fees, _ = execution
-                    remaining_cash -= quantity * price + fees["total_usd"]
+                    remaining_cash -= quantity * price + fees[self.total_fee_key]
                 orders.append((row, quantity))
             rejected = sum(quantity == 0 for _, quantity in orders)
             self.zero_quantity += rejected
@@ -405,6 +427,8 @@ class ExecutionBook(Book):
                 return []
 
     def _current_fx(self) -> float | None:
+        if self.context.market.code == "KR":
+            return None
         frame, schedule = self.context.frame, self.context.schedule
         try:
             fx = float(frame["fx"])
@@ -431,7 +455,7 @@ class ExecutionBook(Book):
         return fx
 
     def _record_tax(self, realized_krw: float | None) -> None:
-        if self.training_proxy:
+        if self.training_proxy or self.context.market.code == "KR":
             return
         if realized_krw is None:
             self.context.tax_missing_fx.add(self.phase)
@@ -490,7 +514,8 @@ class ExecutionBook(Book):
             self._attempt(symbol, side, requested, 0)
             return
         actual_price, fees, source = execution
-        if entry and count * actual_price + fees["total_usd"] > self.cash:
+        total_fee = fees[self.total_fee_key]
+        if entry and count * actual_price + total_fee > self.cash:
             raise ValueError("Fee-inclusive virtual entry exceeds available cash")
         original = None if entry else copy.copy(self.positions[symbol])
         full_count = count if original is None else int(original.quantity)
@@ -507,34 +532,34 @@ class ExecutionBook(Book):
             self.positions[symbol] = original
             self.cooldowns.pop(symbol, None)
             self.closed -= 1
-        self.cash -= fees["total_usd"]
-        self.realized -= fees["total_usd"]
+        self.cash -= total_fee
+        self.realized -= total_fee
         for key, value in fees.items():
             self.fee_totals[key] += value
         if entry:
-            self.entry_fees[symbol] = fees["total_usd"]
+            self.entry_fees[symbol] = total_fee
             self.entry_cost_krw[symbol] = (
-                (count * actual_price + fees["total_usd"]) * fx if fx is not None else None
+                (count * actual_price + total_fee) * fx if fx is not None else None
             )
-            self.position_net_usd[symbol] = 0.0
+            self.position_net[symbol] = 0.0
         else:
             assert gross_pnl is not None
-            net_pnl = gross_pnl - entry_fee - fees["total_usd"]
-            cumulative = self.position_net_usd.get(symbol, 0.0) + net_pnl
+            net_pnl = gross_pnl - entry_fee - total_fee
+            cumulative = self.position_net.get(symbol, 0.0) + net_pnl
             self.wins += int(count == full_count and cumulative > 0) - int(gross_pnl > 0)
             if count == full_count:
                 self.entry_fees.pop(symbol, None)
                 self.entry_cost_krw.pop(symbol, None)
-                self.position_net_usd.pop(symbol, None)
+                self.position_net.pop(symbol, None)
             else:
                 self.entry_fees[symbol] -= entry_fee
                 self.entry_cost_krw[symbol] = (
                     basis - entry_basis if basis is not None and entry_basis is not None else None
                 )
-                self.position_net_usd[symbol] = cumulative
-            self.closed_net_usd += net_pnl
+                self.position_net[symbol] = cumulative
+            self.closed_net += net_pnl
             self._record_tax(
-                (count * actual_price - fees["total_usd"]) * fx - entry_basis
+                (count * actual_price - total_fee) * fx - entry_basis
                 if fx is not None and entry_basis is not None
                 else None
             )
@@ -548,24 +573,32 @@ class ExecutionBook(Book):
                 price_observed_at=self.context.frame.get("price_observed_at", at),
                 signal_source_at=self.context.frame.get("source_times", {}).get(symbol),
                 execution_model=self.context.mode,
-                accounting_currency="USD",
-                fee_usd=fees["total_usd"],
+                accounting_currency=self.context.market.currency,
                 fee_components=fees,
                 cash=self.cash,
                 gross_realized_pnl=gross_pnl,
                 realized_pnl=None if entry else net_pnl,
-                observed_fx_krw_per_usd=fx,
-                entry_cost_basis_krw=self.entry_cost_krw[symbol] if entry else entry_basis,
                 position_closed=not entry and count == full_count,
             )
+            trade[f"fee_{self.currency_suffix}"] = total_fee
+            if self.context.market.code == "US":
+                trade.update(
+                    observed_fx_krw_per_usd=fx,
+                    entry_cost_basis_krw=self.entry_cost_krw[symbol] if entry else entry_basis,
+                )
 
     def summary(self, prices: dict[int, float], times: dict[int, str], at: str) -> dict[str, Any]:
         result = super().summary(prices, times, at)
         schedule = self.context.schedule
-        annual = self.context.tax_realized_krw.get(
-            self.phase, schedule["annual_realized_before_run_krw"]
+        us_tax = self.context.market.code == "US"
+        annual = (
+            self.context.tax_realized_krw.get(
+                self.phase, schedule["annual_realized_before_run_krw"]
+            )
+            if us_tax
+            else 0.0
         )
-        tax_known = self.phase not in self.context.tax_missing_fx
+        tax_known = us_tax and self.phase not in self.context.tax_missing_fx
         reserve = (
             max(0.0, annual - schedule["annual_allowance_krw"]) * schedule["capital_gains_tax_rate"]
             if tax_known
@@ -587,7 +620,7 @@ class ExecutionBook(Book):
                 missing.append(symbol)
                 continue
             price, fees, _ = execution
-            net_proceeds = position.quantity * price - fees["total_usd"]
+            net_proceeds = position.quantity * price - fees[self.total_fee_key]
             liquidation += net_proceeds
             entry_basis = self.entry_cost_krw.get(symbol)
             if entry_basis is None:
@@ -607,36 +640,48 @@ class ExecutionBook(Book):
         result.update(
             execution_model=self.context.mode,
             mark_basis="last_price_mark_not_liquidated",
-            fees_usd=self.fee_totals["total_usd"],
-            commission_usd=self.fee_totals["commission_usd"],
-            sec_usd=self.fee_totals["sec_usd"],
-            taf_usd=self.fee_totals["taf_usd"],
-            closed_net_realized_usd=self.closed_net_usd,
             quote_failure_counts=dict(self.quote_failure_counts),
-            estimated_annual_realized_krw=annual if tax_known else None,
-            estimated_capital_tax_reserve_krw=reserve,
-            estimated_annual_realized_if_liquidated_krw=projected_annual,
-            estimated_capital_tax_reserve_if_liquidated_krw=projected_reserve,
-            bid_liquidation_equity_estimate_usd=bid_equity,
             bid_liquidation_missing_symbols=missing,
             bid_liquidation_coverage=(len(self.positions) - len(missing)) / len(self.positions)
             if self.positions
             else 1.0,
             bid_liquidation_as_of=self.context.frame.get("at"),
-            after_tax_mark_equity_estimate_usd=self.equity - reserve_usd
-            if reserve_usd is not None
-            else None,
-            after_tax_bid_liquidation_estimate_usd=bid_equity - projected_reserve / fx
-            if bid_equity is not None and projected_reserve is not None and fx is not None
-            else None,
-            capital_tax_cash_deducted_usd=0.0,
             order_attempts=len(self.order_attempts),
             unfilled_orders=sum(row["status"] == "unfilled" for row in self.order_attempts),
             partial_orders=sum(row["status"] == "partial" for row in self.order_attempts),
-            tax_basis="Annual KRW sale proceeds net of exit fees at observed exit FX, minus "
-            "purchase cost including entry fees at observed entry FX. Trade-time estimate "
-            "only, not legal settlement FX or a per-trade cash withdrawal.",
         )
+        suffix = self.currency_suffix
+        result.update(
+            {
+                f"fees_{suffix}": self.fee_totals[self.total_fee_key],
+                f"closed_net_realized_{suffix}": self.closed_net,
+                f"bid_liquidation_equity_estimate_{suffix}": bid_equity,
+                **{
+                    key: value
+                    for key, value in self.fee_totals.items()
+                    if key != self.total_fee_key
+                },
+            }
+        )
+        if us_tax:
+            result.update(
+                estimated_annual_realized_krw=annual if tax_known else None,
+                estimated_capital_tax_reserve_krw=reserve,
+                estimated_annual_realized_if_liquidated_krw=projected_annual,
+                estimated_capital_tax_reserve_if_liquidated_krw=projected_reserve,
+                after_tax_mark_equity_estimate_usd=self.equity - reserve_usd
+                if reserve_usd is not None
+                else None,
+                after_tax_bid_liquidation_estimate_usd=bid_equity - projected_reserve / fx
+                if bid_equity is not None and projected_reserve is not None and fx is not None
+                else None,
+                capital_tax_cash_deducted_usd=0.0,
+                tax_basis="Annual KRW sale proceeds net of exit fees at observed exit FX, minus "
+                "purchase cost including entry fees at observed entry FX. Trade-time estimate "
+                "only, not legal settlement FX or a per-trade cash withdrawal.",
+            )
+        else:
+            result["accounting_currency"] = self.context.market.currency
         return result
 
 

@@ -5,9 +5,11 @@ import copy
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from tools.async_layered_paper import AsyncLayeredPaper
 from tools.layered_paper import Feature
+from tools.paper_market import KR
 
 
 def stamp(seconds):
@@ -343,3 +345,151 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(a.reserved_cash, 90.09)
         await a.submit(event(at=2))
         self.assertGreaterEqual(a.book.cash, 0)
+
+
+def kr_event(at: int, ask: int = 5000, bid: int = 4995, volume: int = 100) -> dict[str, Any]:
+    stamp = (datetime(2026, 11, 5, 9, tzinfo=KR.timezone) + timedelta(seconds=at)).isoformat()
+    return {
+        "id": f"kr:{at}",
+        "symbol": 0,
+        "received_at": stamp,
+        "feature": Feature(0, ask, stamp, stamp, 0.01, 0.02, 4950, 4950, 0.8),
+        "eligible": True,
+        "book": {
+            "timestamp": stamp,
+            "currency": "KRW",
+            "asks": [{"price": str(ask), "volume": str(volume)}],
+            "bids": [{"price": str(bid), "volume": str(volume)}],
+        },
+    }
+
+
+class KRAsyncLayerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reservation_partial_exit_and_native_krw_ledger(self) -> None:
+        account = AsyncLayeredPaper(25_000, market=KR, policy="trend")
+        self.addAsyncCleanup(account.close)
+        account.entry_policy_version = 2
+
+        await account.submit(kr_event(0))
+        self.assertEqual(account.intents[-1].quantity, 4)
+        self.assertEqual(account.intents[-1].limit, 5000)
+        self.assertAlmostEqual(account.reserved_cash, 20_003)
+        self.assertEqual(account.book.cash, 25_000)
+        self.assertEqual(account.book.opened, 0)
+        await account.submit(kr_event(2, ask=4995, bid=4990, volume=3))
+        entry_commission = 4995 * 3 * 0.00015
+        self.assertEqual(account.book.positions[0].quantity, 3)
+        self.assertEqual(account.reserved_cash, 0)
+        self.assertAlmostEqual(account.book.cash, 25_000 - 4995 * 3 - entry_commission)
+        self.assertEqual(account.book.trades[-1]["source_at"], kr_event(2)["received_at"])
+
+        account.policy = "rebound"
+        account.entry_policy_version = 3
+        invalidation = kr_event(3, ask=4990, bid=4985)
+        invalidation["feature"] = replace(invalidation["feature"], r15=-0.01)
+        await account.submit(invalidation)
+        self.assertEqual(account.intents[-1].strategy, "trend")
+        self.assertEqual(account.intents[-1].policy_version, 2)
+        await account.submit(kr_event(5, ask=4990, bid=4985, volume=1))
+        summary = account.summary()
+        self.assertEqual(account.outcomes[-1]["status"], "partial")
+        self.assertEqual(summary["owned_positions"], {"0": "trend"})
+        self.assertEqual(account.owner_policy_versions, {0: 2})
+        self.assertEqual(summary["positions"]["0"]["quantity"], 2)
+        self.assertAlmostEqual(
+            summary["positions"]["0"]["remaining_entry_fees_krw"], 2 * entry_commission / 3
+        )
+        krw_account = summary["account"]
+        self.assertEqual(krw_account["accounting_currency"], "KRW")
+        sale_tax = 4985 * 0.002
+        sale_commission = 4985 * 0.00015
+        self.assertAlmostEqual(krw_account["stock_sale_tax_krw"], sale_tax)
+        self.assertAlmostEqual(
+            krw_account["fees_krw"], entry_commission + sale_commission + sale_tax
+        )
+        self.assertAlmostEqual(
+            krw_account["cash"], 25_000 - 3 * 4995 + 4985 - krw_account["fees_krw"]
+        )
+        self.assertAlmostEqual(sum(summary["realized_by_strategy"].values()), account.book.realized)
+        self.assertNotIn("fees_usd", krw_account)
+        self.assertNotIn("observed_fx_krw_per_usd", account.book.trades[-1])
+
+    async def test_currency_ticks_depth_and_confirmation_limit(self) -> None:
+        account = AsyncLayeredPaper(10_000, market=KR, policy="trend")
+        self.addAsyncCleanup(account.close)
+        foreign_currency = kr_event(0)
+        foreign_currency["book"]["currency"] = "USD"
+        await account.submit(foreign_currency)
+        await account.submit(kr_event(1, ask=5005))
+        fractional = kr_event(2)
+        fractional["book"]["asks"][0]["volume"] = "1.5"
+        await account.submit(fractional)
+        await account.submit(kr_event(3, bid=5010))
+        self.assertEqual(account.intents, [])
+
+        with_placeholder = kr_event(4)
+        with_placeholder["book"]["asks"].insert(0, {"price": "0", "volume": "0"})
+        await account.submit(with_placeholder)
+        self.assertEqual(account.prices[0], 4997.5)
+        self.assertEqual(account.intents[-1].quantity, 1)
+        await account.submit(kr_event(6, ask=5010))
+        self.assertEqual(account.outcomes[-1]["status"], "unfilled")
+        self.assertEqual(account.book.cash, 10_000)
+        self.assertEqual(account.reserved_cash, 0)
+        self.assertEqual(account.book.quote_failure_counts["quote_invalid"], 2)
+        self.assertEqual(account.book.quote_failure_counts["quote_crossed"], 1)
+
+    async def test_unusable_book_clears_executable_depth_but_keeps_last_mark(self) -> None:
+        for reason in ("crossed", "empty", "off_tick"):
+            with self.subTest(reason=reason):
+                account = AsyncLayeredPaper(10_000, market=KR, policy="trend")
+                self.addAsyncCleanup(account.close)
+                await account.submit(kr_event(0))
+                filled = kr_event(2)
+                filled["book"]["bids"].insert(0, {"price": "5010", "volume": "0"})
+                await account.submit(filled)
+                original = account.summary()
+                self.assertEqual(original["positions"]["0"]["mark_price"], 4997.5)
+                self.assertIsNotNone(
+                    original["account"]["bid_liquidation_equity_estimate_krw"]
+                )
+
+                unusable = kr_event(4)
+                if reason == "crossed":
+                    unusable["book"]["bids"][0]["price"] = "5010"
+                elif reason == "empty":
+                    unusable["book"]["bids"][0]["volume"] = "0"
+                else:
+                    unusable["book"]["bids"][0]["price"] = "4994"
+                await account.submit(unusable)
+                delayed = kr_event(5)
+                delayed["book"]["timestamp"] = kr_event(3)["received_at"]
+                await account.submit(delayed)
+                await account.advance(delayed["received_at"])
+                summary = account.summary()
+
+                self.assertEqual(
+                    summary["positions"]["0"]["mark_price"],
+                    original["positions"]["0"]["mark_price"],
+                )
+                self.assertEqual(
+                    summary["positions"]["0"]["mark_at"],
+                    original["positions"]["0"]["mark_at"],
+                )
+                self.assertIsNone(summary["account"]["bid_liquidation_equity_estimate_krw"])
+                self.assertEqual(summary["account"]["bid_liquidation_missing_symbols"], [0])
+
+    def test_ordinary_stock_tick_boundaries(self) -> None:
+        for upper, tick_below, tick_above in (
+            (2000, 1, 5),
+            (5000, 5, 10),
+            (20_000, 10, 50),
+            (50_000, 50, 100),
+            (200_000, 100, 500),
+            (500_000, 500, 1000),
+        ):
+            with self.subTest(price=upper):
+                self.assertEqual(KR.limit_price(upper - 0.25, "BUY"), upper - tick_below)
+                self.assertEqual(KR.limit_price(upper - 0.25, "SELL"), upper)
+                self.assertEqual(KR.limit_price(upper + 0.25, "BUY"), upper)
+                self.assertEqual(KR.limit_price(upper + 0.25, "SELL"), upper + tick_above)

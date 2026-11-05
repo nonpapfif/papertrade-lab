@@ -27,6 +27,7 @@ from papertrade.core import SafetyError, Settings
 ROOT = Path(__file__).resolve().parents[1]
 URL = "wss://openapi-ws.tossinvest.com/ws/v1"
 SPEC = "https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json"
+KR_SYMBOL = re.compile(r"[A-Za-z0-9]{6}")
 
 
 def now() -> str:
@@ -113,7 +114,8 @@ class CachedTokenClient(MarketClient):
 def declaration(market: str, symbols: list[str]) -> list[dict[str, Any]]:
     if market not in ("kr", "us") or not symbols or len(set(symbols)) != len(symbols):
         raise ValueError("Choose unique market-data symbols")
-    if len(symbols) * 2 > 100 or any(not SYMBOL.fullmatch(s) for s in symbols):
+    pattern = KR_SYMBOL if market == "kr" else SYMBOL
+    if len(symbols) * 2 > 100 or any(not pattern.fullmatch(s) for s in symbols):
         raise ValueError("Invalid symbols or provider subscription capacity exceeded")
     return [{"type": f"{channel}:{market}", "codes": symbols} for channel in ("trade", "orderbook")]
 
