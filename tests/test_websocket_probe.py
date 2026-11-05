@@ -3,6 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
+from papertrade.api import ApiError
 from tools.probe_toss_websocket import (
     declaration,
     error_details,
@@ -29,6 +30,15 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(details["error_type"], "OSError")
         self.assertNotIn("rcvd", details)
         self.assertNotIn("arbitrary", str(details))
+
+    def test_api_diagnostics_record_retry_metadata_without_provider_text(self) -> None:
+        details = error_details(
+            ApiError("private message", status=429, code="private code", retry_at=100), ""
+        )
+        self.assertEqual(details["api_status"], 429)
+        self.assertEqual(details["api_code"], "other")
+        self.assertEqual(details["api_retry_at"], 100)
+        self.assertNotIn("private", str(details))
 
     def test_clock_difference_is_not_clamped_or_called_latency(self) -> None:
         stats = {}

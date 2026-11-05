@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -13,19 +14,42 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from tools.adaptive_journal import read_status as read_journal_status
 from tools.autotest_jobs import ROOT, atomic_json, poll_job, start_job
 from tools.autotest_supervisor import command, read_json, tree_digest
 
 
+def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
+    state = run.get("state")
+    if state in ("complete", "incomplete", "interrupted"):
+        return False
+    if result["returncode"] == -signal.SIGKILL:
+        return state in (None, "running")
+    if result["returncode"] != 1 or state != "failed" or run.get("error_type") != "ApiError":
+        return False
+    status = run.get("api_status")
+    return status in (429, 500, 502, 503, 504) or (
+        status is None and run.get("api_code") in ("transport_error", "cooldown")
+    )
+
+
 def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     status = output / "status.json"
-    job = output / "job"
+    recovery = spec.get("recover") is True
+    journal = output / "journal.sqlite3"
+    restarts: list[dict[str, Any]] = []
 
     def save(state: str, **details: Any) -> None:
+        if recovery:
+            details["restarts"] = restarts
         atomic_json(
             status,
             {"schedule": spec, "state": state, "at": time.time(), **details},
         )
+
+    def paths(attempt: int) -> tuple[Path, Path]:
+        base = output / "attempts" / str(attempt) if attempt > 1 else output
+        return base / "job", base / "run"
 
     if status.exists():
         try:
@@ -37,40 +61,131 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
         previous_state = previous.get("state")
         if previous_state in ("complete", "expired", "failed", "blocked", "incomplete"):
             return int(previous_state in ("failed", "blocked", "incomplete"))
-        if previous_state != "waiting" and (
-            previous_state != "running" or not (job / "start.claim").exists()
+        if recovery:
+            history = previous.get("restarts")
+            if not isinstance(history, list):
+                raise RuntimeError("Saved schedule is missing restart evidence")
+            cursor = -1
+            for restart in history:
+                if (
+                    not isinstance(restart, dict)
+                    or type(restart.get("cursor")) is not int
+                    or restart["cursor"] <= cursor
+                    or not isinstance(restart.get("journal_hash"), str)
+                    or not isinstance(restart.get("job_exit"), dict)
+                ):
+                    raise RuntimeError("Saved restart evidence is invalid")
+                cursor = restart["cursor"]
+            restarts = history
+        job, _ = paths(len(restarts) + 1)
+        if not (
+            (previous_state == "waiting" and not restarts)
+            or (previous_state == "restarting" and restarts)
+            or (previous_state == "running" and (job / "start.claim").exists())
         ):
             raise RuntimeError("Saved schedule state is inconsistent with its launch claim")
 
     result = None
     try:
-        if not (job / "start.claim").exists():
-            if (output / "run").exists() or job.exists():
-                raise RuntimeError("Run or job already exists without a launch claim")
-            save("waiting")
-            while (remaining := spec["start_epoch"] - time.time()) > 0:
-                time.sleep(min(remaining, 30))
-            if time.time() >= spec["end_epoch"]:
-                save("expired")
-                return 0
-            if (
-                command(["git", "rev-parse", "HEAD"], ROOT) != spec["source_commit"]
-                or tree_digest(ROOT) != spec["source_digest"]
-            ):
-                raise RuntimeError("Approved source changed before launch")
-            if time.time() >= spec["end_epoch"]:
-                save("expired")
-                return 0
-            start_job(job, spec["argv"], ROOT)
+        while True:
+            job, run_output = paths(len(restarts) + 1)
+            result = None
+            if not (job / "start.claim").exists():
+                if run_output.exists() or job.exists():
+                    raise RuntimeError("Run or job already exists without a launch claim")
+                if not restarts:
+                    if recovery and journal.exists():
+                        raise RuntimeError("Journal already exists without a launch claim")
+                    save("waiting")
+                    while (remaining := spec["start_epoch"] - time.time()) > 0:
+                        time.sleep(min(remaining, 30))
+                if restarts:
+                    previous_job, _ = paths(len(restarts))
+                    if (
+                        not (previous_job / "start.claim").exists()
+                        or poll_job(previous_job) != restarts[-1]["job_exit"]
+                    ):
+                        raise RuntimeError("Previous job exit does not match restart decision")
+                    retry_at = restarts[-1].get("retry_at")
+                    if retry_at is not None:
+                        if not isinstance(retry_at, (int, float)) or not math.isfinite(retry_at):
+                            raise RuntimeError("Saved API retry time is invalid")
+                        if retry_at >= spec["end_epoch"]:
+                            save("incomplete", reason="API cooldown extends past approved window")
+                            return 1
+                        while (remaining := min(retry_at, spec["end_epoch"]) - time.time()) > 0:
+                            time.sleep(min(remaining, 30))
+                if time.time() >= spec["end_epoch"]:
+                    if restarts:
+                        save("incomplete", reason="Approved window ended before restart")
+                        return 1
+                    save("expired")
+                    return 0
+                if (
+                    command(["git", "rev-parse", "HEAD"], ROOT) != spec["source_commit"]
+                    or tree_digest(ROOT) != spec["source_digest"]
+                ):
+                    raise RuntimeError("Approved source changed before launch")
+                argv = list(spec["argv"])
+                if recovery:
+                    if restarts:
+                        verified = read_journal_status(journal)
+                        if (
+                            verified["state"] != "active"
+                            or verified["cursor"] != restarts[-1]["cursor"]
+                            or verified["hash"] != restarts[-1]["journal_hash"]
+                        ):
+                            raise RuntimeError("Journal changed after restart decision")
+                        argv[argv.index("--output") + 1] = str(run_output)
+                        argv.append("--resume")
+                    argv.extend(["--journal", str(journal)])
+                if time.time() >= spec["end_epoch"]:
+                    if restarts:
+                        save("incomplete", reason="Approved window ended before restart")
+                        return 1
+                    save("expired")
+                    return 0
+                start_job(job, argv, ROOT)
 
-        save("running")
-        while (result := poll_job(job)) is None:
-            time.sleep(2)
-        if result["returncode"] != 0:
-            save("failed", job_exit=result)
-            return 1
+            save("running")
+            while (result := poll_job(job)) is None:
+                time.sleep(2)
+            if result["returncode"] == 0:
+                break
+            if not recovery:
+                save("failed", job_exit=result)
+                return 1
+            status_file = run_output / "status.json"
+            run = read_json(status_file) if status_file.exists() else {}
+            run_state = run.get("state")
+            if not retryable_exit(result, run):
+                save("failed", job_exit=result, run_state=run_state)
+                return 1
+            if time.time() >= spec["end_epoch"]:
+                save("incomplete", job_exit=result, reason="Approved window ended after child exit")
+                return 1
+            verified = read_journal_status(journal)
+            cursor = verified["cursor"]
+            if verified["state"] != "active" or type(cursor) is not int or cursor < 0:
+                raise RuntimeError("Journal does not contain a recoverable account")
+            if restarts and cursor <= restarts[-1]["cursor"]:
+                save("failed", job_exit=result, reason="Journal cursor did not advance")
+                return 1
+            restarts.append(
+                {
+                    "cursor": cursor,
+                    "journal_hash": verified["hash"],
+                    "job_exit": result,
+                    "run_state": run_state,
+                    "api_status": run.get("api_status"),
+                    "api_code": run.get("api_code"),
+                    "retry_at": run.get("api_retry_at"),
+                    "at": time.time(),
+                }
+            )
+            save("restarting")
 
-        run = read_json(output / "run" / "status.json")
+        run = read_json(run_output / "status.json")
         run_state = run.get("state")
         if run_state in ("failed", "incomplete", "interrupted"):
             state = "failed" if run_state == "failed" else "incomplete"
@@ -105,6 +220,9 @@ def main() -> int:
     parser.add_argument("--capital", required=True, type=float)
     parser.add_argument("--source-digest", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--recover", action="store_true", help="Resume verified journal after a fault"
+    )
     args = parser.parse_args()
     if args.start_at.utcoffset() is None or args.end_at.utcoffset() is None:
         parser.error("Start and end require a timezone offset")
@@ -143,6 +261,7 @@ def main() -> int:
                 "source_commit": command(["git", "rev-parse", "HEAD"], ROOT),
                 "source_digest": args.source_digest,
                 "argv": argv,
+                **({"recover": True} if args.recover else {}),
             },
         )
 

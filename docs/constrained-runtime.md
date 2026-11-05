@@ -76,8 +76,8 @@ semantics and causal AI context. A passing fixture does not establish live profi
 The next required implementation is the KR layered quote/depth path. It must replace the separate
 diagnostic signal runner for full strategy validation. Durable account/intent recovery, final
 valuation freshness, cost-aware deterministic entry, and matched live validation remain open.
-There is no crash-resume guarantee in either runner. No new live campaign was launched by this
-implementation. Live-account access and numerical real-money risk policy remain separate gates.
+Recovery is available for the adaptive US mode described below. Live-account access and numerical
+real-money risk policy remain separate gates.
 
 ## US adaptive exploration
 
@@ -116,24 +116,22 @@ publication time, and book symbol in `runtime_event_failed`. Use these fields to
 recorded provider observation and reproduce it offline against the manifest's source version.
 Past runs containing only an exception class cannot recover the missing traceback.
 
-The one-shot scheduler intentionally refuses to recreate an already claimed run. Its JSON status
-and compressed market stream are diagnostic artifacts, not a recovery checkpoint. In particular,
-a status snapshot cannot reconstruct both accounts' pending intent objects, feature timing,
-original owner state, and exact ordering of policy changes.
+Enable durable recovery on a new adaptive US schedule with `--recover` on
+`tools.schedule_async_live_validation`, alongside its normal start, end, capital, source digest
+and output arguments. The initial attempt uses `run/` and `job/`; recovery attempts use
+`attempts/<number>/`. All attempts share `journal.sqlite3`. Keep that directory on reliable
+local storage. Prior non-journaled runs remain separate historical evidence.
 
-The next implementation slice is a durable journal for the paired paper engine:
+The worker commits exact ordered inputs, applied policy changes and paired account checksums
+to SQLite. An exclusive lock prevents simultaneous workers from updating the same journal.
+The worker checks source and settings hashes, capital, profile and cutoff, then replays the
+committed events before contacting the provider. Replay makes no AI calls. A recovery gap
+expires old intents under their existing rules and is reported separately from observed data.
+An event interrupted before commit may appear in attempt logs without being part of the
+restored account. The journal is authoritative for the committed boundary.
 
-1. Commit one ordered record of both accounts' exact decision inputs and applied policy changes
-   per financial event. Preserve schema, source, settings, and stable event identity. Use the
-   existing execution assumptions rather than changing rounding as part of recovery.
-2. Replay committed inputs without market or AI calls, verify both accounts and policy versions,
-   then acquire exclusive ownership before accepting fresh observations. Persist the restart gap
-   and apply the existing expiry rules to pending intents. Do not replay skipped market time.
-3. Allow the service manager to restart only an eligible interrupted run with a verified journal
-   before its original deadline. Leave completed, paused, corrupt, or incompatible runs stopped.
-   A repeated deterministic failure at the same cursor must block instead of spinning.
-
-Before enabling automatic recovery, kill and restore the paper worker around a reservation,
-partial fill, and policy change. Require exact agreement with uninterrupted account results
-when given identical inputs, no duplicated effects on repeated recovery, and no restart after
-the session cutoff. Keep the active one-shot run isolated from this development.
+The scheduler can restart a killed runner or a classified transient market-data failure.
+It waits for recorded provider cooldowns and keeps the original deadline. A repeated failure
+without journal progress, invalid journal, unknown process identity, explicit interruption,
+or incompatible source stops the schedule. Reattaching the scheduler with the same arguments
+reuses its durable attempt and restart records. Preserve old attempt files when investigating.
