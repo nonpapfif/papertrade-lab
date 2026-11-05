@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from papertrade.api import SYMBOL, MarketClient, private_json, secret_file
+from papertrade.api import SYMBOL, ApiError, MarketClient, private_json, secret_file
 from papertrade.core import SafetyError, Settings
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +40,14 @@ def read_spec() -> bytes:
 
 def error_details(error: BaseException, token: str) -> dict[str, Any]:
     details: dict[str, Any] = {"error_type": type(error).__name__}
+    if isinstance(error, ApiError):
+        details.update(
+            api_status=error.status,
+            api_code=error.code
+            if error.code in ("cooldown", "transport_error", "invalid_response", "authentication_failed")
+            else "other",
+            api_retry_at=error.retry_at,
+        )
     frames = []
     trace = error.__traceback__
     while trace is not None:

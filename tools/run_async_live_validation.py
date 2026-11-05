@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
+from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
 from tools.async_layered_paper import AsyncLayeredPaper, seconds
 from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
 from tools.live_feed import LiveFeed
@@ -55,6 +56,7 @@ SOURCES = (
 ADAPTIVE_SOURCES = (
     *SOURCES,
     "tools/us_adaptive_ai.py",
+    "tools/adaptive_journal.py",
     "tools/kr_comparison_ai.py",
     "papertrade/ai.py",
 )
@@ -169,6 +171,7 @@ class Runtime:
         if adaptive and (not self.constrained or candidate_policy is not None or end_epoch is None):
             raise ValueError("Adaptive experiment requires a constrained profile and fixed end")
         self.end_epoch = end_epoch
+        self.journal: AdaptiveJournal | None = None
         self.review_settings: Settings | None = None
         self.review_task: asyncio.Task | None = None
         self.review_calls: Counter = Counter()
@@ -282,11 +285,7 @@ class Runtime:
         return {key: getattr(account, key) for key in ENTRY_OPTIONS}
 
     def _consider_review(self, sequence: int, at: str, prepared: dict[str, Feature | None]) -> None:
-        if (
-            self.review_settings is None
-            or self.end_epoch is None
-            or seconds(at) >= self.end_epoch
-        ):
+        if self.review_settings is None or self.end_epoch is None or seconds(at) >= self.end_epoch:
             return
         candidate = self.accounts["candidate"]
         excluded = set(candidate.pending) | set(candidate.book.positions)
@@ -376,6 +375,8 @@ class Runtime:
         model = SOL
         try:
             while True:
+                if self.journal is not None:
+                    self.journal.append({"kind": "review_call", "model": model})
                 self.review_calls[model] += 1
                 review_id = sum(self.review_calls.values())
                 self.record(
@@ -409,13 +410,15 @@ class Runtime:
             raise
         self.publish("policy_review", None)
 
-    def _apply_review(self, sequence: int, received: str, result: Any) -> None:
+    def _apply_review(
+        self, sequence: int, received: str, result: Any, at: str | None = None
+    ) -> None:
         self.review_task = None
         if result is None:
             return
         review_id, base_version, response = result
         candidate = self.accounts["candidate"]
-        at = now()
+        at = now() if at is None else at
         if (
             self.end_epoch is None
             or seconds(at) >= self.end_epoch
@@ -449,237 +452,15 @@ class Runtime:
             started = time.monotonic()
             self.queue_delays.append(started - queued)
             try:
-                if kind == "selection":
-                    self.candidates = payload
-                elif kind == "calendar":
-                    day, calendar = payload
-                    self.regular_window = us_regular_window(calendar, day)
-                elif kind == "feature":
-                    symbol, rows = payload
-                    if self.constrained:
-                        window = self.regular_window
-                        rows = [
-                            row
-                            for row in rows
-                            if window is not None
-                            and window[0] < seconds(row["timestamp"]) <= window[1]
-                        ]
-                    self.features[symbol] = feature_from_bars(
-                        self.identifier(symbol),
-                        [{**r, "available_at": received} for r in rows],
-                        received,
-                        timestamp_is_end=self.constrained,
-                    )
-                    self.counts[
-                        "features_valid" if self.features[symbol] else "features_missing"
-                    ] += 1
-                elif kind == "fx":
-                    try:
-                        rate = float(payload["midRate"])
-                    except (KeyError, TypeError, ValueError):
-                        rate = 0
-                    pair_matches = (
-                        payload.get("baseCurrency", "USD") == "USD"
-                        and payload.get("quoteCurrency", "KRW") == "KRW"
-                    )
-                    if not math.isfinite(rate) or rate <= 0 or not pair_matches:
-                        self.counts["invalid_fx"] += 1
-                        rate = 0
-                    self.fx = (
-                        rate,
-                        received,
-                        payload.get("validFrom"),
-                        payload.get("validUntil"),
-                    )
-                elif kind == "policy_review":
-                    self._apply_review(sequence, received, payload)
-                elif kind == "book":
-                    symbol, book = payload
-                    self.symbol_delays.setdefault(symbol, []).append(started - queued)
-                    self.counts["book_events"] += 1
-                    if not isinstance(book, dict) or not isinstance(book.get("timestamp"), str):
-                        self.counts["book_unavailable"] += 1
-                        self.record(
-                            "book_rejected",
-                            reason="unavailable_timestamp",
-                            sequence=sequence,
-                            symbol=symbol,
-                        )
-                        continue
-                    source_age = seconds(received) - seconds(book["timestamp"])
-                    if not 0 <= source_age <= 60:
-                        self.counts["invalid_source_age"] += 1
-                        continue
-                    at = now() if self.constrained else ""
-                    if (
-                        self.adaptive
-                        and self.end_epoch is not None
-                        and seconds(at) >= self.end_epoch
-                    ):
-                        self.counts["after_experiment_cutoff"] += 1
-                        continue
-                    if self.constrained:
-                        window = self.regular_window
-                        if window is None or not all(
-                            window[0] <= seconds(stamp) < window[1]
-                            for stamp in (book["timestamp"], received, at)
-                        ):
-                            self.counts["outside_regular_session"] += 1
-                            continue
-                        if not book["asks"] or not book["bids"]:
-                            self.counts["missing_book_depth"] += 1
-                            continue
-                    old = self.books.get(symbol)
-                    if old and seconds(old["timestamp"]) > seconds(book["timestamp"]):
-                        self.counts["old_snapshot_ignored"] += 1
-                        continue
-                    paired = len(self.accounts) > 1
-                    if (
-                        (paired or self.constrained)
-                        and book.get("currency") == "USD"
-                        and book["asks"]
-                        and book["bids"]
-                        and max(float(row["price"]) for row in book["bids"])
-                        > min(float(row["price"]) for row in book["asks"])
-                    ):
-                        self.counts["crossed_orderbook_rejected"] += 1
-                        self.record(
-                            "book_rejected",
-                            reason="crossed_orderbook",
-                            sequence=sequence,
-                            symbol=symbol,
-                            source_at=book["timestamp"],
-                        )
-                        continue
-                    self.books[symbol] = book
-                    f = self.features.get(symbol)
-                    if f is not None and not self.constrained:
-                        price = (
-                            min(float(r["price"]) for r in book["asks"])
-                            + max(float(r["price"]) for r in book["bids"])
-                        ) / 2
-                        f = replace(
-                            f,
-                            price=price,
-                            r5=price / (f.price / (1 + f.r5)) - 1,
-                            r15=price / (f.price / (1 + f.r15)) - 1,
-                        )
-                    if not self.constrained:
-                        at = now()
-                    use_prepared = paired or self.constrained
-                    prepared = (
-                        {s: self._feature_at(s, at) for s in self.candidates}
-                        if use_prepared
-                        else {}
-                    )
-                    if use_prepared:
-                        f = self._feature_at(symbol, at)
-                    fresh = f is not None and 0 <= seconds(at) - seconds(f.bar_end) <= 90
-                    self.counts["fresh_features" if fresh else "unusable_features"] += 1
-                    if fresh and f is not None and assign(f, self.account.policy):
-                        self.counts["signal_observations"] += 1
-                    shared = {
-                        "id": f"live:{self.counts['book_events']}",
-                        "symbol": self.identifier(symbol),
-                        "received_at": at,
-                        "book": book,
-                        "feature": f,
-                        "eligible": symbol in self.candidates
-                        and (not self.adaptive or symbol in self.desired),
-                        "fx": self.fx[0],
-                        "fx_at": self.fx[1],
-                        "fx_valid_from": self.fx[2],
-                        "fx_valid_until": self.fx[3],
-                        "fx_provider_validity_required": self.constrained,
-                    }
-                    observation = (
-                        json.dumps(
-                            {
-                                "sequence": sequence,
-                                "published_at": received,
-                                **shared,
-                                "feature": asdict(f) if f is not None else None,
-                            },
-                            sort_keys=True,
-                            allow_nan=False,
-                        ).encode()
-                        + b"\n"
-                    )
-                    for name, account in self.accounts.items():
-                        before = len(account.intents), len(account.outcomes)
-                        excluded = set(account.pending) | set(account.book.positions)
-                        candidate_count = max(
-                            1,
-                            sum(
-                                self.ids.get(x) not in excluded
-                                and (
-                                    candidate_feature := (
-                                        prepared.get(x) if use_prepared else self.features.get(x)
-                                    )
-                                )
-                                is not None
-                                and 0 <= seconds(at) - seconds(candidate_feature.bar_end) <= 90
-                                and assign(candidate_feature, account.policy) is not None
-                                and (
-                                    not self.adaptive
-                                    or (
-                                        x in self.desired
-                                        and (
-                                            account.selection != "active"
-                                            or abs(candidate_feature.r5) >= 0.001
-                                            or abs(candidate_feature.r15) >= 0.003
-                                        )
-                                    )
-                                )
-                                for x in self.candidates
-                            ),
-                        )
-                        await account.submit({**shared, "candidate_count": candidate_count})
-                        self._record_delivery(name, observation)
-                        self.book_delivered[name] += 1
-                        identity = {"account": name} if paired else {}
-                        for i in account.intents[before[0] :]:
-                            self.record(
-                                "intent",
-                                symbol=symbol,
-                                quantity=i.quantity,
-                                side=i.side,
-                                decision_at=i.decision_at,
-                                reserved=i.reserved,
-                                **(
-                                    {
-                                        "intent_id": i.id,
-                                        "policy_version": i.policy_version,
-                                        "strategy": i.strategy,
-                                        "sequence": sequence,
-                                    }
-                                    if self.adaptive
-                                    else {}
-                                ),
-                                **identity,
-                            )
-                        for result in account.outcomes[before[1] :]:
-                            self.record("outcome", result=result, **identity)
-                    if self.adaptive:
-                        self._consider_review(sequence, at, prepared)
-                    if paired:
-                        self.record(
-                            "comparison_observation",
-                            sequence=sequence,
-                            symbol=symbol,
-                            received_at=received,
-                            decision_at=at,
-                            input_sha256=hashlib.sha256(observation).hexdigest(),
-                        )
-                elif kind == "clock":
-                    at = now()
-                    observation = json.dumps([sequence, "clock", received, at]).encode() + b"\n"
-                    for name, account in self.accounts.items():
-                        await account.advance(at)
-                        self._record_delivery(name, observation)
-                else:
-                    raise ValueError("Unknown runtime event")
-                self.desired = subscription_set(self.candidates, self.protected())
+                entry = {
+                    "sequence": sequence,
+                    "kind": kind,
+                    "payload": payload,
+                    "received": received,
+                }
+                await self._consume_event(entry, started - queued)
+                if self.journal is not None:
+                    self._commit(entry)
             except (ValueError, TypeError, KeyError, RuntimeError, OverflowError) as error:
                 self.record(
                     "runtime_event_failed",
@@ -693,6 +474,371 @@ class Runtime:
             finally:
                 self.processing_times.append(time.monotonic() - started)
                 self.queue.task_done()
+
+    async def _consume_event(
+        self, entry: dict[str, Any], queue_delay: float, *, saved: dict[str, Any] | None = None
+    ) -> None:
+        sequence, kind, payload, received = (
+            entry["sequence"],
+            entry["kind"],
+            entry["payload"],
+            entry["received"],
+        )
+        if kind == "selection":
+            self.candidates = payload
+        elif kind == "calendar":
+            day, calendar = payload
+            self.regular_window = us_regular_window(calendar, day)
+        elif kind == "feature":
+            symbol, rows = payload
+            if self.constrained:
+                window = self.regular_window
+                rows = [
+                    row
+                    for row in rows
+                    if window is not None and window[0] < seconds(row["timestamp"]) <= window[1]
+                ]
+            self.features[symbol] = feature_from_bars(
+                self.identifier(symbol),
+                [{**r, "available_at": received} for r in rows],
+                received,
+                timestamp_is_end=self.constrained,
+            )
+            self.counts["features_valid" if self.features[symbol] else "features_missing"] += 1
+        elif kind == "fx":
+            try:
+                rate = float(payload["midRate"])
+            except (KeyError, TypeError, ValueError):
+                rate = 0
+            pair_matches = (
+                payload.get("baseCurrency", "USD") == "USD"
+                and payload.get("quoteCurrency", "KRW") == "KRW"
+            )
+            if not math.isfinite(rate) or rate <= 0 or not pair_matches:
+                self.counts["invalid_fx"] += 1
+                rate = 0
+            self.fx = (
+                rate,
+                received,
+                payload.get("validFrom"),
+                payload.get("validUntil"),
+            )
+        elif kind == "policy_review":
+            if self.adaptive:
+                at = entry["at"] = entry.get("at") or now()
+                prior_version_count = len(self.policy_history)
+                self._apply_review(sequence, received, payload, at)
+                entry["applied"] = self.policy_history[prior_version_count:]
+            else:
+                self._apply_review(sequence, received, payload)
+        elif kind == "book":
+            symbol, book = payload
+            if saved is None:
+                self.symbol_delays.setdefault(symbol, []).append(queue_delay)
+            self.counts["book_events"] += 1
+            if not isinstance(book, dict) or not isinstance(book.get("timestamp"), str):
+                self.counts["book_unavailable"] += 1
+                self.record(
+                    "book_rejected",
+                    reason="unavailable_timestamp",
+                    sequence=sequence,
+                    symbol=symbol,
+                )
+                return
+            source_age = seconds(received) - seconds(book["timestamp"])
+            if not 0 <= source_age <= 60:
+                self.counts["invalid_source_age"] += 1
+                return
+            at = (entry.get("at") or now()) if self.constrained else ""
+            entry["at"] = at
+            if self.adaptive and self.end_epoch is not None and seconds(at) >= self.end_epoch:
+                self.counts["after_experiment_cutoff"] += 1
+                return
+            if self.constrained:
+                window = self.regular_window
+                if window is None or not all(
+                    window[0] <= seconds(stamp) < window[1]
+                    for stamp in (book["timestamp"], received, at)
+                ):
+                    self.counts["outside_regular_session"] += 1
+                    return
+                if not book["asks"] or not book["bids"]:
+                    self.counts["missing_book_depth"] += 1
+                    return
+            old = self.books.get(symbol)
+            if old and seconds(old["timestamp"]) > seconds(book["timestamp"]):
+                self.counts["old_snapshot_ignored"] += 1
+                return
+            paired = len(self.accounts) > 1
+            if (
+                (paired or self.constrained)
+                and book.get("currency") == "USD"
+                and book["asks"]
+                and book["bids"]
+                and max(float(row["price"]) for row in book["bids"])
+                > min(float(row["price"]) for row in book["asks"])
+            ):
+                self.counts["crossed_orderbook_rejected"] += 1
+                self.record(
+                    "book_rejected",
+                    reason="crossed_orderbook",
+                    sequence=sequence,
+                    symbol=symbol,
+                    source_at=book["timestamp"],
+                )
+                return
+            self.books[symbol] = book
+            f = self.features.get(symbol)
+            if f is not None and not self.constrained:
+                price = (
+                    min(float(r["price"]) for r in book["asks"])
+                    + max(float(r["price"]) for r in book["bids"])
+                ) / 2
+                f = replace(
+                    f,
+                    price=price,
+                    r5=price / (f.price / (1 + f.r5)) - 1,
+                    r15=price / (f.price / (1 + f.r15)) - 1,
+                )
+            if not self.constrained:
+                at = now()
+            use_prepared = paired or self.constrained
+            prepared = {s: self._feature_at(s, at) for s in self.candidates} if use_prepared else {}
+            if use_prepared:
+                f = self._feature_at(symbol, at)
+            fresh = f is not None and 0 <= seconds(at) - seconds(f.bar_end) <= 90
+            self.counts["fresh_features" if fresh else "unusable_features"] += 1
+            if fresh and f is not None and assign(f, self.account.policy):
+                self.counts["signal_observations"] += 1
+            shared = {
+                "id": f"live:{self.counts['book_events']}",
+                "symbol": self.identifier(symbol),
+                "received_at": at,
+                "book": book,
+                "feature": f,
+                "eligible": symbol in self.candidates
+                and (not self.adaptive or symbol in self.desired),
+                "fx": self.fx[0],
+                "fx_at": self.fx[1],
+                "fx_valid_from": self.fx[2],
+                "fx_valid_until": self.fx[3],
+                "fx_provider_validity_required": self.constrained,
+            }
+            observation = (
+                json.dumps(
+                    {
+                        "sequence": sequence,
+                        "published_at": received,
+                        **shared,
+                        "feature": asdict(f) if f is not None else None,
+                    },
+                    sort_keys=True,
+                    allow_nan=False,
+                ).encode()
+                + b"\n"
+            )
+            for name, account in self.accounts.items():
+                before = len(account.intents), len(account.outcomes)
+                excluded = set(account.pending) | set(account.book.positions)
+                candidate_count = max(
+                    1,
+                    sum(
+                        self.ids.get(x) not in excluded
+                        and (
+                            candidate_feature := (
+                                prepared.get(x) if use_prepared else self.features.get(x)
+                            )
+                        )
+                        is not None
+                        and 0 <= seconds(at) - seconds(candidate_feature.bar_end) <= 90
+                        and assign(candidate_feature, account.policy) is not None
+                        and (
+                            not self.adaptive
+                            or (
+                                x in self.desired
+                                and (
+                                    account.selection != "active"
+                                    or abs(candidate_feature.r5) >= 0.001
+                                    or abs(candidate_feature.r15) >= 0.003
+                                )
+                            )
+                        )
+                        for x in self.candidates
+                    ),
+                )
+                submission = {**shared, "candidate_count": candidate_count}
+                if self.journal is not None or saved is not None:
+                    encoded = {**submission, "feature": asdict(f) if f is not None else None}
+                    entry.setdefault("submissions", {})[name] = encoded
+                    if saved is not None:
+                        recorded = saved["submissions"][name]
+                        if encode(encoded) != encode(recorded):
+                            raise JournalError("Journal submission does not match observations")
+                        feature = recorded["feature"]
+                        submission = {
+                            **recorded,
+                            "feature": Feature(**feature) if feature else None,
+                        }
+                await account.submit(submission)
+                self._record_delivery(name, observation)
+                self.book_delivered[name] += 1
+                identity = {"account": name} if paired else {}
+                for i in account.intents[before[0] :]:
+                    self.record(
+                        "intent",
+                        symbol=symbol,
+                        quantity=i.quantity,
+                        side=i.side,
+                        decision_at=i.decision_at,
+                        reserved=i.reserved,
+                        **(
+                            {
+                                "intent_id": i.id,
+                                "policy_version": i.policy_version,
+                                "strategy": i.strategy,
+                                "sequence": sequence,
+                            }
+                            if self.adaptive
+                            else {}
+                        ),
+                        **identity,
+                    )
+                for result in account.outcomes[before[1] :]:
+                    self.record("outcome", result=result, **identity)
+            if self.adaptive and saved is None:
+                self._consider_review(sequence, at, prepared)
+            if self.adaptive:
+                entry["observation"] = observation.decode()
+            if paired:
+                self.record(
+                    "comparison_observation",
+                    sequence=sequence,
+                    symbol=symbol,
+                    received_at=received,
+                    decision_at=at,
+                    input_sha256=hashlib.sha256(observation).hexdigest(),
+                )
+        elif kind == "clock":
+            at = entry["at"] = entry.get("at") or now()
+            observation = json.dumps([sequence, "clock", received, at]).encode() + b"\n"
+            expired = await self._advance(at, observation)
+            if self.journal is not None or saved is not None:
+                entry["observation"] = observation.decode()
+                entry["expired"] = expired
+        else:
+            raise ValueError("Unknown runtime event")
+        self.desired = subscription_set(self.candidates, self.protected())
+
+    async def _advance(self, at: str, observation: bytes) -> dict[str, list[dict[str, Any]]]:
+        expired = {}
+        for name, account in self.accounts.items():
+            before = len(account.outcomes)
+            await account.advance(at)
+            if len(account.outcomes) > before:
+                expired[name] = account.outcomes[before:]
+            self._record_delivery(name, observation)
+        return expired
+
+    def _checkpoint(self) -> str:
+        return digest(
+            encode(
+                {
+                    name: {
+                        "cash": account.book.cash,
+                        "realized": account.book.realized,
+                        "fees": account.book.fee_totals,
+                        "entry_fees": account.book.entry_fees,
+                        "position_marks": {
+                            s: (account.prices[s], account.times[s]) for s in account.book.positions
+                        },
+                        "positions": {s: asdict(p) for s, p in account.book.positions.items()},
+                        "owners": account.owners,
+                        "owner_versions": account.owner_policy_versions,
+                        "pending": {s: asdict(i) for s, i in account.pending.items()},
+                        "intent_count": len(account.intents),
+                        "outcome_count": len(account.outcomes),
+                        "trade_count": len(account.book.trades),
+                        "last_intent": asdict(account.intents[-1]) if account.intents else None,
+                        "last_outcome": account.outcomes[-1] if account.outcomes else None,
+                        "last_trade": account.book.trades[-1] if account.book.trades else None,
+                        "last_at": account.last_at,
+                        "policy_version": account.entry_policy_version,
+                        "input_hash": self.delivery_hashes[name].hexdigest(),
+                    }
+                    for name, account in self.accounts.items()
+                }
+            )
+        )
+
+    def _commit(self, entry: dict[str, Any]) -> None:
+        assert self.journal is not None
+        self.journal.append(
+            {
+                **entry,
+                "checkpoint": self._checkpoint(),
+                "reviewed_fills": self.reviewed_fills,
+                "active_opportunities": sorted(self.active_opportunities),
+                "new_opportunities": self.new_opportunities,
+            }
+        )
+
+    async def restore(self, journal: AdaptiveJournal) -> None:
+        original_record = self.record
+        self.record = lambda *_args, **_kwargs: None
+        try:
+            for saved in journal.events():
+                kind = saved["kind"]
+                if kind == "initial":
+                    if saved["index"] != 1:
+                        raise JournalError("Unexpected journal initialization record")
+                    self.fx = (0, saved["fx_at"], None, None)
+                    continue
+                if saved["index"] == 1:
+                    raise JournalError("Journal has no initialization record")
+                if kind == "review_call":
+                    self.review_calls[saved["model"]] += 1
+                    continue
+                entry = {key: saved[key] for key in ("sequence", "kind", "payload", "received")}
+                if "at" in saved:
+                    entry["at"] = saved["at"]
+                if kind in ("recovery_gap", "final_advance"):
+                    await self._advance_marker(entry)
+                else:
+                    if entry["sequence"] != self.sequence + 1:
+                        raise JournalError("Journal observation sequence mismatch")
+                    self.sequence = entry["sequence"]
+                    await self._consume_event(entry, 0, saved=saved)
+                if (
+                    encode(entry) != encode({key: saved[key] for key in entry})
+                    or saved["checkpoint"] != self._checkpoint()
+                ):
+                    raise JournalError("Journal replay diverged from committed account results")
+                self.reviewed_fills = saved["reviewed_fills"]
+                self.active_opportunities = {
+                    (symbol, family) for symbol, family in saved["active_opportunities"]
+                }
+                self.new_opportunities = saved["new_opportunities"]
+        finally:
+            self.record = original_record
+        self.journal = journal
+
+    async def _advance_marker(self, entry: dict[str, Any]) -> None:
+        expired = await self._advance(entry["at"], (encode(entry) + "\n").encode())
+        entry["gap_expired"] = expired
+        self.desired = subscription_set(self.candidates, self.protected())
+
+    async def mark_advance(self, kind: str, at: str) -> None:
+        last = self.account.last_at
+        entry = {
+            "kind": kind,
+            "sequence": self.sequence,
+            "payload": {"last_at": last},
+            "received": at,
+            "at": at,
+        }
+        await self._advance_marker(entry)
+        self._commit(entry)
+        self.record(kind, sequence=self.sequence, previous_at=last, at=at)
 
     def status(self) -> dict[str, Any]:
         result = {
@@ -867,6 +1013,20 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
         await asyncio.sleep(delay)
 
 
+def journal_identity(capital: float, end_epoch: float) -> dict[str, Any]:
+    return {
+        "profile": "broker-constrained",
+        "experiment": "adaptive_exploration",
+        "capital": float(capital),
+        "end_epoch": end_epoch,
+        "source_sha256": {
+            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+            for path in ADAPTIVE_SOURCES
+        },
+        "settings_sha256": hashlib.sha256((ROOT / "settings.toml").read_bytes()).hexdigest(),
+    }
+
+
 async def campaign(
     output: Path,
     duration: int,
@@ -876,6 +1036,54 @@ async def campaign(
     profile: str = "legacy",
     adaptive: bool = False,
     end_epoch: float | None = None,
+    journal_path: Path | None = None,
+    resume: bool = False,
+) -> None:
+    if resume and journal_path is None:
+        raise ValueError("Recovery requires an existing journal")
+    if journal_path is None:
+        await _campaign(
+            output,
+            duration,
+            capital,
+            candidate_policy=candidate_policy,
+            profile=profile,
+            adaptive=adaptive,
+            end_epoch=end_epoch,
+        )
+        return
+    if not adaptive or profile != "broker-constrained" or end_epoch is None:
+        raise ValueError("Recovery journals require the constrained adaptive profile")
+    if not math.isfinite(end_epoch) or time.time() >= end_epoch:
+        raise ValueError("Campaign cutoff reached before journal open")
+    os.umask(0o077)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    identity = journal_identity(capital, end_epoch)
+    with AdaptiveJournal.open(journal_path, identity, resume=resume) as journal:
+        await _campaign(
+            output,
+            duration,
+            capital,
+            candidate_policy=candidate_policy,
+            profile=profile,
+            adaptive=adaptive,
+            end_epoch=end_epoch,
+            journal=journal,
+            resume=resume,
+        )
+
+
+async def _campaign(
+    output: Path,
+    duration: int,
+    capital: float,
+    *,
+    candidate_policy: str | None = None,
+    profile: str = "legacy",
+    adaptive: bool = False,
+    end_epoch: float | None = None,
+    journal: AdaptiveJournal | None = None,
+    resume: bool = False,
 ) -> None:
     if adaptive and (
         profile != "broker-constrained"
@@ -923,7 +1131,24 @@ async def campaign(
     token = ""
     resync = asyncio.Event()
     try:
+        if journal is not None:
+            if resume:
+                await runtime.restore(journal)
+                if journal.evidence()["records"] == 0:
+                    journal.append({"kind": "initial", "fx_at": runtime.fx[1]})
+                stats["recovered_from"] = journal.evidence()
+                recovered_at = now()
+                if end_epoch is None or seconds(recovered_at) >= end_epoch:
+                    raise CampaignCutoff("Campaign cutoff reached during replay")
+                await runtime.mark_advance("recovery_gap", recovered_at)
+            else:
+                runtime.journal = journal
+                journal.append({"kind": "initial", "fx_at": runtime.fx[1]})
         settings = Settings.load(ROOT)
+        if journal is not None and (
+            end_epoch is None or journal_identity(capital, end_epoch) != journal.identity
+        ):
+            raise JournalError("Campaign source or settings changed during initialization")
         if adaptive:
             runtime.review_settings = settings
         data = copy.deepcopy(settings.data)
@@ -976,13 +1201,17 @@ async def campaign(
                         "entry_options": ENTRY_OPTIONS,
                         "ai_models": [SOL, ASTRA],
                         "ai_reasoning_effort": "medium",
+                        "durable_journal": journal is not None,
+                        "resumed": resume,
                     }
                     if adaptive
                     else {}
                 ),
-                "source_sha256": {
-                    p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources
-                },
+                "source_sha256": (
+                    journal.identity["source_sha256"]
+                    if journal is not None
+                    else {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources}
+                ),
                 "selection": (
                     "Absolute change between consecutive fresh minute scans; USD common shares"
                 ),
@@ -1009,8 +1238,19 @@ async def campaign(
                 ),
                 "limitations": [
                     "One connection, market-data only; not all symbols continuously watched",
-                    "No crash-resume implementation; finite isolated paper account",
+                    (
+                        "Recovery replays committed inputs and skips missed market time"
+                        if journal is not None
+                        else "No recovery journal configured; finite isolated paper account"
+                    ),
                     "Single live sample does not establish profitability",
+                    *(
+                        [
+                            "Attempt artifacts cover current acquisition only; accounts include replay"
+                        ]
+                        if resume
+                        else []
+                    ),
                 ],
             },
         )
@@ -1235,6 +1475,8 @@ async def campaign(
         streamer = asyncio.create_task(stream())
         tasks = [consumer, collector, streamer]
         while time.monotonic() < deadline:
+            if runtime.review_task is not None and runtime.review_task.done():
+                runtime.review_task.result()
             for task in tasks:
                 if task.done():
                     task.result()
@@ -1266,8 +1508,11 @@ async def campaign(
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
         at = now()
-        for account in runtime.accounts.values():
-            await account.advance(at)
+        if journal is not None:
+            await runtime.mark_advance("final_advance", at)
+        else:
+            for account in runtime.accounts.values():
+                await account.advance(at)
         await runtime.close()
         stats.update(state="complete", at=now(), **runtime.status())
         checks = {
@@ -1319,6 +1564,8 @@ async def campaign(
         elif stats.get("state") == "complete":
             stats.setdefault("ended_at", stats.get("at", now()))
         stats.update(**runtime.status())
+        if journal is not None:
+            stats["journal"] = journal.evidence()
         private_json(output / "http-audit.json", {"requests": http_audit})
         files.close()
         comparison = write_comparison(output, stats, runtime)
@@ -1333,6 +1580,8 @@ async def campaign(
                 source_unchanged=comparison["source_unchanged"],
                 freeze_matches=comparison["freeze_matches"],
             )
+        if journal is not None and stats["state"] == "complete":
+            journal.complete()
         private_json(output / "status.json", stats)
 
 
@@ -1345,7 +1594,13 @@ def main() -> None:
     parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
+    parser.add_argument("--journal", type=Path, help="Durable journal for an adaptive campaign")
+    parser.add_argument(
+        "--resume", action="store_true", help="Recover an existing campaign journal"
+    )
     args = parser.parse_args()
+    if (args.journal is not None and not args.adaptive) or (args.resume and args.journal is None):
+        parser.error("--journal requires --adaptive and --resume requires --journal")
     if (
         (not args.adaptive and args.duration < 360)
         or not math.isfinite(args.capital)
@@ -1366,6 +1621,7 @@ def main() -> None:
         parser.error("--end-at requires --adaptive")
     if args.profile == "broker-constrained" and args.candidate_policy is not None:
         parser.error("The broker-constrained profile runs a single trend baseline")
+
     async def run() -> None:
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
@@ -1381,6 +1637,8 @@ def main() -> None:
                 profile=args.profile,
                 adaptive=args.adaptive,
                 end_epoch=end_epoch,
+                journal_path=args.journal.resolve() if args.journal else None,
+                resume=args.resume,
             )
         finally:
             if args.adaptive:
@@ -1390,7 +1648,8 @@ def main() -> None:
         asyncio.run(run())
     except asyncio.CancelledError:
         raise SystemExit("Live validation interrupted") from None
-
+    except JournalError:
+        raise SystemExit("Live validation journal unavailable or incompatible") from None
 
 
 if __name__ == "__main__":

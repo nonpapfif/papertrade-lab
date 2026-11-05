@@ -8,9 +8,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from tools import schedule_async_live_validation as schedule
+from tools.adaptive_journal import AdaptiveJournal
 
 
 class ScheduleTest(unittest.TestCase):
@@ -116,3 +118,223 @@ class ScheduleTest(unittest.TestCase):
                 schedule.run_schedule(output, {})
             self.assertEqual(status.read_text(), '{"state":')
             self.assertFalse((output / "job").exists())
+
+
+RECOVERY_CHILD = """
+import argparse
+import json
+import os
+import signal
+from pathlib import Path
+
+from tools.adaptive_journal import AdaptiveJournal
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--output", type=Path)
+parser.add_argument("--journal", type=Path)
+parser.add_argument("--resume", action="store_true")
+parser.add_argument("--kill-resumed", action="store_true")
+args = parser.parse_args()
+args.output.mkdir()
+identity = {"test_account": "original"}
+with AdaptiveJournal.open(args.journal, identity, resume=args.resume) as journal:
+    if not args.resume:
+        journal.append({"kind": "clock", "expired": ["test_intent"]})
+    else:
+        assert list(journal.events())[0]["kind"] == "clock"
+    if not args.resume or args.kill_resumed:
+        os.kill(os.getpid(), signal.SIGKILL)
+    journal.complete()
+    (args.output / "status.json").write_text(json.dumps({
+        "state": "complete",
+        "result": "inconclusive",
+        "comparison": {"complete": True, "source_unchanged": True, "freeze_matches": True},
+    }))
+"""
+
+
+class RecoveryScheduleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.output = Path(directory.name)
+        now = time.time()
+        self.spec: dict[str, Any] = {
+            "start_epoch": now - 1,
+            "end_epoch": now + 30,
+            "source_commit": "approved",
+            "source_digest": "expected",
+            "argv": [sys.executable, "-c", RECOVERY_CHILD, "--output", str(self.output / "run")],
+            "recover": True,
+        }
+        sleep = time.sleep
+        self.enterContext(patch.object(schedule, "command", return_value="approved"))
+        self.enterContext(patch.object(schedule, "tree_digest", return_value="expected"))
+        self.enterContext(patch.object(schedule.time, "sleep", side_effect=lambda _: sleep(0.02)))
+
+    def status(self) -> dict[str, Any]:
+        return json.loads((self.output / "status.json").read_text())
+
+    def test_killed_child_resumes_same_journal_and_completes_once(self) -> None:
+        self.assertEqual(schedule.run_schedule(self.output, self.spec), 0)
+        status = self.status()
+        self.assertEqual(status["state"], "complete")
+        self.assertEqual(status["restarts"][0]["job_exit"]["returncode"], -9)
+        self.assertEqual(status["restarts"][0]["cursor"], 1)
+        self.assertEqual(status["job_exit"]["returncode"], 0)
+        self.assertTrue((self.output / "attempts/2/run/status.json").exists())
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 0)
+            start.assert_not_called()
+
+    def test_failure_at_same_cursor_does_not_restart_again(self) -> None:
+        self.spec["argv"].append("--kill-resumed")
+        self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+        status = self.status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["reason"], "Journal cursor did not advance")
+        self.assertEqual(len(status["restarts"]), 1)
+        self.assertFalse((self.output / "attempts/3").exists())
+
+    def test_controller_reattaches_before_and_after_restart_claim(self) -> None:
+        start_job = schedule.start_job
+
+        def interrupt_before_start(directory: Path, argv: list[str], cwd: Path) -> None:
+            if "--resume" in argv:
+                raise KeyboardInterrupt
+            start_job(directory, argv, cwd)
+
+        def interrupt_after_start(directory: Path, argv: list[str], cwd: Path) -> None:
+            start_job(directory, argv, cwd)
+            raise KeyboardInterrupt
+
+        with (
+            patch.object(schedule, "start_job", side_effect=interrupt_before_start),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            schedule.run_schedule(self.output, self.spec)
+        self.assertEqual(self.status()["state"], "restarting")
+        with (
+            patch.object(schedule, "start_job", side_effect=interrupt_after_start),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            schedule.run_schedule(self.output, self.spec)
+        self.assertEqual(self.status()["state"], "restarting")
+        self.assertTrue((self.output / "attempts/2/job/start.claim").exists())
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 0)
+            start.assert_not_called()
+
+    def test_deadline_after_child_exit_blocks_recovery(self) -> None:
+        job = self.output / "job"
+        job.mkdir()
+        (job / "start.claim").write_text("123\n")
+        (job / "exit.json").write_text('{"returncode": -9}')
+        self.spec["end_epoch"] = time.time() - 1
+        self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+        self.assertEqual(self.status()["state"], "incomplete")
+        self.assertFalse((self.output / "attempts").exists())
+
+    def test_recovery_refuses_missing_or_corrupt_journal(self) -> None:
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                job = output / "job"
+                job.mkdir()
+                (job / "start.claim").write_text("123\n")
+                (job / "exit.json").write_text('{"returncode": -9}')
+                if corrupt:
+                    (output / "journal.sqlite3").write_text("invalid journal")
+                self.assertEqual(schedule.run_schedule(output, self.spec), 1)
+                self.assertFalse((output / "attempts").exists())
+                status = json.loads((output / "status.json").read_text())
+                self.assertEqual(status["state"], "blocked")
+
+    def test_stop_and_auth_failure_are_terminal(self) -> None:
+        for code, run in (
+            (-15, {"state": "running"}),
+            (1, {"state": "interrupted"}),
+            (1, {"state": "failed", "error_type": "ApiError", "api_status": 401}),
+        ):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                job = output / "job"
+                job.mkdir()
+                (job / "start.claim").write_text("123\n")
+                (job / "exit.json").write_text(json.dumps({"returncode": code}))
+                run_output = output / "run"
+                run_output.mkdir()
+                (run_output / "status.json").write_text(json.dumps(run))
+                self.assertEqual(schedule.run_schedule(output, self.spec), 1)
+                self.assertFalse((output / "attempts").exists())
+                status = json.loads((output / "status.json").read_text())
+                self.assertEqual(status["state"], "failed")
+
+    def test_saved_restart_requires_matching_previous_exit(self) -> None:
+        job = self.output / "job"
+        job.mkdir()
+        (job / "start.claim").write_text("123\n")
+        (job / "exit.json").write_text('{"returncode": -15}')
+        schedule.atomic_json(
+            self.output / "status.json",
+            {
+                "schedule": self.spec,
+                "state": "restarting",
+                "restarts": [{"cursor": 1, "journal_hash": "test", "job_exit": {"returncode": -9}}],
+            },
+        )
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            start.assert_not_called()
+        self.assertEqual(self.status()["state"], "blocked")
+        self.assertEqual(
+            self.status()["reason"], "Previous job exit does not match restart decision"
+        )
+
+    def test_provider_cooldown_past_deadline_prevents_restart(self) -> None:
+        job = self.output / "job"
+        job.mkdir()
+        (job / "start.claim").write_text("123\n")
+        (job / "exit.json").write_text('{"returncode": 1}')
+        run = self.output / "run"
+        run.mkdir()
+        schedule.atomic_json(
+            run / "status.json",
+            {
+                "state": "failed",
+                "error_type": "ApiError",
+                "api_status": 429,
+                "api_retry_at": self.spec["end_epoch"] + 1,
+            },
+        )
+        with AdaptiveJournal.open(
+            self.output / "journal.sqlite3", {"test_account": "original"}, resume=False
+        ) as journal:
+            journal.append({"kind": "clock", "expired": ["test_intent"]})
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            start.assert_not_called()
+        self.assertEqual(self.status()["state"], "incomplete")
+        self.assertEqual(self.status()["reason"], "API cooldown extends past approved window")
+
+    def test_journal_change_at_same_cursor_invalidates_saved_restart(self) -> None:
+        job = self.output / "job"
+        job.mkdir()
+        (job / "start.claim").write_text("123\n")
+        (job / "exit.json").write_text('{"returncode": -9}')
+        journal_path = self.output / "journal.sqlite3"
+        identity = {"test_account": "original"}
+        with AdaptiveJournal.open(journal_path, identity, resume=False) as journal:
+            journal.append({"kind": "clock", "expired": ["test_intent"]})
+        with (
+            patch.object(schedule, "start_job", side_effect=KeyboardInterrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            schedule.run_schedule(self.output, self.spec)
+        with AdaptiveJournal.open(journal_path, identity, resume=True) as journal:
+            journal.append({"kind": "clock"})
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            start.assert_not_called()
+        self.assertEqual(self.status()["state"], "blocked")
+        self.assertEqual(self.status()["reason"], "Journal changed after restart decision")
