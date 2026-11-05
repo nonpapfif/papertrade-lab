@@ -130,6 +130,41 @@ async def kill_worker(path: Path, through: int) -> int:
 
 
 class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_processing_clock_rollback_preserves_pair_and_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "journal.db"
+            run, recovered = runtime(), runtime()
+            self.addAsyncCleanup(run.close)
+            self.addAsyncCleanup(recovered.close)
+            with AdaptiveJournal.open(path, IDENTITY, resume=False) as journal:
+                run.journal = journal
+                journal.append({"kind": "initial", "fx_at": run.fx[1]})
+                await inputs(run, 0, 4)
+                worker = asyncio.create_task(run.consume())
+                try:
+                    for offset in (0, 2):
+                        with patch("tools.run_async_live_validation.now", return_value=stamp(offset)):
+                            run.publish("clock", None)
+                            await asyncio.wait_for(run.queue.join(), 3)
+                finally:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+                self.assertTrue(worker.cancelled())
+                await inputs(run, 3, 5)
+                self.assertEqual(run.book_delivered, {"incumbent": 2, "candidate": 2})
+                self.assertEqual(run.counts["books_skipped_clock_regression"], 1)
+                events = list(journal.events())
+                self.assertEqual(
+                    [(row["kind"], row["wall_at"], row["at"]) for row in events if "wall_at" in row],
+                    [("clock", stamp(0), stamp(1)), ("book", stamp(1), stamp(2))],
+                )
+            with AdaptiveJournal.open(path, IDENTITY, resume=True) as journal:
+                await recovered.restore(journal)
+                self.assertEqual(recovered._checkpoint(), run._checkpoint())
+                await recovered.mark_advance("recovery_gap", stamp(2))
+                self.assertEqual(recovered.account.last_at, stamp(3))
+                self.assertEqual(list(journal.events())[-1]["wall_at"], stamp(2))
+
     async def test_sigkill_replays_reservation_partial_fill_and_policy_change(self) -> None:
         for through, restart_at in ((4, 2), (5, 3), (6, 4)):
             with (

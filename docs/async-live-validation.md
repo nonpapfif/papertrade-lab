@@ -112,7 +112,10 @@ A rate limit during a per-symbol candle or book request pauses REST until the cl
 time or the observation deadline. Existing WebSocket subscriptions continue during the pause.
 The failed request remains recorded; the sweep proceeds without filling in missing data.
 
-A consumer preserves publication order and stamps the actual decision time when processing starts.
+A consumer preserves publication order and stamps the wall time when processing starts.
+If that clock moves backwards, the runtime records both timestamps, holds account time steady,
+and skips books and policy changes until wall time catches up. Replay uses the recorded decision
+time and preserves the original provider timestamps.
 Late REST snapshots cannot overwrite newer source timestamps. Feature receipt time is retained.
 Queue and processing latency distributions are recorded globally and per symbol. The provisional
 integration budget is queue-delay p95 below one second; this is not an exchange latency guarantee.

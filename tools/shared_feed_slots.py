@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from papertrade.core import Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, encode
+from tools.async_layered_paper import ProcessingClock
 from tools.probe_toss_websocket import now
 from tools.slot_control import SlotCommand, SlotControl
 
@@ -50,6 +51,7 @@ class SharedFeedSlots:
         self.queue: asyncio.Queue[tuple[dict[str, Any], float]] = asyncio.Queue()
         self.sequence = 0
         self.consumed = 0
+        self.processing_clock = ProcessingClock()
         self.counts: Counter[str] = Counter()
         self.committing = asyncio.Lock()
         self.max_queue = 0
@@ -184,7 +186,7 @@ class SharedFeedSlots:
         sequence, kind, payload = entry["sequence"], entry["kind"], entry["payload"]
         if sequence != self.consumed + 1:
             raise JournalError("Shared observation sequence mismatch")
-        entry["at"] = entry.get("at") or now()
+        self.processing_clock.stamp(entry, entry.get("at") or now(), self.record)
         command_result = None
         outputs: dict[str, Any] = {}
         if kind == "slot_command":
@@ -283,6 +285,8 @@ class SharedFeedSlots:
                 entry = {
                     key: saved[key] for key in ("sequence", "kind", "payload", "received", "at")
                 }
+                if "wall_at" in saved:
+                    entry["wall_at"] = saved["wall_at"]
                 await self._apply(entry, 0, saved=saved)
             self.sequence = self.consumed
         finally:

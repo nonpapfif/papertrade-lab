@@ -126,6 +126,23 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
             offset,
         )
 
+    async def test_clock_rollback_skips_book_and_preserves_shared_replay(self) -> None:
+        await self.seed()
+        await self.command(add("small", 100))
+        await self.command(add("large", 200))
+        await self.book("A", 2)
+        await self.feed("clock", None, 0)
+        await self.book("A", 1)
+        await self.book("A", 3)
+        restored = self.coordinator(self.journal)
+        self.addAsyncCleanup(restored.close)
+        await restored.restore()
+        for slot_id, slot in restored.slots.items():
+            self.assertEqual(slot.runtime.book_delivered, {"incumbent": 2, "candidate": 2})
+            self.assertEqual(
+                slot.runtime._checkpoint(), self.slots.slots[slot_id].runtime._checkpoint()
+            )
+
     async def test_add_stop_replay_keeps_independent_ledgers_and_last_marks(self) -> None:
         await self.seed()
         self.assertEqual(self.slots.desired, [])
