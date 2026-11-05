@@ -228,10 +228,8 @@ class SharedFeedSlots:
                 await runtime._consume_event(event, delay, replaying=saved is not None)
                 if recorded is not None:
                     runtime.reviewed_fills = recorded["reviewed_fills"]
-                    runtime.active_opportunities = {
-                        (symbol, family) for symbol, family in recorded["active_opportunities"]
-                    }
-                    runtime.new_opportunities = recorded["new_opportunities"]
+                    runtime.reviewed_families = set(recorded["reviewed_families"])
+                    runtime.allocation_blocked = recorded["allocation_blocked"]
                 outputs[slot_id] = {
                     "progress": (
                         runtime.book_delivered["incumbent"] > books_before
@@ -240,8 +238,8 @@ class SharedFeedSlots:
                         or bool(event.get("applied"))
                     ),
                     "reviewed_fills": runtime.reviewed_fills,
-                    "active_opportunities": sorted(runtime.active_opportunities),
-                    "new_opportunities": runtime.new_opportunities,
+                    "reviewed_families": sorted(runtime.reviewed_families),
+                    "allocation_blocked": runtime.allocation_blocked,
                 }
         self.desired = self.subscribe(self.candidates, self.protected()) if self.active() else []
         self.counts[kind] += 1
@@ -269,7 +267,7 @@ class SharedFeedSlots:
                 **command_result[2],
             )
         for _, slot in self.active():
-            slot.runtime.launch_shared_review()
+            slot.runtime.launch_review()
 
     async def restore(self) -> None:
         original_record = self.record

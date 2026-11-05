@@ -104,6 +104,8 @@ class AdaptiveTests(unittest.IsolatedAsyncioTestCase):
             second = AsyncMock(return_value=keep)
             with patch("tools.run_async_live_validation.propose", second):
                 await publish(4, "book", "A")
+                self.assertIsNone(runtime.review_task)
+                await publish(5, "book", "A")
                 review = runtime.review_task
                 assert review is not None
                 await asyncio.wait_for(review, 1)
@@ -120,7 +122,7 @@ class AdaptiveTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(b.owners[0][0], "trend")
             self.assertEqual(b.owner_policy_versions[0], 0)
-            await publish(5, "book", "B")
+            await publish(6, "book", "B")
             self.assertNotIn(1, a.pending)
             self.assertEqual(b.pending[1].strategy, "rebound")
             self.assertEqual(b.pending[1].policy_version, 1)

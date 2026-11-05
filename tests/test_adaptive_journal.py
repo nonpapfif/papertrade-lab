@@ -16,6 +16,7 @@ from unittest.mock import PropertyMock, patch
 
 from papertrade.core import Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, read_status
+from tools.layered_paper import Feature
 from tools.paper_market import KR
 from tools.run_async_live_validation import Runtime, campaign
 
@@ -133,6 +134,58 @@ async def kill_worker(path: Path, through: int) -> int:
 
 
 class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_review_requires_new_affordable_rule_or_allocation_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "journal.db"
+            run, restored = runtime(), runtime()
+            run.review_settings = Settings.load(Path.cwd())
+            run.shared_watch = {"A", "B"}
+            candidate = run.accounts["candidate"]
+            at = stamp(0)
+            features = {
+                name: Feature(index, 10, at, at, 0.01, 0.02, 10, 9, 0.8)
+                for index, name in enumerate(("A", "B"))
+            }
+            for name in features:
+                run.books[name] = {"asks": [{"price": "10", "volume": "100"}]}
+
+            run._consider_review(1, at, {"A": features["A"]})
+            self.assertIsNotNone(run.review_payload)
+            run.review_payload = None
+            candidate.book.trades.append({"side": "SELL"})
+            run._consider_review(2, at, features)
+            self.assertIsNone(run.review_payload)
+            self.assertEqual(run.reviewed_fills["candidate"], 0)
+
+            candidate.book.cash = 15
+            run._consider_review(3, at, features)
+            payload = run.review_payload
+            assert payload is not None
+            self.assertTrue(payload["allocation_became_blocked"])
+            self.assertEqual(payload["accounts"]["candidate"]["new_fills"], [{"side": "SELL"}])
+            run.review_payload = None
+            run._consider_review(4, at, features)
+            self.assertIsNone(run.review_payload)
+
+            candidate.book.cash = 100
+            candidate.book.trades.clear()
+            run.reviewed_fills["candidate"] = 0
+            with AdaptiveJournal.open(path, IDENTITY, resume=False) as journal:
+                run.journal = journal
+                journal.append({"kind": "initial", "fx_at": run.fx[1]})
+                await run.mark_advance("recovery_gap", at)
+            with AdaptiveJournal.open(path, IDENTITY, resume=True) as journal:
+                await restored.restore(journal)
+                self.assertEqual(restored.reviewed_families, {"trend"})
+                self.assertTrue(restored.allocation_blocked)
+
+            run._consider_review(5, at, features)
+            self.assertFalse(run.allocation_blocked)
+            self.assertIsNone(run.review_payload)
+            candidate.book.cash = 15
+            run._consider_review(6, at, features)
+            self.assertIsNotNone(run.review_payload)
+
     async def test_processing_clock_rollback_preserves_pair_and_replays(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "journal.db"

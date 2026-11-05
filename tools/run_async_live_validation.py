@@ -207,11 +207,11 @@ class Runtime:
         self.shared_watch: set[str] | None = None
         self.shared_review_call: Callable[[str, int], None] | None = None
         self.shared_review_publish: Callable[[Any], None] | None = None
-        self.shared_review_payload: dict[str, Any] | None = None
+        self.review_payload: dict[str, Any] | None = None
         self.review_task: asyncio.Task | None = None
         self.review_calls: Counter = Counter()
-        self.active_opportunities: set[tuple[str, str]] = set()
-        self.new_opportunities: list[dict[str, Any]] = []
+        self.reviewed_families: set[str] = set()
+        self.allocation_blocked = False
         self.reviewed_fills = dict.fromkeys(("incumbent", "candidate"), 0)
         self.policy_history: list[dict[str, Any]] = []
         self.regular_window: tuple[float, float] | None = None
@@ -324,7 +324,13 @@ class Runtime:
         return {key: getattr(account, key) for key in ENTRY_OPTIONS}
 
     def _consider_review(self, sequence: int, at: str, prepared: dict[str, Feature | None]) -> None:
-        if self.review_settings is None or self.end_epoch is None or seconds(at) >= self.end_epoch:
+        if (
+            self.review_settings is None
+            or self.end_epoch is None
+            or seconds(at) >= self.end_epoch
+            or self.review_task is not None
+            or self.review_payload is not None
+        ):
             return
         candidate = self.accounts["candidate"]
         excluded = set(candidate.pending) | set(candidate.book.positions)
@@ -333,30 +339,66 @@ class Runtime:
             for symbol, feature in prepared.items()
             if feature is not None and symbol in self.entry_watch
         }
-        for symbol, feature in observed.items():
-            for family in ENTRY_OPTIONS["policy"]:
-                key = (symbol, family)
-                if assign(feature, family) is None:
-                    self.active_opportunities.discard(key)
-                elif key not in self.active_opportunities:
-                    self.active_opportunities.add(key)
-                    self.new_opportunities.append(
-                        {
-                            "symbol": symbol,
-                            "family": family,
-                            "observed_at": at,
-                            "feature": asdict(feature),
-                        }
-                    )
-        if self.review_task is not None:
+        eligible = {
+            symbol: feature
+            for symbol, feature in observed.items()
+            if feature.symbol not in excluded
+            and (
+                candidate.selection != "active"
+                or abs(feature.r5) >= 0.001
+                or abs(feature.r15) >= 0.003
+            )
+        }
+        one_share_costs = {}
+        for symbol in eligible:
+            asks = [
+                float(row["price"])
+                for row in self.books[symbol]["asks"]
+                if float(row["volume"]) >= 1
+            ]
+            if asks:
+                limit = self.market.limit_price(min(asks), "BUY")
+                if limit > 0:
+                    one_share_costs[symbol] = candidate.book.entry_cost(1, limit)
+
+        opportunities: list[dict[str, Any]] = []
+        allocation_became_blocked = False
+        cash = candidate.available_cash
+        for family in ENTRY_OPTIONS["policy"]:
+            signals = {
+                symbol: feature
+                for symbol, feature in eligible.items()
+                if assign(feature, family) is not None
+            }
+            if not signals:
+                continue
+            budget = cash / len(signals) if candidate.allocation == "equal" else cash
+            affordable = [
+                symbol for symbol in signals if one_share_costs.get(symbol, math.inf) <= budget
+            ]
+            if family == candidate.policy and candidate.allocation == "equal":
+                if affordable:
+                    self.allocation_blocked = False
+                elif any(one_share_costs.get(symbol, math.inf) <= cash for symbol in signals):
+                    allocation_became_blocked = not self.allocation_blocked
+                    self.allocation_blocked = True
+            if affordable and family not in self.reviewed_families:
+                self.reviewed_families.add(family)
+                opportunities.extend(
+                    {
+                        "symbol": symbol,
+                        "family": family,
+                        "observed_at": at,
+                        "feature": asdict(signals[symbol]),
+                    }
+                    for symbol in affordable
+                )
+        if not opportunities and not allocation_became_blocked:
             return
         trades = {
             name: copy.deepcopy(account.book.trades[self.reviewed_fills[name] :])
             for name, account in self.accounts.items()
         }
-        if not self.new_opportunities and not any(trades.values()):
-            return
-        opportunities, self.new_opportunities = self.new_opportunities, []
         for name, fills in trades.items():
             self.reviewed_fills[name] += len(fills)
         currency = self.market.currency.lower()
@@ -368,6 +410,7 @@ class Runtime:
             "base_version": candidate.entry_policy_version,
             "current": self._entry_configuration(),
             "new_rule_opportunities": opportunities,
+            "allocation_became_blocked": allocation_became_blocked,
             "completed_bar_features": {
                 symbol: {
                     **asdict(feature),
@@ -411,17 +454,14 @@ class Runtime:
             "symbol_ids": self.ids.copy(),
             "cost_scenario": candidate.context.schedule.copy(),
         }
-        if self.shared_review_call is not None:
-            self.shared_review_payload = payload
-        else:
-            self.review_task = asyncio.create_task(self._review(self.review_settings, payload))
+        self.review_payload = payload
 
     @property
     def entry_watch(self) -> list[str] | set[str]:
         return self.desired if self.shared_watch is None else self.shared_watch
 
-    def launch_shared_review(self) -> None:
-        payload, self.shared_review_payload = self.shared_review_payload, None
+    def launch_review(self) -> None:
+        payload, self.review_payload = self.review_payload, None
         if payload is not None:
             assert self.review_settings is not None
             self.review_task = asyncio.create_task(self._review(self.review_settings, payload))
@@ -503,6 +543,8 @@ class Runtime:
         for key, value in config.items():
             setattr(candidate, key, value)
         candidate.entry_policy_version += 1
+        self.reviewed_families.clear()
+        self.allocation_blocked = False
         applied = {
             "sequence": sequence,
             "published_at": received,
@@ -530,6 +572,7 @@ class Runtime:
                 await self._consume_event(entry, started - queued)
                 if self.journal is not None:
                     self._commit(entry)
+                self.launch_review()
             except (ValueError, TypeError, KeyError, RuntimeError, OverflowError) as error:
                 self.record(
                     "runtime_event_failed",
@@ -746,6 +789,8 @@ class Runtime:
                 ).encode()
                 + b"\n"
             )
+            if self.adaptive and saved is None and not replaying:
+                self._consider_review(sequence, at, prepared)
             for name, account in self.accounts.items():
                 before = len(account.intents), len(account.outcomes)
                 excluded = set(account.pending) | set(account.book.positions)
@@ -815,8 +860,6 @@ class Runtime:
                     )
                 for result in account.outcomes[before[1] :]:
                     self.record("outcome", result=result, **identity)
-            if self.adaptive and saved is None and not replaying:
-                self._consider_review(sequence, at, prepared)
             if self.adaptive:
                 entry["observation"] = observation.decode()
             if paired:
@@ -887,8 +930,8 @@ class Runtime:
                 **entry,
                 "checkpoint": self._checkpoint(),
                 "reviewed_fills": self.reviewed_fills,
-                "active_opportunities": sorted(self.active_opportunities),
-                "new_opportunities": self.new_opportunities,
+                "reviewed_families": sorted(self.reviewed_families),
+                "allocation_blocked": self.allocation_blocked,
             }
         )
 
@@ -925,10 +968,8 @@ class Runtime:
                 ):
                     raise JournalError("Journal replay diverged from committed account results")
                 self.reviewed_fills = saved["reviewed_fills"]
-                self.active_opportunities = {
-                    (symbol, family) for symbol, family in saved["active_opportunities"]
-                }
-                self.new_opportunities = saved["new_opportunities"]
+                self.reviewed_families = set(saved["reviewed_families"])
+                self.allocation_blocked = saved["allocation_blocked"]
         finally:
             self.record = original_record
         self.journal = journal
