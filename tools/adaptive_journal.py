@@ -17,7 +17,13 @@ SCHEMA = 1
 
 
 def _made_progress(event: dict[str, Any]) -> bool:
-    return bool(event.get("submissions") or event.get("applied") or event.get("expired"))
+    return bool(
+        event.get("submissions")
+        or event.get("applied")
+        or event.get("expired")
+        or event.get("disposition") == "applied"
+        or any(output.get("progress") for output in event.get("outputs", {}).values())
+    )
 
 
 class JournalError(RuntimeError):

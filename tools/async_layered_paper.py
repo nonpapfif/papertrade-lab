@@ -173,6 +173,20 @@ class AsyncLayeredPaper(LayeredPaper):
                 self.outcomes.append({"intent_id": intent.id, "at": at, "status": "expired"})
                 del self.pending[symbol]
 
+    async def cancel_pending(self, at: str) -> None:
+        """Release a stopped slot's reservations while preserving its last observed marks."""
+        await asyncio.gather(*(q.join() for q in self._queues.values()))
+        async with self._lock:
+            tick = seconds(at)
+            if tick < self._last_enqueued:
+                raise ValueError("Cannot rewind account clock")
+            self._last_enqueued = tick
+            for intent in self.pending.values():
+                self.outcomes.append({"intent_id": intent.id, "at": at, "status": "slot_stopped"})
+            self.pending.clear()
+            if self.last_at is not None:
+                self.last_at = at
+
     def _process(self, event: dict[str, Any]) -> None:
         event_id, symbol, at = event["id"], event["symbol"], event["received_at"]
         if event_id in self._processed:

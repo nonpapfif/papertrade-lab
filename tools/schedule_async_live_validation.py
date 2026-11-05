@@ -7,6 +7,7 @@ import fcntl
 import math
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ from typing import Any
 from tools.adaptive_journal import read_status as read_journal_status
 from tools.autotest_jobs import ROOT, atomic_json, poll_job, start_job
 from tools.autotest_supervisor import command, read_json, tree_digest
+from tools.slot_control import SPOOL_NAME, SlotControl
 
 
 def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
@@ -36,7 +38,9 @@ def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
 def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     status = output / "status.json"
     recovery = spec.get("recover") is True
+    dynamic_slots = spec.get("dynamic_slots") is True
     journal = output / "journal.sqlite3"
+    slot_spool = output / SPOOL_NAME
     restarts: list[dict[str, Any]] = []
 
     def save(state: str, **details: Any) -> None:
@@ -51,6 +55,8 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
         base = output / "attempts" / str(attempt) if attempt > 1 else output
         return base / "job", base / "run"
 
+    if dynamic_slots and slot_spool.exists() and not status.exists():
+        raise RuntimeError("Slot command spool already exists without its saved schedule")
     if status.exists():
         try:
             previous = read_json(status)
@@ -127,6 +133,10 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                 ):
                     raise RuntimeError("Approved source changed before launch")
                 argv = list(spec["argv"])
+                if dynamic_slots:
+                    with SlotControl.open(slot_spool, initialize=not restarts):
+                        pass
+                    argv.extend(["--slot-control", str(slot_spool)])
                 if recovery:
                     if restarts:
                         verified = read_journal_status(journal)
@@ -191,23 +201,56 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             state = "failed" if run_state == "failed" else "incomplete"
             save(state, job_exit=result, run_state=run_state)
             return 1
-        comparison = run.get("comparison")
-        if (
-            run_state != "complete"
-            or not isinstance(comparison, dict)
-            or any(
-                comparison.get(key) is not True
-                for key in ("complete", "source_unchanged", "freeze_matches")
-            )
-            or run.get("result") not in ("passed", "inconclusive")
-        ):
-            raise RuntimeError("Run status does not confirm a completed comparison")
+        complete = run_state == "complete" and run.get("result") in ("passed", "inconclusive")
+        if dynamic_slots:
+            shared_feed = run.get("shared_feed")
+            evidence = run.get("journal")
+            verified = read_journal_status(journal)
+            identity = verified["identity"]
+            if (
+                not complete
+                or run.get("experiment") != "shared_feed_slots"
+                or not isinstance(shared_feed, dict)
+                or shared_feed.get("complete") is not True
+                or shared_feed.get("source_unchanged") is not True
+                or not isinstance(run.get("shared_slots"), list)
+                or not isinstance(evidence, dict)
+                or identity.get("experiment") != "shared_feed_slots"
+                or identity.get("slot_control") != str(slot_spool.resolve())
+                or identity.get("end_epoch") != spec["end_epoch"]
+                or verified["state"] != "complete"
+                or verified["hash"] != evidence.get("chain_sha256")
+                or verified["cursor"] != evidence.get("cursor")
+                or verified["records"] != evidence.get("records")
+            ):
+                raise RuntimeError("Run status does not confirm a completed shared feed")
+        else:
+            comparison = run.get("comparison")
+            if (
+                not complete
+                or not isinstance(comparison, dict)
+                or any(
+                    comparison.get(key) is not True
+                    for key in ("complete", "source_unchanged", "freeze_matches")
+                )
+            ):
+                raise RuntimeError("Run status does not confirm a completed comparison")
         if tree_digest(ROOT) != spec["source_digest"]:
             save("incomplete", job_exit=result, reason="Approved source changed during the run")
             return 1
+        if dynamic_slots:
+            with SlotControl.open(slot_spool) as control:
+                control.close_submissions()
         save("complete", job_exit=result, run_result=run["result"])
         return 0
-    except (OSError, ValueError, RuntimeError, TypeError, subprocess.CalledProcessError) as error:
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        TypeError,
+        sqlite3.Error,
+        subprocess.CalledProcessError,
+    ) as error:
         save("blocked", reason=str(error), job_exit=result)
         return 1
 
@@ -224,6 +267,9 @@ def main() -> int:
     parser.add_argument(
         "--recover", action="store_true", help="Resume verified journal after a fault"
     )
+    parser.add_argument(
+        "--dynamic-slots", action="store_true", help="Enable local add, stop and list commands"
+    )
     args = parser.parse_args()
     if args.start_at.utcoffset() is None or args.end_at.utcoffset() is None:
         parser.error("Start and end require a timezone offset")
@@ -231,6 +277,8 @@ def main() -> int:
         parser.error("Start must precede end")
     if not math.isfinite(args.capital) or args.capital <= 0:
         parser.error("Capital must be positive and finite")
+    if args.dynamic_slots and not args.recover:
+        parser.error("Dynamic slots require --recover")
     if len(args.source_digest) != 64 or any(
         char not in "0123456789abcdef" for char in args.source_digest
     ):
@@ -265,6 +313,7 @@ def main() -> int:
                 "source_digest": args.source_digest,
                 "argv": argv,
                 **({"recover": True} if args.recover else {}),
+                **({"dynamic_slots": True} if args.dynamic_slots else {}),
             },
         )
 
