@@ -23,7 +23,7 @@ from typing import Any
 from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
-from tools.async_layered_paper import AsyncLayeredPaper, seconds
+from tools.async_layered_paper import AsyncLayeredPaper, ProcessingClock, seconds
 from tools.kr_broker_profile import eligible as eligible_kr_stock
 from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
 from tools.live_feed import LiveFeed
@@ -237,6 +237,7 @@ class Runtime:
         self.book_delivered = dict.fromkeys(self.accounts, 0)
         self.delivery_hashes = {name: hashlib.sha256() for name in self.accounts}
         self.sequence = 0
+        self.processing_clock = ProcessingClock()
         self.record = record
         self.ids: dict[str, int] = {}
         self.features: dict[str, Feature | None] = {}
@@ -590,7 +591,9 @@ class Runtime:
             )
         elif kind == "policy_review":
             if self.adaptive:
-                at = entry["at"] = entry.get("at") or now()
+                at = self.processing_clock.stamp(entry, entry.get("at") or now(), self.record)
+                if "wall_at" in entry:
+                    return
                 prior_version_count = len(self.policy_history)
                 self._apply_review(sequence, received, payload, at)
                 entry["applied"] = self.policy_history[prior_version_count:]
@@ -614,8 +617,10 @@ class Runtime:
             if not 0 <= source_age <= 60:
                 self.counts["invalid_source_age"] += 1
                 return
-            at = (entry.get("at") or now()) if self.constrained else ""
-            entry["at"] = at
+            at = self.processing_clock.stamp(entry, entry.get("at") or now(), self.record)
+            if "wall_at" in entry:
+                self.counts["books_skipped_clock_regression"] += 1
+                return
             if self.adaptive and self.end_epoch is not None and seconds(at) >= self.end_epoch:
                 self.counts["after_experiment_cutoff"] += 1
                 return
@@ -696,8 +701,6 @@ class Runtime:
                     r5=price / (f.price / (1 + f.r5)) - 1,
                     r15=price / (f.price / (1 + f.r15)) - 1,
                 )
-            if not self.constrained:
-                at = now()
             use_prepared = paired or self.constrained
             prepared = {s: self._feature_at(s, at) for s in self.candidates} if use_prepared else {}
             if use_prepared:
@@ -818,7 +821,7 @@ class Runtime:
                     input_sha256=hashlib.sha256(observation).hexdigest(),
                 )
         elif kind == "clock":
-            at = entry["at"] = entry.get("at") or now()
+            at = self.processing_clock.stamp(entry, entry.get("at") or now(), self.record)
             observation = json.dumps([sequence, "clock", received, at]).encode() + b"\n"
             expired = await self._advance(at, observation)
             if self.journal is not None or saved is not None:
@@ -898,8 +901,9 @@ class Runtime:
                     self.review_calls[saved["model"]] += 1
                     continue
                 entry = {key: saved[key] for key in ("sequence", "kind", "payload", "received")}
-                if "at" in saved:
-                    entry["at"] = saved["at"]
+                for key in ("at", "wall_at"):
+                    if key in saved:
+                        entry[key] = saved[key]
                 if kind in ("recovery_gap", "final_advance"):
                     await self._advance_marker(entry)
                 else:
@@ -922,7 +926,8 @@ class Runtime:
         self.journal = journal
 
     async def _advance_marker(self, entry: dict[str, Any]) -> None:
-        expired = await self._advance(entry["at"], (encode(entry) + "\n").encode())
+        at = self.processing_clock.stamp(entry, entry["at"], self.record)
+        expired = await self._advance(at, (encode(entry) + "\n").encode())
         entry["gap_expired"] = expired
         self.desired = subscription_set(self.candidates, self.protected())
 
@@ -1756,6 +1761,8 @@ async def _campaign(
             if journal is not None:
                 await runtime.mark_advance("final_advance", at)
             else:
+                marker = {"sequence": runtime.sequence, "kind": "final_advance"}
+                at = runtime.processing_clock.stamp(marker, at, record)
                 for account in runtime.accounts.values():
                     await account.advance(at)
         await runtime.close()

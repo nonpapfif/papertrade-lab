@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -19,6 +20,30 @@ def seconds(at: str) -> float:
     if stamp.tzinfo is None:
         raise ValueError("Timestamp requires timezone")
     return stamp.timestamp()
+
+
+class ProcessingClock:
+    """Keep account time ordered while preserving the observed wall time for audit."""
+
+    def __init__(self) -> None:
+        self.last_at: str | None = None
+
+    def stamp(
+        self, entry: dict[str, Any], wall_at: str, record: Callable[..., None]
+    ) -> str:
+        at = entry.get("at") or wall_at
+        if self.last_at is not None and seconds(at) < seconds(self.last_at):
+            entry["wall_at"] = at
+            record(
+                "processing_clock_regressed",
+                sequence=entry["sequence"],
+                event_kind=entry["kind"],
+                wall_at=at,
+                processing_at=self.last_at,
+            )
+            at = self.last_at
+        entry["at"] = self.last_at = at
+        return at
 
 
 @dataclass(frozen=True)
