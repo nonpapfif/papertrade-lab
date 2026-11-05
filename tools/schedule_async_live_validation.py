@@ -1,4 +1,4 @@
-"""Schedule one finite broker-constrained US paper validation."""
+"""Schedule one finite broker-constrained paper validation for one market."""
 
 from __future__ import annotations
 
@@ -218,6 +218,7 @@ def main() -> int:
     parser.add_argument("--start-at", required=True, type=datetime.fromisoformat)
     parser.add_argument("--end-at", required=True, type=datetime.fromisoformat)
     parser.add_argument("--capital", required=True, type=float)
+    parser.add_argument("--market", choices=("US", "KR"), default="US")
     parser.add_argument("--source-digest", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
@@ -251,6 +252,8 @@ def main() -> int:
         "--output",
         str(output / "run"),
     ]
+    if args.market == "KR":
+        argv.extend(["--market", "KR"])
     with (output / "schedule.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return run_schedule(

@@ -12,11 +12,10 @@ trading date, and the continuous-session window. The US profile reads the regula
 The KR profile reads the integrated regular session and stops before the closing auction.
 The profile module is included in the frozen source evidence for both runners.
 
-The target is one layered execution engine with separate processes, journals and output
-directories for each market. Move native currency accounting, valid price increments,
-quantity units and costs behind market rules before connecting the KR quote feed to the
-shared engine. Keep product eligibility and provider message normalization at the feed
-boundary. The existing KR last-trade diagnostic remains a separate runner until then.
+The shared layered runner selects one market per process with `--market US` or
+`--market KR`. Each campaign has its own output directory and optional adaptive journal.
+Capital, depth execution and account reporting use the selected market's currency.
+The KR last-trade diagnostic remains available as a separate historical comparison path.
 
 An additional market needs verified provider quotes, calendar, instrument eligibility,
 quantity units, tick rules and costs before its profile can be used for an experiment.
@@ -84,19 +83,45 @@ Paper sale proceeds are immediately reusable, which does not certify broker buyi
 The manifest records these assumptions and the official capability snapshot. Reverify dated costs
 before a future-date campaign. The existing finite runner's controlled faults remain enabled.
 
+## KR layered baseline
+
+```sh
+python -m tools.run_async_live_validation \
+  --profile broker-constrained --market KR \
+  --output state/validation/kr-layered-unique/run \
+  --duration 1200 --capital 100000
+```
+
+Capital is KRW. This mode sweeps the active KR listings and ranks fresh price moves.
+It selects only verified active ordinary KOSPI/KOSDAQ common shares with the same
+metadata requirements as the KR diagnostic. It uses `trade:kr` and `orderbook:kr` with
+the provider's six-character symbols and keeps held and pending symbols subscribed.
+REST and streaming books share the same depth processing. FX is unnecessary for KRW.
+
+The integrated regular-session calendar gates the source, publication and decision times
+before the closing auction starts. Provider candles use their end timestamps. Zero-volume
+carried-price bars remain observations. The continuous window excludes the later closing
+bar, which may be revised through 16:00 for non-NXT stocks. Zero-volume depth placeholders
+provide no liquidity. An integrated crossed book is recorded as ambiguous and invalidates
+the previous usable depth until a new actionable observation arrives.
+
+Paper fills use whole shares, the ordinary-stock tick grid and later observed depth. The
+modeled fees use unrounded 0.015% commission on each side and 0.20% sale tax. Account fees
+and buying-power treatment are unverified. The integrated feed has no venue identity and
+does not establish venue-level execution or auction/VI eligibility.
+
 ## Validation and remaining work
 
 Offline fixtures cover cash reservation, whole-share affordability, account isolation, partial
 fills and retained ownership, calendar boundaries, stale/future prices, provider candle end
 semantics and causal AI context. A passing fixture does not establish live profitability.
 
-The next required implementation is the KR layered quote/depth path. It must replace the separate
-diagnostic signal runner for full strategy validation. Durable account/intent recovery, final
-valuation freshness, cost-aware deterministic entry, and matched live validation remain open.
-Recovery is available for the adaptive US mode described below. Live-account access and numerical
-real-money risk policy remain separate gates.
+Offline fixtures cover native KRW fanout, auction gating, uncertain depth invalidation and
+replay of KR policy and account state. Matched live validation remains open. Recovery is
+available for the adaptive mode described below. Live-account access and numerical real-money
+risk policy remain separate gates.
 
-## US adaptive exploration
+## Adaptive exploration
 
 ```sh
 python -m tools.run_async_live_validation \
@@ -105,8 +130,9 @@ python -m tools.run_async_live_validation \
   --output state/validation/us-adaptive-unique/run
 ```
 
-This finite mode creates two fresh USD accounts with identical trend rules, equal allocation,
+This finite mode creates two fresh native-currency accounts with identical trend rules, equal allocation,
 starting capital, market observations and execution assumptions. The incumbent stays frozen.
+Use `--market KR`, a KRW capital amount and a new output directory for KR.
 The adaptive candidate can change new-entry policy between trend and rebound, selection
 between all and active, and allocation between equal and priority. These are combinations of
 existing deterministic rules. Candle-high breakouts, new executable rules, real trades and
@@ -133,15 +159,16 @@ publication time, and book symbol in `runtime_event_failed`. Use these fields to
 recorded provider observation and reproduce it offline against the manifest's source version.
 Past runs containing only an exception class cannot recover the missing traceback.
 
-Enable durable recovery on a new adaptive US schedule with `--recover` on
+Enable durable recovery on a new adaptive schedule with `--recover` on
 `tools.schedule_async_live_validation`, alongside its normal start, end, capital, source digest
-and output arguments. The initial attempt uses `run/` and `job/`; recovery attempts use
+and output arguments. Select KR with `--market KR`. The initial attempt uses `run/` and
+`job/`; recovery attempts use
 `attempts/<number>/`. All attempts share `journal.sqlite3`. Keep that directory on reliable
 local storage. Prior non-journaled runs remain separate historical evidence.
 
 The worker commits exact ordered inputs, applied policy changes and paired account checksums
 to SQLite. An exclusive lock prevents simultaneous workers from updating the same journal.
-The worker checks source and settings hashes, capital, profile and cutoff, then replays the
+The worker checks source and settings hashes, capital, market, currency, profile and cutoff, then replays the
 committed events before contacting the provider. Replay makes no AI calls. A recovery gap
 expires old intents under their existing rules and is reported separately from observed data.
 An event interrupted before commit may appear in attempt logs without being part of the

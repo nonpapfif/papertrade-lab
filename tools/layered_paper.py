@@ -8,7 +8,8 @@ from datetime import datetime
 from itertools import pairwise
 from typing import Any
 
-from tools.live_execution import DEFAULT_FEES, ExecutionBook, ExecutionContext
+from tools.live_execution import DEFAULT_FEES, KR_FEES, ExecutionBook, ExecutionContext
+from tools.paper_market import US, PaperMarket
 
 FAMILIES = ("trend", "breakout", "rebound")
 
@@ -144,6 +145,7 @@ class LayeredPaper:
         selection: str = "all",
         allocation: str = "equal",
         fees: dict[str, float] | None = None,
+        market: PaperMarket = US,
     ) -> None:
         if policy not in ("router", *FAMILIES) or selection not in ("all", "active"):
             raise ValueError("Unknown signal policy")
@@ -151,12 +153,12 @@ class LayeredPaper:
             raise ValueError("Invalid allocation or capital")
         self.policy, self.selection, self.allocation = policy, selection, allocation
         schedule = {
-            **DEFAULT_FEES,
+            **(KR_FEES if market.code == "KR" else DEFAULT_FEES),
             "allow_partial_exits": 1.0,
             "confirmation_delay_seconds": 1.0,
             **(fees or {}),
         }
-        self.context = ExecutionContext("quotes", schedule)
+        self.context = ExecutionContext("quotes", schedule, market=market)
         config = {
             "slots": 1,
             "leverage": 1,
@@ -173,7 +175,7 @@ class LayeredPaper:
             "id": 0,
         }
         self.book = ExecutionBook(
-            config, "US", "layered", True, context=self.context, initial_equity=capital
+            config, market.code, "layered", True, context=self.context, initial_equity=capital
         )
         self.owners: dict[int, tuple[str, Feature]] = {}
         self.realized_by_strategy = dict.fromkeys(FAMILIES, 0.0)
@@ -271,6 +273,7 @@ class LayeredPaper:
     def summary(self) -> dict[str, Any]:
         if self.last_at is None:
             raise ValueError("No account event has been processed")
+        suffix = self.book.currency_suffix
         return {
             "account": self.book.summary(self.prices, self.times, self.last_at),
             "realized_by_strategy": self.realized_by_strategy,
@@ -281,16 +284,16 @@ class LayeredPaper:
                     "strategy": self.owners[symbol][0],
                     "quantity": position.quantity,
                     "entry_price": position.entry,
-                    "entry_cost_usd": position.quantity * position.entry,
-                    "remaining_entry_fees_usd": self.book.entry_fees[symbol],
+                    f"entry_cost_{suffix}": position.quantity * position.entry,
+                    f"remaining_entry_fees_{suffix}": self.book.entry_fees[symbol],
                     "mark_price": self.prices[symbol],
                     "mark_at": self.times[symbol],
                     "mark_age_seconds": (
                         datetime.fromisoformat(self.last_at)
                         - datetime.fromisoformat(self.times[symbol])
                     ).total_seconds(),
-                    "market_value_usd": position.quantity * self.prices[symbol],
-                    "unrealized_usd": position.quantity
+                    f"market_value_{suffix}": position.quantity * self.prices[symbol],
+                    f"unrealized_{suffix}": position.quantity
                     * (self.prices[symbol] - position.entry),
                 }
                 for symbol, position in sorted(self.book.positions.items())

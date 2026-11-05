@@ -10,7 +10,9 @@ uv run --no-project --with websockets==15.0.1 python -m tools.run_async_live_val
 This starts a new isolated virtual account and terminates after the declared observation duration.
 It never starts the legacy live bot or historical collector. Credentials must already be valid;
 the cached-token client cannot issue or refresh tokens. Only market-data and stock-information
-endpoints and market WebSocket topics are used. No AI calls occur in the runner.
+endpoints and market WebSocket topics are used. This default mode makes no AI calls.
+See [constrained runtime profiles](constrained-runtime.md) for KR and US native-currency
+operation, adaptive exploration, and scheduled recovery.
 
 ## Fixed-strategy comparison
 
@@ -95,5 +97,6 @@ hashes, selection assumptions, and the provider calendar. Missing activity or un
 is inconclusive rather than a pass. Existing ledgers are untouched.
 
 The end time is an observation deadline. In-flight HTTP transport cleanup can take slightly longer.
-Open positions and reservations are reported without invented liquidations. This runner does not
-implement durable crash resume, real queue-priority calibration, or multi-session generalization.
+Open positions and reservations are reported without invented liquidations. Durable crash resume
+is available with an adaptive journal. Broker queue priority and multi-session generalization
+remain unverified.

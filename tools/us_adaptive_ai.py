@@ -1,4 +1,4 @@
-"""Schema-bound new-entry policy reviews for a single US paper experiment."""
+"""Schema-bound new-entry policy reviews for one market's paper experiment."""
 
 from __future__ import annotations
 
@@ -24,7 +24,8 @@ SCHEMA: dict[str, Any] = {
         **{key: {"type": "string", "enum": list(values)} for key, values in ENTRY_OPTIONS.items()},
     },
 }
-INSTRUCTIONS = """Review the US paper experiment using only the supplied observations.
+INSTRUCTIONS = """Review the paper experiment using only the supplied observations.
+Use the supplied market and native accounting currency for every monetary field.
 The account objective is virtual profit under unchanged whole-share, cost, session and
 delayed depth fill assumptions. Propose one complete new-entry configuration, not trades.
 Use keep and return the current configuration if no useful change follows from the evidence.
@@ -62,6 +63,11 @@ def validate_proposal(response: Any, current: dict[str, str], model: str) -> dic
 
 async def propose(settings: Settings, payload: dict[str, Any], model: str) -> dict[str, Any]:
     instructions = INSTRUCTIONS
+    if payload.get("market") == "KR":
+        instructions += (
+            "\nUse KRW and whole shares. Integrated KRX/NXT quotes lack venue identity. "
+            "The paper account only acts during the continuous regular window."
+        )
     if model == ASTRA:
         instructions += "\nResolve the specific supplied question with keep or change only."
     response = await request_review(settings, payload, instructions, SCHEMA, model)

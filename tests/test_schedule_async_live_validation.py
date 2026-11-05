@@ -16,6 +16,36 @@ from tools.adaptive_journal import AdaptiveJournal
 
 
 class ScheduleTest(unittest.TestCase):
+    def test_kr_schedule_freezes_market_in_worker_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            argv = [
+                "schedule",
+                "--market",
+                "KR",
+                "--start-at",
+                "2026-11-05T09:00:00+09:00",
+                "--end-at",
+                "2026-11-05T15:20:00+09:00",
+                "--capital",
+                "100000",
+                "--source-digest",
+                "a" * 64,
+                "--output",
+                directory,
+                "--recover",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(schedule, "command", return_value="approved"),
+                patch.object(schedule, "run_schedule", return_value=0) as run,
+            ):
+                self.assertEqual(schedule.main(), 0)
+            self.assertEqual(run.call_args.args[0], output.resolve())
+            spec = run.call_args.args[1]
+            self.assertEqual(spec["argv"][-2:], ["--market", "KR"])
+            self.assertTrue(spec["recover"])
+
     def test_waits_then_launches_once_and_records_real_child_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

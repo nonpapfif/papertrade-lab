@@ -14,10 +14,15 @@ from typing import Any
 
 from papertrade.api import SYMBOL, ApiError, MarketClient
 from papertrade.core import SafetyError, Settings, stamp
+from tools.paper_market import US, PaperMarket
 
 Record = Callable[[str, dict[str, Any]], None]
 LOOKBACKS = (5, 10, 15, 30, 60)
 MAX_AGE_SECONDS = 90
+LISTING_EXCHANGES = {
+    "US": ("NYSE", "NASDAQ", "AMEX", "US_ETC"),
+    "KR": ("KOSPI", "KOSDAQ", "KR_ETC"),
+}
 
 
 class _PacedClient(MarketClient):
@@ -40,7 +45,12 @@ class LiveFeed:
     """Use only current market data; rate limits remain owned by MarketClient."""
 
     def __init__(
-        self, settings: Settings, record: Record, *, client: MarketClient | None = None
+        self,
+        settings: Settings,
+        record: Record,
+        *,
+        client: MarketClient | None = None,
+        market: PaperMarket = US,
     ) -> None:
         self.record = record
         self.settings = settings
@@ -48,18 +58,21 @@ class LiveFeed:
         self.client = client or MarketClient(settings)
         self.client.audit = lambda event: self.record("http", event)
         self.symbols: list[str] | None = None
+        self.market = market
+        self.listing_exchanges: dict[str, set[str]] = {}
 
     def universe(self) -> list[str]:
-        symbols: set[str] = set()
-        for market in ("NYSE", "NASDAQ", "AMEX", "US_ETC"):
+        listings: dict[str, set[str]] = {}
+        for market in LISTING_EXCHANGES[self.market.code]:
             rows = self.client.listed(market, status="ACTIVE")
             self.record("listings", {"market": market, "status": "ACTIVE", "rows": rows})
             for row in rows:
                 symbol = row.get("symbol")
                 if not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol):
                     raise ApiError("Invalid listed stock symbol", code="invalid_response")
-                symbols.add(symbol)
-        self.symbols = sorted(symbols)
+                listings.setdefault(symbol, set()).add(market)
+        self.listing_exchanges = listings
+        self.symbols = sorted(listings)
         return list(self.symbols)
 
     def snapshot(self) -> list[dict[str, Any]]:
@@ -161,8 +174,8 @@ class LiveFeed:
 
     def calendar(self, day: str) -> dict[str, Any]:
         day = date.fromisoformat(day).isoformat()
-        result = self.client.calendar("US", day)
-        self.record("calendar", {"market": "US", "date": day, "result": result})
+        result = self.client.calendar(self.market.code, day)
+        self.record("calendar", {"market": self.market.code, "date": day, "result": result})
         return result
 
 

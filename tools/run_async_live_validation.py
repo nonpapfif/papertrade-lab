@@ -23,10 +23,12 @@ from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
 from tools.async_layered_paper import AsyncLayeredPaper, seconds
+from tools.kr_broker_profile import eligible as eligible_kr_stock
 from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
 from tools.live_feed import LiveFeed
-from tools.paper_market import US
+from tools.paper_market import KR, US, PaperMarket
 from tools.probe_toss_websocket import (
+    KR_SYMBOL,
     ROOT,
     URL,
     CachedTokenClient,
@@ -61,13 +63,22 @@ ADAPTIVE_SOURCES = (
     "tools/kr_comparison_ai.py",
     "papertrade/ai.py",
 )
+KR_SOURCES = ("tools/kr_broker_profile.py",)
 
-US_CAPABILITY_SNAPSHOT = {
+MARKET_CAPABILITY_SNAPSHOT = {
     "source": "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json",
     "retrieved": "2026-11-04",
     "version": "1.2.28",
     "sha256": "18fdc96fdf632e4869c765ed0cb169049c5310a1c48e10b40e47a71f52aa7a45",
 }
+KR_COST_EVIDENCE = {
+    "as_of": "2026-11-04",
+    "status": "unverified_toss_api_fee_scenario",
+    "commission": "0.015% commission assumed on each side, unrounded",
+    "sale_tax": "0.20% ordinary KOSPI/KOSDAQ stock sale tax, unrounded",
+    "settlement": "Simulated sale proceeds available immediately; broker buying power unverified",
+}
+MARKETS = {"US": US, "KR": KR}
 US_COST_EVIDENCE = {
     "as_of": "2026-11-04",
     "status": "unverified_toss_api_fee_scenario",
@@ -83,23 +94,30 @@ def us_date(at: str) -> str:
     return US.trading_date(datetime.fromisoformat(at))
 
 
-def us_regular_window(calendar: dict, day: str) -> tuple[float, float] | None:
+def us_regular_window(
+    calendar: dict, day: str, market: PaperMarket = US
+) -> tuple[float, float] | None:
     try:
-        start, end = US.session(calendar, day)
+        start, end = market.session(calendar, day)
         return start.timestamp(), end.timestamp()
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
 
 
 def rank_candidates(
-    rows: list[dict], previous: dict[str, float], at: str, capital: float
+    rows: list[dict], previous: dict[str, float], at: str, capital: float, currency: str = "USD"
 ) -> tuple[list[str], dict[str, float]]:
     fresh = {}
     for row in rows:
         try:
             price = float(row["lastPrice"])
             age = seconds(at) - seconds(row["timestamp"])
-            if row["currency"] == "USD" and math.isfinite(price) and price > 0 and 0 <= age <= 90:
+            if (
+                row["currency"] == currency
+                and math.isfinite(price)
+                and price > 0
+                and 0 <= age <= 90
+            ):
                 fresh[row["symbol"]] = price
         except (KeyError, ValueError, TypeError):
             continue
@@ -156,10 +174,14 @@ class Runtime:
         profile: str = "legacy",
         adaptive: bool = False,
         end_epoch: float | None = None,
+        market: PaperMarket = US,
     ) -> None:
         if profile not in ("legacy", "broker-constrained"):
             raise ValueError("Unknown validation profile")
         self.constrained = profile == "broker-constrained"
+        if market is KR and not self.constrained:
+            raise ValueError("KR requires the broker-constrained profile")
+        self.market = market
         self.adaptive = adaptive
         if adaptive and (not self.constrained or candidate_policy is not None or end_epoch is None):
             raise ValueError("Adaptive experiment requires a constrained profile and fixed end")
@@ -175,15 +197,16 @@ class Runtime:
         self.regular_window: tuple[float, float] | None = None
         if self.constrained and candidate_policy is not None:
             raise ValueError("The broker-constrained profile runs a single trend baseline")
+        constrained_fees = {"commission_exemption_usd": 0.0} if market is US else None
         self.account = (
-            AsyncLayeredPaper(capital, policy="trend", fees={"commission_exemption_usd": 0.0})
+            AsyncLayeredPaper(capital, policy="trend", fees=constrained_fees, market=market)
             if self.constrained
             else AsyncLayeredPaper(capital)
         )
         self.accounts = {"incumbent": self.account}
         if adaptive:
             self.accounts["candidate"] = AsyncLayeredPaper(
-                capital, policy="trend", fees={"commission_exemption_usd": 0.0}
+                capital, policy="trend", fees=constrained_fees, market=market
             )
         elif candidate_policy is not None:
             self.accounts["candidate"] = AsyncLayeredPaper(capital, policy=candidate_policy)
@@ -208,6 +231,7 @@ class Runtime:
         self.candidates: list[str] = []
         self.desired: list[str] = []
         self.books: dict[str, dict] = {}
+        self.unactionable_books: set[str] = set()
         self.fx: tuple[float, str, str | None, str | None] = (0, now(), None, None)
         self.queue: asyncio.Queue = asyncio.Queue()
         self.counts: Counter = Counter()
@@ -242,7 +266,8 @@ class Runtime:
         if (
             feature is None
             or book is None
-            or book.get("currency") != US.currency
+            or book.get("currency") != self.market.currency
+            or symbol in self.unactionable_books
             or seconds(feature.available_at) > tick
             or not 0 <= tick - seconds(feature.bar_end) <= 90
             or not 0 <= tick - seconds(book["timestamp"]) <= 60
@@ -313,7 +338,10 @@ class Runtime:
         opportunities, self.new_opportunities = self.new_opportunities, []
         for name, fills in trades.items():
             self.reviewed_fills[name] += len(fills)
+        currency = self.market.currency.lower()
         payload = {
+            "market": self.market.code,
+            "currency": self.market.currency,
             "evidence_sequence": sequence,
             "evidence_at": at,
             "base_version": candidate.entry_policy_version,
@@ -329,17 +357,17 @@ class Runtime:
             "orderbooks": {symbol: self.books[symbol] for symbol in observed},
             "accounts": {
                 name: {
-                    "cash_usd": account.book.cash,
-                    "reserved_cash_usd": account.reserved_cash,
-                    "realized_usd": account.book.realized,
+                    f"cash_{currency}": account.book.cash,
+                    f"reserved_cash_{currency}": account.reserved_cash,
+                    f"realized_{currency}": account.book.realized,
                     "new_fills": trades[name],
                     "positions": {
                         symbol: {
                             "quantity": position.quantity,
-                            "entry_price_usd": position.entry,
-                            "last_mark_usd": account.prices[symbol],
+                            f"entry_price_{currency}": position.entry,
+                            f"last_mark_{currency}": account.prices[symbol],
                             "mark_at": account.times[symbol],
-                            "entry_fee_usd": account.book.entry_fees[symbol],
+                            f"entry_fee_{currency}": account.book.entry_fees[symbol],
                             "strategy": account.owners[symbol][0],
                             "policy_version": account.owner_policy_versions[symbol],
                         }
@@ -350,7 +378,7 @@ class Runtime:
                             "symbol_id": intent.symbol,
                             "side": intent.side,
                             "quantity": intent.quantity,
-                            "limit_usd": intent.limit,
+                            f"limit_{currency}": intent.limit,
                             "decision_at": intent.decision_at,
                             "policy_version": intent.policy_version,
                         }
@@ -481,7 +509,7 @@ class Runtime:
             self.candidates = payload
         elif kind == "calendar":
             day, calendar = payload
-            self.regular_window = us_regular_window(calendar, day)
+            self.regular_window = us_regular_window(calendar, day, self.market)
         elif kind == "feature":
             symbol, rows = payload
             if self.constrained:
@@ -548,6 +576,9 @@ class Runtime:
                 self.counts["after_experiment_cutoff"] += 1
                 return
             if self.constrained:
+                if self.market is KR and book.get("currency") != KR.currency:
+                    self.counts["book_currency_mismatch"] += 1
+                    return
                 window = self.regular_window
                 if window is None or not all(
                     window[0] <= seconds(stamp) < window[1]
@@ -555,7 +586,7 @@ class Runtime:
                 ):
                     self.counts["outside_regular_session"] += 1
                     return
-                if not book["asks"] or not book["bids"]:
+                if self.market is US and (not book["asks"] or not book["bids"]):
                     self.counts["missing_book_depth"] += 1
                     return
             old = self.books.get(symbol)
@@ -563,9 +594,37 @@ class Runtime:
                 self.counts["old_snapshot_ignored"] += 1
                 return
             paired = len(self.accounts) > 1
-            if (
+            if self.market is KR:
+                self.unactionable_books.discard(symbol)
+                # The provider can pad a depth side with zero-volume placeholders.
+                bids = [row for row in book["bids"] if float(row["volume"]) != 0]
+                asks = [row for row in book["asks"] if float(row["volume"]) != 0]
+                reason = None
+                if not asks or not bids:
+                    reason = "missing_book_depth"
+                elif not all(
+                    KR.valid_quote_level(float(row["price"]), float(row["volume"]))
+                    for row in bids + asks
+                ):
+                    reason = "invalid_book_depth"
+                elif max(float(row["price"]) for row in bids) > min(
+                    float(row["price"]) for row in asks
+                ):
+                    # Integrated KRX/NXT may legitimately cross.
+                    reason = "integrated_cross_uncertain"
+                if reason is not None:
+                    self.unactionable_books.add(symbol)
+                    self.counts[reason] += 1
+                    self.record(
+                        "book_unactionable",
+                        reason=reason,
+                        sequence=sequence,
+                        symbol=symbol,
+                        source_at=book["timestamp"],
+                    )
+            elif (
                 (paired or self.constrained)
-                and book.get("currency") == US.currency
+                and book.get("currency") == self.market.currency
                 and book["asks"]
                 and book["bids"]
                 and max(float(row["price"]) for row in book["bids"])
@@ -905,8 +964,14 @@ def write_comparison(
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     expected = manifest.get("source_sha256", {})
-    sources = SOURCES if runtime.constrained or len(runtime.accounts) > 1 else LEGACY_SOURCES
-    expected_sources = set(ADAPTIVE_SOURCES if runtime.adaptive else sources)
+    sources: tuple[str, ...] = (
+        SOURCES if runtime.constrained or len(runtime.accounts) > 1 else LEGACY_SOURCES
+    )
+    if runtime.adaptive:
+        sources = ADAPTIVE_SOURCES
+    if runtime.market is KR:
+        sources += KR_SOURCES
+    expected_sources = set(sources)
     source_unchanged = set(expected) == expected_sources and all(
         (ROOT / name).is_file()
         and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected[name]
@@ -938,6 +1003,12 @@ def write_comparison(
         if len(runtime.accounts) > 1
         else manifest.get("account") == runtime.configurations["incumbent"]
     )
+    if runtime.market is KR:
+        freeze_matches = (
+            freeze_matches
+            and manifest.get("market") == KR.code
+            and manifest.get("currency") == KR.currency
+        )
     policy_trace_valid = True
     if runtime.adaptive:
         adaptive_status = runtime_status["adaptive"]
@@ -1006,15 +1077,17 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
         await asyncio.sleep(delay)
 
 
-def journal_identity(capital: float, end_epoch: float) -> dict[str, Any]:
+def journal_identity(capital: float, end_epoch: float, market: PaperMarket = US) -> dict[str, Any]:
+    sources = ADAPTIVE_SOURCES + KR_SOURCES if market is KR else ADAPTIVE_SOURCES
     return {
         "profile": "broker-constrained",
         "experiment": "adaptive_exploration",
+        "market": market.code,
+        "currency": market.currency,
         "capital": float(capital),
         "end_epoch": end_epoch,
         "source_sha256": {
-            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
-            for path in ADAPTIVE_SOURCES
+            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in sources
         },
         "settings_sha256": hashlib.sha256((ROOT / "settings.toml").read_bytes()).hexdigest(),
     }
@@ -1031,7 +1104,10 @@ async def campaign(
     end_epoch: float | None = None,
     journal_path: Path | None = None,
     resume: bool = False,
+    market: PaperMarket = US,
 ) -> None:
+    if market is KR and profile != "broker-constrained":
+        raise ValueError("KR requires the broker-constrained profile")
     if resume and journal_path is None:
         raise ValueError("Recovery requires an existing journal")
     if journal_path is None:
@@ -1043,6 +1119,7 @@ async def campaign(
             profile=profile,
             adaptive=adaptive,
             end_epoch=end_epoch,
+            market=market,
         )
         return
     if not adaptive or profile != "broker-constrained" or end_epoch is None:
@@ -1051,7 +1128,7 @@ async def campaign(
         raise ValueError("Campaign cutoff reached before journal open")
     os.umask(0o077)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
-    identity = journal_identity(capital, end_epoch)
+    identity = journal_identity(capital, end_epoch, market)
     with AdaptiveJournal.open(journal_path, identity, resume=resume) as journal:
         await _campaign(
             output,
@@ -1063,6 +1140,7 @@ async def campaign(
             end_epoch=end_epoch,
             journal=journal,
             resume=resume,
+            market=market,
         )
 
 
@@ -1077,6 +1155,7 @@ async def _campaign(
     end_epoch: float | None = None,
     journal: AdaptiveJournal | None = None,
     resume: bool = False,
+    market: PaperMarket = US,
 ) -> None:
     if adaptive and (
         profile != "broker-constrained"
@@ -1101,6 +1180,13 @@ async def _campaign(
         log.write(json.dumps({"at": now(), "kind": kind, **payload}) + "\n")
 
     http_audit: list[dict[str, Any]] = []
+
+    def record_feed(kind: str, payload: dict[str, Any]) -> None:
+        if kind == "http":
+            http_audit.append(payload)
+        elif market is KR and kind in ("listings", "prices"):
+            raw.write(json.dumps({"kind": kind, "received_at": now(), **payload}) + "\n")
+
     runtime = Runtime(
         capital,
         record,
@@ -1108,12 +1194,14 @@ async def _campaign(
         profile=profile,
         adaptive=adaptive,
         end_epoch=end_epoch,
+        market=market,
     )
     stats: dict[str, Any] = {
         "state": "starting",
         "ai_calls": 0,
         "real_orders": False,
         "capital": capital,
+        **({"market": market.code, "currency": market.currency} if runtime.constrained else {}),
         "duration_seconds": duration,
         "rest_cycles": [],
         "connections": 0,
@@ -1139,7 +1227,7 @@ async def _campaign(
                 journal.append({"kind": "initial", "fx_at": runtime.fx[1]})
         settings = Settings.load(ROOT)
         if journal is not None and (
-            end_epoch is None or journal_identity(capital, end_epoch) != journal.identity
+            end_epoch is None or journal_identity(capital, end_epoch, market) != journal.identity
         ):
             raise JournalError("Campaign source or settings changed during initialization")
         if adaptive:
@@ -1154,8 +1242,9 @@ async def _campaign(
         )
         feed = LiveFeed(
             client.settings,
-            lambda kind, payload: http_audit.append(payload) if kind == "http" else None,
+            record_feed,
             client=client,
+            market=market,
         )
         token = client.access_token()
         spec = await asyncio.to_thread(read_spec)
@@ -1173,8 +1262,12 @@ async def _campaign(
             expected_end_epoch=end_epoch if end_epoch is not None else time.time() + duration,
             universe_count=len(universe),
         )
-        calendar_day = us_date(now()) if runtime.constrained else now()[:10]
-        calendar = await asyncio.to_thread(client.calendar, US.code, calendar_day)
+        calendar_day = (
+            market.trading_date(datetime.fromisoformat(now()))
+            if runtime.constrained
+            else now()[:10]
+        )
+        calendar = await asyncio.to_thread(client.calendar, market.code, calendar_day)
         if runtime.constrained:
             runtime.publish("calendar", (calendar_day, calendar))
         sources: tuple[str, ...] = (
@@ -1182,6 +1275,9 @@ async def _campaign(
         )
         if adaptive:
             sources = ADAPTIVE_SOURCES
+        if market is KR:
+            sources += KR_SOURCES
+        stream_market = market.code.lower()
         private_json(
             output / "manifest.json",
             {
@@ -1206,7 +1302,8 @@ async def _campaign(
                     else {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources}
                 ),
                 "selection": (
-                    "Absolute change between consecutive fresh minute scans; USD common shares"
+                    "Absolute change between consecutive fresh minute scans; "
+                    f"{market.currency} common shares"
                 ),
                 "universe_count": len(universe),
                 "connection_capacity_symbols": 50,
@@ -1215,16 +1312,23 @@ async def _campaign(
                     {
                         "profile": profile,
                         "account": runtime.configurations["incumbent"],
-                        "cost_evidence": US_COST_EVIDENCE,
+                        "cost_evidence": KR_COST_EVIDENCE if market is KR else US_COST_EVIDENCE,
                         "session_policy": (
-                            "Provider US regular session, open inclusive, close exclusive"
+                            "Provider integrated KR regular session, open inclusive, "
+                            "closing auction start exclusive"
+                            if market is KR
+                            else "Provider US regular session, open inclusive, close exclusive"
                         ),
-                        "market": "US",
-                        "currency": "USD",
-                        "instrument": "Active ordinary common shares",
+                        "market": market.code,
+                        "currency": market.currency,
+                        "instrument": (
+                            "Verified active ordinary KOSPI/KOSDAQ common shares"
+                            if market is KR
+                            else "Active ordinary common shares"
+                        ),
                         "quantity_mode": "whole_shares",
                         "order_model": "Simulated limit with delayed depth confirmation",
-                        "capability_snapshot": US_CAPABILITY_SNAPSHOT,
+                        "capability_snapshot": MARKET_CAPABILITY_SNAPSHOT,
                     }
                     if runtime.constrained
                     else {}
@@ -1255,13 +1359,18 @@ async def _campaign(
             cycle = 0
             while time.monotonic() < deadline:
                 begin = time.monotonic()
-                if runtime.constrained and (day := us_date(now())) != calendar_day:
-                    calendar = await asyncio.to_thread(client.calendar, US.code, day)
+                day = market.trading_date(datetime.fromisoformat(now()))
+                if runtime.constrained and day != calendar_day:
+                    calendar = await asyncio.to_thread(client.calendar, market.code, day)
                     raw.write(
                         json.dumps({"kind": "calendar", "date": day, "result": calendar}) + "\n"
                     )
                     runtime.publish("calendar", (day, calendar))
                     calendar_day = day
+                    if market is KR:
+                        previous.clear()
+                        metadata.clear()
+                        await asyncio.to_thread(feed.universe)
                 if not adaptive and cycle == 2:
                     before = runtime.counts["book_events"]
                     record("rest_delay_start", seconds=5)
@@ -1279,7 +1388,17 @@ async def _campaign(
                     json.dumps({"kind": "rest_prices", "received_at": received, "rows": rows})
                     + "\n"
                 )
-                ranked, previous = rank_candidates(rows, previous, received, capital)
+                ranked, previous = rank_candidates(
+                    rows, previous, received, capital, market.currency
+                )
+                if market is KR:
+                    ranked = [
+                        symbol
+                        for symbol in ranked
+                        if KR_SYMBOL.fullmatch(symbol)
+                        and feed.listing_exchanges[symbol] in ({"KOSPI"}, {"KOSDAQ"})
+                    ]
+                stock_is_eligible = eligible_kr_stock if market is KR else eligible_stock
                 chosen: list[str] = []
                 for offset in range(0, len(ranked), 50):
                     batch = ranked[offset : offset + 50]
@@ -1291,13 +1410,14 @@ async def _campaign(
                                 json.dumps({"kind": "stock_info", "received_at": now(), "row": row})
                                 + "\n"
                             )
-                    chosen.extend(s for s in batch if eligible_stock(metadata.get(s, {})))
+                    chosen.extend(s for s in batch if stock_is_eligible(metadata.get(s, {})))
                     if len(chosen) >= 50:
                         break
                 runtime.publish("selection", chosen[:50])
-                fx = await asyncio.to_thread(feed.fx)
-                raw.write(json.dumps({"kind": "fx", "received_at": now(), "result": fx}) + "\n")
-                runtime.publish("fx", fx)
+                if market is US:
+                    fx = await asyncio.to_thread(feed.fx)
+                    raw.write(json.dumps({"kind": "fx", "received_at": now(), "result": fx}) + "\n")
+                    runtime.publish("fx", fx)
                 watch = subscription_set(chosen[:50], runtime.protected())
                 # Sequential REST calls share the client's rate controller off the event loop.
                 for symbol in watch:
@@ -1411,9 +1531,11 @@ async def _campaign(
                             ):
                                 selected = list(runtime.desired)
                                 expected = {
-                                    f"{c}:us:{s}" for c in ("trade", "orderbook") for s in selected
+                                    f"{c}:{stream_market}:{s}"
+                                    for c in ("trade", "orderbook")
+                                    for s in selected
                                 }
-                                await ws.send(json.dumps(declaration("us", selected)))
+                                await ws.send(json.dumps(declaration(stream_market, selected)))
                                 declaration_at, ack_pending = tick, True
                             if ack_pending and tick - declaration_at > 20:
                                 raise TimeoutError("Subscription acknowledgement timeout")
@@ -1451,7 +1573,7 @@ async def _campaign(
                                     json.dumps({"received_at": now(), "frame": message}) + "\n"
                                 )
                                 stats["market_messages"] = stats.get("market_messages", 0) + 1
-                                if topic.startswith("orderbook:us:"):
+                                if topic.startswith(f"orderbook:{stream_market}:"):
                                     runtime.publish(
                                         "book", (topic.rsplit(":", 1)[1], message["data"])
                                     )
@@ -1585,6 +1707,7 @@ def main() -> None:
     parser.add_argument("--capital", type=float, default=100)
     parser.add_argument("--candidate-policy", choices=("router", *FAMILIES))
     parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
+    parser.add_argument("--market", choices=MARKETS, default="US")
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
     parser.add_argument("--journal", type=Path, help="Durable journal for an adaptive campaign")
@@ -1592,6 +1715,8 @@ def main() -> None:
         "--resume", action="store_true", help="Recover an existing campaign journal"
     )
     args = parser.parse_args()
+    if args.market == "KR" and args.profile != "broker-constrained":
+        parser.error("--market KR requires --profile broker-constrained")
     if (args.journal is not None and not args.adaptive) or (args.resume and args.journal is None):
         parser.error("--journal requires --adaptive and --resume requires --journal")
     if (
@@ -1632,6 +1757,7 @@ def main() -> None:
                 end_epoch=end_epoch,
                 journal_path=args.journal.resolve() if args.journal else None,
                 resume=args.resume,
+                market=MARKETS[args.market],
             )
         finally:
             if args.adaptive:

@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Any
 
 from tools.layered_paper import Feature, LayeredPaper, assign, holding_valid
-from tools.live_execution import transaction_fees, us_limit_price
 
 
 def seconds(at: str) -> float:
@@ -186,7 +185,7 @@ class AsyncLayeredPaper(LayeredPaper):
         source = seconds(quote["timestamp"])
         self._processed.add(event_id)
         self._receipts[symbol] = tick
-        if not 0 <= tick - source <= 60 or quote.get("currency") != "USD":
+        if not 0 <= tick - source <= 60 or quote.get("currency") != self.context.market.currency:
             return
         previous_source = self._source_times.get(symbol, -math.inf)
         if source < previous_source:
@@ -199,17 +198,35 @@ class AsyncLayeredPaper(LayeredPaper):
                 previous[key] == quote[key] for key in ("timestamp", "currency", "asks", "bids")
             )
         )
-        asks = [(float(r["price"]), int(float(r["volume"]))) for r in quote["asks"]]
-        bids = [(float(r["price"]), int(float(r["volume"]))) for r in quote["bids"]]
-        if (
-            not asks
-            or not bids
-            or any(not math.isfinite(p) or p <= 0 or v < 0 for p, v in asks + bids)
-        ):
-            raise ValueError("Invalid orderbook")
+        asks = [(float(r["price"]), float(r["volume"])) for r in quote["asks"]]
+        bids = [(float(r["price"]), float(r["volume"])) for r in quote["bids"]]
+        kr = self.context.market.code == "KR"
+        if kr:
+            asks = [(price, volume) for price, volume in asks if volume != 0]
+            bids = [(price, volume) for price, volume in bids if volume != 0]
+        invalid = not asks or not bids or any(
+            not math.isfinite(price)
+            or price <= 0
+            or not math.isfinite(volume)
+            or (volume < 0 if kr else int(volume) < 0)
+            or not self.context.market.valid_quote_level(price, volume)
+            for price, volume in asks + bids
+        )
+        if invalid:
+            if not kr:
+                raise ValueError("Invalid orderbook")
+            self._source_times[symbol] = source
+            self._books.pop(symbol, None)
+            self.book._failure("quote_invalid")
+            return
         ask, bid = min(p for p, _ in asks), max(p for p, _ in bids)
         if bid > ask:
-            raise ValueError("Crossed orderbook")
+            if not kr:
+                raise ValueError("Crossed orderbook")
+            self._source_times[symbol] = source
+            self._books.pop(symbol, None)
+            self.book._failure("quote_crossed")
+            return
         if not duplicate_quote:
             self._source_times[symbol] = source
             self._books[symbol] = copy.deepcopy(quote)
@@ -264,7 +281,7 @@ class AsyncLayeredPaper(LayeredPaper):
         if not prices:
             return
         limit = min(prices) if side == "BUY" else max(prices)
-        limit = us_limit_price(limit)
+        limit = self.context.market.limit_price(limit, side)
         if limit <= 0:
             return
         if side == "BUY":
@@ -272,24 +289,8 @@ class AsyncLayeredPaper(LayeredPaper):
             if not isinstance(count, int) or count < 1:
                 raise ValueError("Positive decision-time candidate count required")
             budget = self.available_cash / count
-            lo, hi = 0, int(budget / limit)
-            while lo < hi:
-                n = (lo + hi + 1) // 2
-                cost = (
-                    n * limit
-                    + transaction_fees(n * limit, n, "BUY", self.context.schedule)["total_usd"]
-                )
-                if cost <= budget:
-                    lo = n
-                else:
-                    hi = n - 1
-            quantity = lo
-            reserve = (
-                quantity * limit
-                + transaction_fees(quantity * limit, quantity, "BUY", self.context.schedule)[
-                    "total_usd"
-                ]
-            )
+            quantity = self.book.affordable_shares(budget, limit)
+            reserve = self.book.entry_cost(quantity, limit)
         else:
             quantity, reserve = int(self.book.positions[symbol].quantity), 0.0
         self.decisions.append(
@@ -362,7 +363,7 @@ class AsyncLayeredPaper(LayeredPaper):
             other_reserved = self.reserved_cash - intent.reserved
             reason = "sell_execution_unavailable"
             if execution is not None and (
-                self.book.cash + count * execution[0] - execution[1]["total_usd"]
+                self.book.cash + count * execution[0] - execution[1][self.book.total_fee_key]
                 < other_reserved - 1e-9
             ):
                 reason = "insufficient_cash_after_sell_costs"
