@@ -13,6 +13,7 @@ import os
 import signal
 import time
 from collections import Counter
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -37,6 +38,8 @@ from tools.probe_toss_websocket import (
     now,
     read_spec,
 )
+from tools.shared_feed_slots import SharedFeedSlots
+from tools.slot_control import SlotControl
 from tools.us_adaptive_ai import ASTRA, ENTRY_OPTIONS, SOL, propose
 
 LEGACY_SOURCES = (
@@ -63,6 +66,10 @@ ADAPTIVE_SOURCES = (
     "tools/adaptive_journal.py",
     "tools/kr_comparison_ai.py",
     "papertrade/ai.py",
+)
+SLOT_SOURCES = (
+    "tools/shared_feed_slots.py",
+    "tools/slot_control.py",
 )
 KR_SOURCES = ("tools/kr_broker_profile.py",)
 
@@ -189,6 +196,10 @@ class Runtime:
         self.end_epoch = end_epoch
         self.journal: AdaptiveJournal | None = None
         self.review_settings: Settings | None = None
+        self.shared_watch: set[str] | None = None
+        self.shared_review_call: Callable[[str, int], None] | None = None
+        self.shared_review_publish: Callable[[Any], None] | None = None
+        self.shared_review_payload: dict[str, Any] | None = None
         self.review_task: asyncio.Task | None = None
         self.review_calls: Counter = Counter()
         self.active_opportunities: set[tuple[str, str]] = set()
@@ -311,7 +322,7 @@ class Runtime:
         observed = {
             symbol: feature
             for symbol, feature in prepared.items()
-            if feature is not None and symbol in self.desired
+            if feature is not None and symbol in self.entry_watch
         }
         for symbol, feature in observed.items():
             for family in ENTRY_OPTIONS["policy"]:
@@ -391,14 +402,41 @@ class Runtime:
             "symbol_ids": self.ids.copy(),
             "cost_scenario": candidate.context.schedule.copy(),
         }
-        self.review_task = asyncio.create_task(self._review(self.review_settings, payload))
+        if self.shared_review_call is not None:
+            self.shared_review_payload = payload
+        else:
+            self.review_task = asyncio.create_task(self._review(self.review_settings, payload))
+
+    @property
+    def entry_watch(self) -> list[str] | set[str]:
+        return self.desired if self.shared_watch is None else self.shared_watch
+
+    def launch_shared_review(self) -> None:
+        payload, self.shared_review_payload = self.shared_review_payload, None
+        if payload is not None:
+            assert self.review_settings is not None
+            self.review_task = asyncio.create_task(self._review(self.review_settings, payload))
+
+    def _publish_review(self, payload: Any) -> None:
+        if self.shared_review_publish is None:
+            self.publish("policy_review", payload)
+        else:
+            self.shared_review_publish(payload)
 
     async def _review(self, settings: Settings, payload: dict[str, Any]) -> None:
         model = SOL
         try:
             while True:
+                if (
+                    self.shared_review_call is not None
+                    and self.end_epoch is not None
+                    and time.time() >= self.end_epoch
+                ):
+                    break
                 if self.journal is not None:
                     self.journal.append({"kind": "review_call", "model": model})
+                if self.shared_review_call is not None:
+                    self.shared_review_call(model, payload["evidence_sequence"])
                 self.review_calls[model] += 1
                 review_id = sum(self.review_calls.values())
                 self.record(
@@ -416,7 +454,7 @@ class Runtime:
                 if after_cutoff:
                     break
                 if response["action"] != "defer":
-                    self.publish("policy_review", (review_id, payload["base_version"], response))
+                    self._publish_review((review_id, payload["base_version"], response))
                     return
                 payload = {**payload, "sol_question": response["reason"]}
                 model = ASTRA
@@ -430,7 +468,7 @@ class Runtime:
         except asyncio.CancelledError:
             self.record("ai_review_cancelled", model=model)
             raise
-        self.publish("policy_review", None)
+        self._publish_review(None)
 
     def _apply_review(
         self, sequence: int, received: str, result: Any, at: str | None = None
@@ -498,7 +536,12 @@ class Runtime:
                 self.queue.task_done()
 
     async def _consume_event(
-        self, entry: dict[str, Any], queue_delay: float, *, saved: dict[str, Any] | None = None
+        self,
+        entry: dict[str, Any],
+        queue_delay: float,
+        *,
+        saved: dict[str, Any] | None = None,
+        replaying: bool = False,
     ) -> None:
         sequence, kind, payload, received = (
             entry["sequence"],
@@ -555,7 +598,7 @@ class Runtime:
                 self._apply_review(sequence, received, payload)
         elif kind == "book":
             symbol, book = payload
-            if saved is None:
+            if saved is None and not replaying:
                 self.symbol_delays.setdefault(symbol, []).append(queue_delay)
             self.counts["book_events"] += 1
             if not isinstance(book, dict) or not isinstance(book.get("timestamp"), str):
@@ -670,7 +713,7 @@ class Runtime:
                 "book": book,
                 "feature": f,
                 "eligible": symbol in self.candidates
-                and (not self.adaptive or symbol in self.desired),
+                and (not self.adaptive or symbol in self.entry_watch),
                 "fx": self.fx[0],
                 "fx_at": self.fx[1],
                 "fx_valid_from": self.fx[2],
@@ -710,7 +753,7 @@ class Runtime:
                         and (
                             not self.adaptive
                             or (
-                                x in self.desired
+                                x in self.entry_watch
                                 and (
                                     account.selection != "active"
                                     or abs(candidate_feature.r5) >= 0.001
@@ -761,7 +804,7 @@ class Runtime:
                     )
                 for result in account.outcomes[before[1] :]:
                     self.record("outcome", result=result, **identity)
-            if self.adaptive and saved is None:
+            if self.adaptive and saved is None and not replaying:
                 self._consider_review(sequence, at, prepared)
             if self.adaptive:
                 entry["observation"] = observation.decode()
@@ -1081,11 +1124,18 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
         await asyncio.sleep(delay)
 
 
-def journal_identity(capital: float, end_epoch: float, market: PaperMarket = US) -> dict[str, Any]:
-    sources = ADAPTIVE_SOURCES + KR_SOURCES if market is KR else ADAPTIVE_SOURCES
+def journal_identity(
+    capital: float, end_epoch: float, market: PaperMarket = US, *, slot_control: Path | None = None
+) -> dict[str, Any]:
+    sources: tuple[str, ...] = ADAPTIVE_SOURCES
+    if market is KR:
+        sources += KR_SOURCES
+    if slot_control is not None:
+        sources += SLOT_SOURCES
     return {
         "profile": "broker-constrained",
-        "experiment": "adaptive_exploration",
+        "experiment": "adaptive_exploration" if slot_control is None else "shared_feed_slots",
+        **({"slot_control": str(slot_control.resolve())} if slot_control is not None else {}),
         "market": market.code,
         "currency": market.currency,
         "capital": float(capital),
@@ -1107,11 +1157,14 @@ async def campaign(
     adaptive: bool = False,
     end_epoch: float | None = None,
     journal_path: Path | None = None,
+    slot_control: Path | None = None,
     resume: bool = False,
     market: PaperMarket = US,
 ) -> None:
     if market is KR and profile != "broker-constrained":
         raise ValueError("KR requires the broker-constrained profile")
+    if slot_control is not None and journal_path is None:
+        raise ValueError("Shared slots require a durable campaign journal")
     if resume and journal_path is None:
         raise ValueError("Recovery requires an existing journal")
     if journal_path is None:
@@ -1132,8 +1185,12 @@ async def campaign(
         raise ValueError("Campaign cutoff reached before journal open")
     os.umask(0o077)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
-    identity = journal_identity(capital, end_epoch, market)
-    with AdaptiveJournal.open(journal_path, identity, resume=resume) as journal:
+    identity = journal_identity(capital, end_epoch, market, slot_control=slot_control)
+    with ExitStack() as contexts:
+        journal = contexts.enter_context(
+            AdaptiveJournal.open(journal_path, identity, resume=resume)
+        )
+        control = contexts.enter_context(SlotControl.open(slot_control)) if slot_control else None
         await _campaign(
             output,
             duration,
@@ -1143,6 +1200,7 @@ async def campaign(
             adaptive=adaptive,
             end_epoch=end_epoch,
             journal=journal,
+            control=control,
             resume=resume,
             market=market,
         )
@@ -1158,6 +1216,7 @@ async def _campaign(
     adaptive: bool = False,
     end_epoch: float | None = None,
     journal: AdaptiveJournal | None = None,
+    control: SlotControl | None = None,
     resume: bool = False,
     market: PaperMarket = US,
 ) -> None:
@@ -1182,6 +1241,8 @@ async def _campaign(
 
     def record(kind: str, **payload: Any) -> None:
         log.write(json.dumps({"at": now(), "kind": kind, **payload}) + "\n")
+        if kind == "slot_command" and payload["disposition"] == "applied":
+            resync.set()
 
     http_audit: list[dict[str, Any]] = []
 
@@ -1191,21 +1252,33 @@ async def _campaign(
         elif market is KR and kind in ("listings", "prices"):
             raw.write(json.dumps({"kind": kind, "received_at": now(), **payload}) + "\n")
 
-    runtime = Runtime(
-        capital,
-        record,
-        candidate_policy=candidate_policy,
-        profile=profile,
-        adaptive=adaptive,
-        end_epoch=end_epoch,
-        market=market,
-    )
+    def make_runtime(slot_capital: float, slot_record: Any) -> Runtime:
+        return Runtime(
+            slot_capital,
+            slot_record,
+            candidate_policy=candidate_policy,
+            profile=profile,
+            adaptive=adaptive,
+            end_epoch=end_epoch,
+            market=market,
+        )
+
+    slots = None
+    runtime: Runtime | SharedFeedSlots
+    if control is not None:
+        assert journal is not None
+        slots = SharedFeedSlots(make_runtime, subscription_set, record, journal, control)
+        runtime = slots
+    else:
+        runtime = make_runtime(capital, record)
+    constrained = profile == "broker-constrained"
+
     stats: dict[str, Any] = {
         "state": "starting",
         "ai_calls": 0,
         "real_orders": False,
-        "capital": capital,
-        **({"market": market.code, "currency": market.currency} if runtime.constrained else {}),
+        **({"capital": capital} if slots is None else {"experiment": "shared_feed_slots"}),
+        **({"market": market.code, "currency": market.currency} if constrained else {}),
         "duration_seconds": duration,
         "rest_cycles": [],
         "connections": 0,
@@ -1216,7 +1289,16 @@ async def _campaign(
     token = ""
     resync = asyncio.Event()
     try:
-        if journal is not None:
+        if slots is not None:
+            if resume:
+                await slots.restore()
+                stats["recovered_from"] = slots.journal.evidence()
+                recovered_at = now()
+                if end_epoch is None or seconds(recovered_at) >= end_epoch:
+                    raise CampaignCutoff("Campaign cutoff reached during replay")
+                await slots.marker("recovery_gap", recovered_at)
+        elif journal is not None:
+            assert isinstance(runtime, Runtime)
             if resume:
                 await runtime.restore(journal)
                 if journal.evidence()["records"] == 0:
@@ -1231,10 +1313,20 @@ async def _campaign(
                 journal.append({"kind": "initial", "fx_at": runtime.fx[1]})
         settings = Settings.load(ROOT)
         if journal is not None and (
-            end_epoch is None or journal_identity(capital, end_epoch, market) != journal.identity
+            end_epoch is None
+            or journal_identity(
+                capital,
+                end_epoch,
+                market,
+                slot_control=Path(journal.identity["slot_control"]) if slots is not None else None,
+            )
+            != journal.identity
         ):
             raise JournalError("Campaign source or settings changed during initialization")
-        if adaptive:
+        if slots is not None:
+            slots.enable_reviews(settings)
+        elif adaptive:
+            assert isinstance(runtime, Runtime)
             runtime.review_settings = settings
         data = copy.deepcopy(settings.data)
         data["limits"]["minimum_request_interval"] = 0.08
@@ -1267,15 +1359,13 @@ async def _campaign(
             universe_count=len(universe),
         )
         calendar_day = (
-            market.trading_date(datetime.fromisoformat(now()))
-            if runtime.constrained
-            else now()[:10]
+            market.trading_date(datetime.fromisoformat(now())) if constrained else now()[:10]
         )
         calendar = await asyncio.to_thread(client.calendar, market.code, calendar_day)
-        if runtime.constrained:
+        if constrained:
             runtime.publish("calendar", (calendar_day, calendar))
         sources: tuple[str, ...] = (
-            SOURCES if candidate_policy is not None or runtime.constrained else LEGACY_SOURCES
+            SOURCES if candidate_policy is not None or constrained else LEGACY_SOURCES
         )
         if adaptive:
             sources = ADAPTIVE_SOURCES
@@ -1285,10 +1375,16 @@ async def _campaign(
         private_json(
             output / "manifest.json",
             {
-                **({"comparison": runtime.configurations} if len(runtime.accounts) > 1 else {}),
+                **(
+                    {"comparison": runtime.configurations}
+                    if isinstance(runtime, Runtime) and len(runtime.accounts) > 1
+                    else {}
+                ),
                 **(
                     {
-                        "experiment": "adaptive_exploration",
+                        "experiment": (
+                            "shared_feed_slots" if slots is not None else "adaptive_exploration"
+                        ),
                         "controlled_faults": False,
                         "end_epoch": end_epoch,
                         "entry_options": ENTRY_OPTIONS,
@@ -1315,7 +1411,11 @@ async def _campaign(
                 **(
                     {
                         "profile": profile,
-                        "account": runtime.configurations["incumbent"],
+                        **(
+                            {"account": runtime.configurations["incumbent"]}
+                            if isinstance(runtime, Runtime)
+                            else {}
+                        ),
                         "cost_evidence": KR_COST_EVIDENCE if market is KR else US_COST_EVIDENCE,
                         "session_policy": (
                             "Provider integrated KR regular session, open inclusive, "
@@ -1334,7 +1434,7 @@ async def _campaign(
                         "order_model": "Simulated limit with delayed depth confirmation",
                         "capability_snapshot": MARKET_CAPABILITY_SNAPSHOT,
                     }
-                    if runtime.constrained
+                    if constrained
                     else {}
                 ),
                 "limitations": [
@@ -1364,7 +1464,7 @@ async def _campaign(
             while time.monotonic() < deadline:
                 begin = time.monotonic()
                 day = market.trading_date(datetime.fromisoformat(now()))
-                if runtime.constrained and day != calendar_day:
+                if constrained and day != calendar_day:
                     calendar = await asyncio.to_thread(client.calendar, market.code, day)
                     raw.write(
                         json.dumps({"kind": "calendar", "date": day, "result": calendar}) + "\n"
@@ -1393,7 +1493,11 @@ async def _campaign(
                     + "\n"
                 )
                 ranked, previous = rank_candidates(
-                    rows, previous, received, capital, market.currency
+                    rows,
+                    previous,
+                    received,
+                    slots.capital if slots is not None else capital,
+                    market.currency,
                 )
                 if market is KR:
                     ranked = [
@@ -1594,18 +1698,35 @@ async def _campaign(
         streamer = asyncio.create_task(stream())
         tasks = [consumer, collector, streamer]
         while time.monotonic() < deadline:
-            if runtime.review_task is not None and runtime.review_task.done():
-                runtime.review_task.result()
+            if slots is not None:
+                slots.check_reviews()
+                slots.poll_controls()
+            elif isinstance(runtime, Runtime) and runtime.review_task is not None:
+                if runtime.review_task.done():
+                    runtime.review_task.result()
             for task in tasks:
                 if task.done():
                     task.result()
                     if task is consumer:
                         raise RuntimeError("Consumer stopped")
             runtime.publish("clock", None)
-            private_json(output / "status.json", {**stats, "at": now(), **runtime.status()})
+            if slots is not None:
+                async with slots.committing:
+                    if consumer.done():
+                        consumer.result()
+                    status = slots.status()
+                    slots.control.snapshot(status["shared_slots"])
+            else:
+                status = runtime.status()
+            private_json(output / "status.json", {**stats, "at": now(), **status})
             raw.flush()
             await asyncio.sleep(1)
-        if runtime.review_task is not None:
+        if slots is not None:
+            slots.check_reviews()
+            await slots.quiesce_reviews()
+            slots.control.close_submissions()
+            slots.poll_controls()
+        elif isinstance(runtime, Runtime) and runtime.review_task is not None:
             runtime.review_task.cancel()
         for producer in (collector, streamer):
             if producer.done():
@@ -1627,16 +1748,24 @@ async def _campaign(
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
         at = now()
-        if journal is not None:
-            await runtime.mark_advance("final_advance", at)
+        if slots is not None:
+            slots.check_reviews()
+            await slots.marker("final_advance", at)
         else:
-            for account in runtime.accounts.values():
-                await account.advance(at)
+            assert isinstance(runtime, Runtime)
+            if journal is not None:
+                await runtime.mark_advance("final_advance", at)
+            else:
+                for account in runtime.accounts.values():
+                    await account.advance(at)
         await runtime.close()
         stats.update(state="complete", at=now(), **runtime.status())
         checks = {
             "stream_observed": stats.get("market_messages", 0) > 0,
-            "features_observed": runtime.counts["features_valid"] > 0,
+            "features_observed": runtime.counts[
+                "feature" if slots is not None else "features_valid"
+            ]
+            > 0,
             "rest_delay_did_not_stop_books": any(
                 x["kind"] == "rest_delay" and x["book_events_during"] > 0 for x in stats["faults"]
             ),
@@ -1649,13 +1778,25 @@ async def _campaign(
             ),
             "cash_not_overreserved": all(
                 account.reserved_cash <= account.book.cash + 1e-9
-                for account in runtime.accounts.values()
+                for pair in (
+                    [slot.runtime for slot in slots.slots.values()]
+                    if slots is not None
+                    else [runtime]
+                )
+                if isinstance(pair, Runtime)
+                for account in pair.accounts.values()
             ),
         }
         if adaptive:
             for key in ("rest_delay_did_not_stop_books", "reconnected", "subscription_replaced"):
                 del checks[key]
-            checks["matched_inputs"] = runtime.status()["comparison"]["inputs_aligned"]
+            if slots is not None:
+                rows = stats["shared_slots"]
+                checks["matched_inputs"] = bool(rows) and all(
+                    row["comparison"]["inputs_aligned"] for row in rows
+                )
+            else:
+                checks["matched_inputs"] = runtime.status()["comparison"]["inputs_aligned"]
         stats.update(checks=checks, result="passed" if all(checks.values()) else "inconclusive")
     except (
         OSError,
@@ -1687,7 +1828,24 @@ async def _campaign(
             stats["journal"] = journal.evidence()
         private_json(output / "http-audit.json", {"requests": http_audit})
         files.close()
-        comparison = write_comparison(output, stats, runtime)
+        comparison = (
+            write_comparison(output, stats, runtime) if isinstance(runtime, Runtime) else None
+        )
+        if slots is not None:
+            assert journal is not None
+            source_unchanged = all(
+                (ROOT / name).is_file()
+                and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected
+                for name, expected in journal.identity["source_sha256"].items()
+            )
+            stats["shared_feed"] = {
+                "complete": stats["state"] == "complete" and source_unchanged,
+                "source_unchanged": source_unchanged,
+            }
+            if stats["state"] == "complete":
+                slots.control.snapshot(stats["shared_slots"])
+                if not source_unchanged:
+                    stats.update(state="failed", result="inconclusive")
         if comparison is not None:
             stats.update(
                 state=comparison["state"],
@@ -1716,9 +1874,14 @@ def main() -> None:
     parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
     parser.add_argument("--journal", type=Path, help="Durable journal for an adaptive campaign")
     parser.add_argument(
+        "--slot-control", type=Path, help="Enable shared slots with this command spool"
+    )
+    parser.add_argument(
         "--resume", action="store_true", help="Recover an existing campaign journal"
     )
     args = parser.parse_args()
+    if args.slot_control is not None and (args.journal is None or not args.adaptive):
+        parser.error("--slot-control requires --adaptive and --journal")
     if args.market == "KR" and args.profile != "broker-constrained":
         parser.error("--market KR requires --profile broker-constrained")
     if (args.journal is not None and not args.adaptive) or (args.resume and args.journal is None):
@@ -1760,6 +1923,7 @@ def main() -> None:
                 adaptive=args.adaptive,
                 end_epoch=end_epoch,
                 journal_path=args.journal.resolve() if args.journal else None,
+                slot_control=args.slot_control.resolve() if args.slot_control else None,
                 resume=args.resume,
                 market=MARKETS[args.market],
             )

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from tools import schedule_async_live_validation as schedule
 from tools.adaptive_journal import AdaptiveJournal
+from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
 
 
 class ScheduleTest(unittest.TestCase):
@@ -368,3 +369,61 @@ class RecoveryScheduleTest(unittest.TestCase):
             start.assert_not_called()
         self.assertEqual(self.status()["state"], "blocked")
         self.assertEqual(self.status()["reason"], "Journal changed after restart decision")
+
+    def test_dynamic_attempts_reuse_the_same_spool_and_keep_prior_evidence(self) -> None:
+        self.spec["dynamic_slots"] = True
+        command = SlotCommand("request-1", "stop", "slot")
+        spool = self.output / SPOOL_NAME
+        first_output = self.output / "run"
+
+        def start(job: Path, argv: list[str], _cwd: Path) -> None:
+            job.mkdir(parents=True)
+            (job / "start.claim").touch()
+            self.assertEqual(argv[argv.index("--slot-control") + 1], str(spool))
+            run = Path(argv[argv.index("--output") + 1])
+            run.mkdir(parents=True)
+            resume = "--resume" in argv
+            with (
+                SlotControl.open(spool) as control,
+                AdaptiveJournal.open(
+                    self.output / "journal.sqlite3",
+                    {
+                        "experiment": "shared_feed_slots",
+                        "slot_control": str(spool.resolve()),
+                        "end_epoch": self.spec["end_epoch"],
+                    },
+                    resume=resume,
+                ) as journal,
+            ):
+                if not resume:
+                    control.submit(command, end_epoch=self.spec["end_epoch"])
+                    journal.append({"kind": "clock"})
+                    (run / "status.json").write_text('{"state": "running"}')
+                    (job / "exit.json").write_text('{"returncode": -9}')
+                    return
+                self.assertEqual(control.pending(), [command])
+                control.record(command, "rejected", {"reason": "Unknown slot"})
+                journal.complete()
+                evidence = journal.evidence()
+            schedule.atomic_json(
+                run / "status.json",
+                {
+                    "state": "complete",
+                    "result": "inconclusive",
+                    "experiment": "shared_feed_slots",
+                    "shared_feed": {"complete": True, "source_unchanged": True},
+                    "shared_slots": [],
+                    "journal": evidence,
+                },
+            )
+            (job / "exit.json").write_text('{"returncode": 0}')
+
+        with patch.object(schedule, "start_job", side_effect=start) as started:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 0)
+            self.assertEqual(started.call_count, 2)
+        self.assertEqual((first_output / "status.json").read_text(), '{"state": "running"}')
+        with SlotControl.open(spool) as control:
+            self.assertEqual(control.pending(), [])
+            report = control.report()
+            self.assertTrue(report["closed"])
+            self.assertEqual(report["commands"][0]["disposition"], "rejected")

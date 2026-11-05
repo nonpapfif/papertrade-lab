@@ -56,6 +56,43 @@ artifact or calibrate actual broker execution latency.
 The new comparison path is covered by offline fixtures. A live comparison has not been run
 as part of this implementation; a separate explicitly started campaign supplies that evidence.
 
+## Operator-managed shared-feed slots
+
+Use a new schedule output directory and add `--dynamic-slots --recover` to the finite scheduler.
+The schedule fixes the market, source digest and observation window. Dynamic mode starts without
+accounts. The scheduler's required capital argument does not create a slot. Each add command
+sets the initial capital in the market's native currency for both accounts and supplies their
+entry options. The incumbent stays fixed and the candidate has its own adaptive AI review.
+Each slot starts on the shared feed at its admission point. Match the initial entry options
+when comparing the effect of AI changes.
+
+```sh
+schedule_dir=state/validation/NEW_SHARED_FEED
+python -m tools.slot_control --output "$schedule_dir" list
+python -m tools.slot_control --output "$schedule_dir" add --command-id req-001 --slot-id small \
+  --capital 100000 \
+  --incumbent '{"policy":"trend","selection":"all","allocation":"equal"}' \
+  --candidate '{"policy":"trend","selection":"all","allocation":"equal"}'
+python -m tools.slot_control --output "$schedule_dir" stop --command-id req-002 --slot-id small
+```
+
+The examples use KRW 100,000 for a KR schedule. Run these commands after the worker starts.
+Supported options are `trend` and `rebound` for `policy`, `all` and `active` for `selection`,
+and `equal` and `priority` for `allocation`. Supply all three options per account.
+
+Submitting a request records it in `slot-control.sqlite3`. The worker consumes requests in order
+and records a disposition and evidence separately from the request. A null disposition means the
+worker has yet to record its decision. `list` displays the latest slot snapshot and command history.
+The same command ID and payload return the original request and any recorded result. A different
+payload requires a new command ID. A stopped slot keeps its accumulated paper results and ID.
+Use a new slot ID for a fresh comparison. Stopping cancels pending intents and releases
+reservations. Held positions and their last observed marks stay in the frozen slot result.
+
+The scheduler reuses the same command spool for a verified journal restart. Each worker attempt
+uses its own output directory. The finite observation deadline still applies. Commands queued too
+late to reach the worker remain visible with a null disposition. The CLI also allows `list` and
+identical command retries after the schedule closes so the operator can retrieve recorded results.
+
 ## Selection and processing
 
 Each REST sweep reads the active US universe in batches of 200. The first sweep establishes a
