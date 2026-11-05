@@ -153,9 +153,11 @@ between all and active, and allocation between equal and priority. These are com
 existing deterministic rules. Candle-high breakouts, new executable rules, real trades and
 changes to the execution contract are outside this experiment.
 
-A fresh completed feature entering a supported rule for a symbol, or a newly recorded paper fill,
-can trigger an asynchronous review. Repeated matching features do not trigger duplicate reviews.
-Evidence that accumulates while a review is in flight remains available for the next review.
+The first affordable signal for a rule can trigger an asynchronous review once per policy version.
+Review also triggers when equal allocation blocks every current entry and priority could afford
+at least one. That blocker re-arms after an equal allocation entry becomes affordable.
+Fills accumulate as evidence for the next review. Opportunities are evaluated again after an
+in-flight review finishes.
 No clock-only review runs. Sol medium is the default. Astra
 medium receives the same evidence only when Sol identifies a concrete unresolved question.
 The runner validates a closed schema locally and queues approved configuration changes in
