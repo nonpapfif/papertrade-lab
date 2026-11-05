@@ -120,7 +120,7 @@ class ScheduleTest(unittest.TestCase):
             job.mkdir()
             claim = job / "start.claim"
             claim.write_text("123\n")
-            self.assertEqual(schedule.run_schedule(output, {}), 1)
+            self.assertEqual(schedule.run_schedule(output, {"end_epoch": time.time() + 30}), 1)
             self.assertEqual(claim.read_text(), "123\n")
             status = json.loads((output / "status.json").read_text())
             self.assertEqual(status["state"], "blocked")
@@ -135,7 +135,7 @@ class ScheduleTest(unittest.TestCase):
             run = output / "run"
             run.mkdir()
             (run / "status.json").write_text('{"state": "incomplete"}')
-            self.assertEqual(schedule.run_schedule(output, {}), 1)
+            self.assertEqual(schedule.run_schedule(output, {"end_epoch": time.time() + 30}), 1)
             status = json.loads((output / "status.json").read_text())
             self.assertEqual(status["state"], "incomplete")
             self.assertEqual(status["job_exit"]["returncode"], 0)
@@ -230,13 +230,17 @@ class RecoveryScheduleTest(unittest.TestCase):
     def test_controller_reattaches_before_and_after_restart_claim(self) -> None:
         start_job = schedule.start_job
 
-        def interrupt_before_start(directory: Path, argv: list[str], cwd: Path) -> None:
+        def interrupt_before_start(
+            directory: Path, argv: list[str], cwd: Path, *, stop_after: float
+        ) -> None:
             if "--resume" in argv:
                 raise KeyboardInterrupt
-            start_job(directory, argv, cwd)
+            start_job(directory, argv, cwd, stop_after=stop_after)
 
-        def interrupt_after_start(directory: Path, argv: list[str], cwd: Path) -> None:
-            start_job(directory, argv, cwd)
+        def interrupt_after_start(
+            directory: Path, argv: list[str], cwd: Path, *, stop_after: float
+        ) -> None:
+            start_job(directory, argv, cwd, stop_after=stop_after)
             raise KeyboardInterrupt
 
         with (
@@ -266,6 +270,56 @@ class RecoveryScheduleTest(unittest.TestCase):
         self.assertEqual(self.status()["state"], "incomplete")
         self.assertFalse((self.output / "attempts").exists())
 
+    def test_cutoff_stops_a_stuck_target_and_never_restarts_it(self) -> None:
+        self.spec["argv"] = [sys.executable, "-c", "import time; time.sleep(60)"]
+        self.spec["end_epoch"] = time.time() + 1
+        with patch.object(schedule, "CUTOFF_DRAIN_SECONDS", 0):
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+        status = self.status()
+        self.assertEqual(status["state"], "incomplete")
+        self.assertTrue(status["job_exit"]["cutoff_stop"])
+        self.assertEqual(
+            status["failure_handoff"],
+            {
+                "attempt": 1,
+                "source_commit": self.spec["source_commit"],
+                "source_digest": self.spec["source_digest"],
+                "evidence": {
+                    "worker_status": None,
+                    "exit_record": "job/exit.json",
+                    "launch_claim": "job/start.claim",
+                },
+            },
+        )
+        self.assertLess(status["job_exit"]["returncode"], 0)
+        self.assertEqual(status["restarts"], [])
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            start.assert_not_called()
+        self.assertFalse((self.output / "attempts").exists())
+        self.assertEqual(self.status(), status)
+
+    def test_cutoff_without_verified_exit_leaves_the_launch_claim_in_place(self) -> None:
+        job = self.output / "job"
+        job.mkdir()
+        claim = job / "start.claim"
+        claim.touch()
+        self.spec["end_epoch"] = time.time() - 90
+        with (
+            patch.object(schedule, "poll_job", return_value=None) as poll,
+            patch.object(schedule, "start_job") as start,
+        ):
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            poll.assert_called_once_with(job)
+            start.assert_not_called()
+        status = self.status()
+        self.assertEqual(status["state"], "incomplete")
+        self.assertIn("exit unverified", status["reason"])
+        self.assertNotIn("job_exit", status)
+        self.assertIsNone(status["failure_handoff"]["evidence"]["exit_record"])
+        self.assertTrue(claim.exists())
+
     def test_recovery_refuses_missing_or_corrupt_journal(self) -> None:
         for corrupt in (False, True):
             with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
@@ -286,6 +340,7 @@ class RecoveryScheduleTest(unittest.TestCase):
             (-15, {"state": "running"}),
             (1, {"state": "interrupted"}),
             (1, {"state": "failed", "error_type": "ApiError", "api_status": 401}),
+            (1, {"state": "failed", "error_type": "ApiError", "api_status": 403}),
         ):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
@@ -376,7 +431,8 @@ class RecoveryScheduleTest(unittest.TestCase):
         spool = self.output / SPOOL_NAME
         first_output = self.output / "run"
 
-        def start(job: Path, argv: list[str], _cwd: Path) -> None:
+        def start(job: Path, argv: list[str], _cwd: Path, *, stop_after: float) -> None:
+            self.assertEqual(stop_after, self.spec["end_epoch"] + schedule.CUTOFF_DRAIN_SECONDS)
             job.mkdir(parents=True)
             (job / "start.claim").touch()
             self.assertEqual(argv[argv.index("--slot-control") + 1], str(spool))

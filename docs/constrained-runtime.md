@@ -200,3 +200,9 @@ It waits for recorded provider cooldowns and keeps the original deadline. A repe
 without journal progress, invalid journal, unknown process identity, explicit interruption,
 or incompatible source stops the schedule. Reattaching the scheduler with the same arguments
 reuses its durable attempt and restart records. Preserve old attempt files when investigating.
+
+A failed, blocked, or incomplete schedule records `failure_handoff` atomically with its terminal
+status. The handoff identifies the current attempt and approved source, and links to the available
+worker status, exit record, and launch claim relative to the schedule directory. A missing exit
+reference can mean the attempt was never launched or its exit could not be verified. Earlier
+attempts remain in the restart history. This record can be used for a later scoped diagnosis.

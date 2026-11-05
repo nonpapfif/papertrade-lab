@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 from papertrade.api import ApiError
 from tools.layered_paper import Feature
+from tools.paper_market import KR
 from tools.run_async_live_validation import (
     SOURCES,
     Runtime,
@@ -24,11 +25,18 @@ from tools.run_async_live_validation import (
     rank_candidates,
     subscription_set,
     wait_for_rest_cooldown,
+    websocket_retry_at,
     write_comparison,
 )
 
 
 class SelectionTests(unittest.TestCase):
+    def test_websocket_retry_time_honors_valid_delay_and_http_date(self) -> None:
+        self.assertEqual(websocket_retry_at(["8"], 100), 108)
+        self.assertEqual(websocket_retry_at(["Thu, 01 Jan 1970 00:02:00 GMT"], 100), 120)
+        self.assertEqual(websocket_retry_at(["8", "10"], 100), 110)
+        self.assertEqual(websocket_retry_at(["invalid", "-10", "1", "9" * 500], 100), 102)
+
     def test_default_runtime_preserves_single_account_status(self) -> None:
         runtime = Runtime(100, lambda *_args, **_kwargs: None)
         self.assertEqual(len(runtime.accounts), 1)
@@ -454,6 +462,68 @@ class ComparisonTests(RuntimeTests):
             self.assertFalse(result["source_unchanged"])
             self.assertEqual(result["observation_status"], "inconclusive")
 
+    @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
+    async def test_adaptive_websocket_handshake_classifies_only_429_and_503(self) -> None:
+        from websockets.datastructures import Headers
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+
+        runner = "tools.run_async_live_validation"
+
+        async def select_and_consume(runtime: Runtime) -> None:
+            runtime.desired = ["005930"]
+            await asyncio.Future()
+
+        for status in (429, 503, 401, 403, 500):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "run"
+                headers = Headers([("Retry-After", "30")])
+                connection = AsyncMock()
+                connection.__aenter__.side_effect = InvalidStatus(
+                    Response(status, "fixture", headers, body=b"private fixture response")
+                )
+                before = time.time()
+                with (
+                    patch("websockets.asyncio.client.connect", return_value=connection),
+                    patch.object(Runtime, "consume", new=select_and_consume),
+                    patch(f"{runner}.DeadlineMarketClient") as client,
+                    patch(f"{runner}.LiveFeed") as feed,
+                    patch(f"{runner}.read_spec", return_value=b"{}"),
+                    self.assertRaisesRegex(SystemExit, "Live validation failed"),
+                ):
+                    client.return_value.access_token.return_value = "fixture-token"
+                    client.return_value.calendar.return_value = {}
+                    feed.return_value.universe.return_value = []
+                    feed.return_value.snapshot.return_value = []
+                    await asyncio.wait_for(
+                        campaign(
+                            output,
+                            10,
+                            100_000,
+                            profile="broker-constrained",
+                            adaptive=True,
+                            end_epoch=before + 10,
+                            market=KR,
+                        ),
+                        timeout=3,
+                    )
+                payload = (output / "status.json").read_text()
+                result = json.loads(payload)
+                self.assertEqual(result["state"], "failed")
+                if status in (429, 503):
+                    self.assertEqual(result["error_type"], "ApiError")
+                    self.assertEqual(result["api_status"], status)
+                    self.assertEqual(result["api_code"], "cooldown")
+                    self.assertGreaterEqual(result["api_retry_at"], before + 30)
+                    self.assertLessEqual(result["api_retry_at"], time.time() + 30)
+                else:
+                    self.assertEqual(result["error_type"], "InvalidStatus")
+                    self.assertEqual(result["http_status"], status)
+                    self.assertNotIn("api_retry_at", result)
+                self.assertNotIn("private fixture response", payload)
+                self.assertNotIn("fixture-token", payload)
+                connection.__aenter__.assert_awaited_once()
+
     async def test_cancelled_constrained_campaign_persists_terminal_interruption(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "run"
@@ -464,6 +534,7 @@ class ComparisonTests(RuntimeTests):
             websocket_exceptions = ModuleType("websockets.exceptions")
             websocket_client.connect = AsyncMock()
             websocket_exceptions.ConnectionClosed = type("ConnectionClosed", (Exception,), {})
+            websocket_exceptions.InvalidStatus = type("InvalidStatus", (Exception,), {})
             websocket_exceptions.WebSocketException = type("WebSocketException", (Exception,), {})
             with (
                 patch.dict(

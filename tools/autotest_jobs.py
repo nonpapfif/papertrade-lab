@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from papertrade.core import process_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 STARTUP_SECONDS = 5
+STOP_SECONDS = 5
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -75,6 +77,11 @@ def _validate(spec: dict[str, Any]) -> None:
     source = spec.get("stdin")
     if source is not None and (not isinstance(source, str) or not Path(source).is_absolute()):
         raise RuntimeError("Job stdin must be an absolute path")
+    stop_after = spec.get("stop_after")
+    if stop_after is not None and (
+        type(stop_after) not in (int, float) or not math.isfinite(stop_after)
+    ):
+        raise RuntimeError("Job stop time must be finite")
 
 
 def start_job(
@@ -84,6 +91,7 @@ def start_job(
     *,
     stdin: Path | None = None,
     environment: dict[str, str] | None = None,
+    stop_after: float | None = None,
 ) -> None:
     """Reserve once and start a detached worker; an existing job is never restarted."""
     directory = directory.resolve()
@@ -92,6 +100,7 @@ def start_job(
         "cwd": str(cwd.resolve()),
         "stdin": str(stdin.resolve()) if stdin is not None else None,
         "created_at": time.time(),
+        **({"stop_after": stop_after} if stop_after is not None else {}),
     }
     _validate(spec)
     target_environment = codex_environment() if environment is None else environment
@@ -208,12 +217,27 @@ def _child(directory: Path) -> int:
                     "identity": process_identity(process.pid),
                 },
             )
-            returncode = process.wait()
+            cutoff_stop = False
+            stop_after = spec.get("stop_after")
+            try:
+                returncode = process.wait(
+                    timeout=None if stop_after is None else max(0, stop_after - time.time())
+                )
+            except subprocess.TimeoutExpired:
+                # Only the parent holding this Popen may signal the target.
+                cutoff_stop = True
+                process.terminate()
+                try:
+                    returncode = process.wait(timeout=STOP_SECONDS)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    returncode = process.wait()
         atomic_json(
             directory / "exit.json",
             {
                 "returncode": returncode,
                 "finished_at": time.time(),
+                **({"cutoff_stop": True} if cutoff_stop else {}),
             },
         )
         return 0

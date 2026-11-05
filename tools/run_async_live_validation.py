@@ -17,6 +17,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import asdict, replace
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -1178,6 +1179,25 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
         await asyncio.sleep(delay)
 
 
+def websocket_retry_at(headers: list[str], now_epoch: float) -> float:
+    retry_at = now_epoch + 2
+    for header in headers:
+        value = header.strip()
+        try:
+            if value.isascii() and value.isdecimal():
+                candidate = now_epoch + float(value)
+            else:
+                stamp = parsedate_to_datetime(value)
+                if stamp.utcoffset() is None:
+                    continue
+                candidate = stamp.timestamp()
+        except (ValueError, TypeError, OSError, OverflowError):
+            continue
+        if math.isfinite(candidate):
+            retry_at = max(retry_at, candidate)
+    return retry_at
+
+
 def journal_identity(
     capital: float, end_epoch: float, market: PaperMarket = US, *, slot_control: Path | None = None
 ) -> dict[str, Any]:
@@ -1283,7 +1303,7 @@ async def _campaign(
     ):
         raise ValueError("Adaptive campaign requires a constrained profile and future cutoff")
     from websockets.asyncio.client import connect
-    from websockets.exceptions import ConnectionClosed, WebSocketException
+    from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
     os.umask(0o077)
     output.mkdir(parents=True, exist_ok=False)
@@ -1745,6 +1765,19 @@ async def _campaign(
                                     )
                             else:
                                 raise ValueError("Unexpected provider frame")
+                except InvalidStatus as error:
+                    status = error.response.status_code
+                    if not adaptive or status not in (429, 503):
+                        raise
+                    record("connection_failure", **error_details(error, token))
+                    raise ApiError(
+                        "WebSocket handshake temporarily unavailable",
+                        status=status,
+                        code="cooldown",
+                        retry_at=websocket_retry_at(
+                            error.response.headers.get_all("Retry-After"), time.time()
+                        ),
+                    ) from error
                 except (ConnectionClosed, OSError, TimeoutError) as error:
                     record("connection_failure", **error_details(error, token))
                 if time.monotonic() < deadline:
