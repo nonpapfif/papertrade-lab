@@ -18,7 +18,6 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from papertrade.api import ApiError, private_json
 from papertrade.core import SafetyError, Settings
@@ -26,6 +25,7 @@ from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
 from tools.async_layered_paper import AsyncLayeredPaper, seconds
 from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
 from tools.live_feed import LiveFeed
+from tools.paper_market import US
 from tools.probe_toss_websocket import (
     ROOT,
     URL,
@@ -43,6 +43,7 @@ LEGACY_SOURCES = (
     "tools/layered_paper.py",
     "tools/live_execution.py",
     "papertrade/api.py",
+    "tools/paper_market.py",
 )
 SOURCES = (
     *LEGACY_SOURCES,
@@ -61,7 +62,6 @@ ADAPTIVE_SOURCES = (
     "papertrade/ai.py",
 )
 
-US_TIMEZONE = ZoneInfo("America/New_York")
 US_CAPABILITY_SNAPSHOT = {
     "source": "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json",
     "retrieved": "2026-11-04",
@@ -80,22 +80,15 @@ US_COST_EVIDENCE = {
 
 
 def us_date(at: str) -> str:
-    return datetime.fromtimestamp(seconds(at), tz=US_TIMEZONE).date().isoformat()
+    return US.trading_date(datetime.fromisoformat(at))
 
 
 def us_regular_window(calendar: dict, day: str) -> tuple[float, float] | None:
     try:
-        today = calendar["today"]
-        regular = today["regularMarket"]
-        if today["date"] != day or regular is None:
-            return None
-        start, end = regular["startTime"], regular["endTime"]
-        start_tick, end_tick = seconds(start), seconds(end)
-        if start_tick < end_tick and us_date(start) == us_date(end) == day:
-            return start_tick, end_tick
+        start, end = US.session(calendar, day)
+        return start.timestamp(), end.timestamp()
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
-    return None
 
 
 def rank_candidates(
@@ -249,7 +242,7 @@ class Runtime:
         if (
             feature is None
             or book is None
-            or book.get("currency") != "USD"
+            or book.get("currency") != US.currency
             or seconds(feature.available_at) > tick
             or not 0 <= tick - seconds(feature.bar_end) <= 90
             or not 0 <= tick - seconds(book["timestamp"]) <= 60
@@ -572,7 +565,7 @@ class Runtime:
             paired = len(self.accounts) > 1
             if (
                 (paired or self.constrained)
-                and book.get("currency") == "USD"
+                and book.get("currency") == US.currency
                 and book["asks"]
                 and book["bids"]
                 and max(float(row["price"]) for row in book["bids"])
@@ -1181,7 +1174,7 @@ async def _campaign(
             universe_count=len(universe),
         )
         calendar_day = us_date(now()) if runtime.constrained else now()[:10]
-        calendar = await asyncio.to_thread(client.calendar, "US", calendar_day)
+        calendar = await asyncio.to_thread(client.calendar, US.code, calendar_day)
         if runtime.constrained:
             runtime.publish("calendar", (calendar_day, calendar))
         sources: tuple[str, ...] = (
@@ -1263,7 +1256,7 @@ async def _campaign(
             while time.monotonic() < deadline:
                 begin = time.monotonic()
                 if runtime.constrained and (day := us_date(now())) != calendar_day:
-                    calendar = await asyncio.to_thread(client.calendar, "US", day)
+                    calendar = await asyncio.to_thread(client.calendar, US.code, day)
                     raw.write(
                         json.dumps({"kind": "calendar", "date": day, "result": calendar}) + "\n"
                     )

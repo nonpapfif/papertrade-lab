@@ -14,13 +14,13 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from papertrade.api import SYMBOL, ApiError
 from papertrade.core import SafetyError, Settings, encode
 from tools.autotest_jobs import atomic_json
 from tools.kr_comparison_ai import SOL, decide, review_cascade
 from tools.live_feed import LiveFeed
+from tools.paper_market import KR
 from tools.probe_toss_websocket import CachedTokenClient
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,7 +198,7 @@ class Comparison:
                     account.budgets.clear()
                 return []
         for row in rows:
-            if row.get("currency") != "KRW":
+            if row.get("currency") != KR.currency:
                 continue
             try:
                 symbol = row["symbol"]
@@ -448,8 +448,8 @@ async def campaign(
 
                 calendar = await asyncio.to_thread(
                     client.calendar,
-                    "KR",
-                    now().astimezone(ZoneInfo("Asia/Seoul")).date().isoformat(),
+                    KR.code,
+                    KR.trading_date(now()),
                 )
                 window = continuous_window(calendar, now())
                 classification = {}
@@ -481,6 +481,7 @@ async def campaign(
                         "tools/kr_broker_profile.py",
                         "papertrade/api.py",
                         "tools/live_feed.py",
+                        "tools/paper_market.py",
                     )
                 )
                 profile_evidence = {
