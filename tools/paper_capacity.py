@@ -98,8 +98,67 @@ class ArrivalBacklog:
         self.maximum = max(self.maximum, self.finished - arrival)
 
 
+def _valid_measurement(sample: Any) -> bool:
+    if not isinstance(sample, dict) or type(sample.get("slots")) is not int:
+        return False
+    if sample["slots"] < 1:
+        return False
+    if (
+        sample.get("inputs_aligned") is False
+        and sample.get("subscriptions_covered") is False
+        and sample
+        == {
+            "slots": sample["slots"],
+            "inputs_aligned": False,
+            "subscriptions_covered": False,
+            "reason": "Protected positions exceed one connection capacity",
+        }
+    ):
+        return True
+    for field in (
+        "accounts",
+        "events",
+        "accepted_books_per_account",
+        "valid_features_per_slot",
+        "peak_rss_bytes",
+    ):
+        value = sample.get(field)
+        if type(value) is not int or value < 0:
+            return False
+    for field in (
+        "observed_seconds",
+        "processing_seconds",
+        "max_backlog_seconds",
+        "p99_event_seconds",
+    ):
+        value = sample.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return False
+        try:
+            if not math.isfinite(value):
+                return False
+        except OverflowError:
+            return False
+    return (
+        sample["accounts"] == 2 * sample["slots"]
+        and sample["events"] >= 2
+        and sample["observed_seconds"] > 0
+        and type(sample.get("inputs_aligned")) is bool
+        and type(sample.get("subscriptions_covered")) is bool
+    )
+
+
 def assess(samples: list[dict[str, Any]], budget_seconds: float) -> int:
     """Return the largest contiguous tested count satisfying the frozen latency contract."""
+    if type(budget_seconds) not in (int, float) or budget_seconds <= 0:
+        return 0
+    try:
+        if not math.isfinite(budget_seconds):
+            return 0
+    except OverflowError:
+        return 0
+    if not isinstance(samples, list) or not all(_valid_measurement(row) for row in samples):
+        return 0
     maximum = 0
     for sample in samples:
         if (
@@ -110,10 +169,7 @@ def assess(samples: list[dict[str, Any]], budget_seconds: float) -> int:
             or sample["processing_seconds"] > sample["observed_seconds"]
         ):
             break
-        if (
-            sample.get("accepted_books_per_account", 1) < 1
-            or sample.get("valid_features_per_slot", 1) < 1
-        ):
+        if sample["accepted_books_per_account"] < 1 or sample["valid_features_per_slot"] < 1:
             break
         maximum = sample["slots"]
     return maximum
@@ -131,7 +187,9 @@ class CapacityBenchmark:
 
     async def measure(self, rows: list[dict[str, Any]], count: int) -> dict[str, Any]:
         observed = [
-            datetime.fromisoformat(row["received"]).timestamp() for row in rows if row["kind"] == "book"
+            datetime.fromisoformat(row["received"]).timestamp()
+            for row in rows
+            if row["kind"] == "book"
         ]
         if len(observed) < 2 or max(observed) <= min(observed):
             raise ValueError("No measurable observation duration")

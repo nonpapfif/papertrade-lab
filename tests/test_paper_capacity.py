@@ -8,9 +8,27 @@ from typing import Any
 from unittest.mock import patch
 
 from tools.adaptive_journal import AdaptiveJournal
+from tools.paper_campaign.policy import Admission
 from tools.paper_capacity import ArrivalBacklog, CapacityBenchmark, assess, strategies, workload
 
 START = datetime(2026, 11, 6, 15, tzinfo=UTC)
+
+
+def measurement(count: int = 1) -> dict[str, Any]:
+    return {
+        "slots": count,
+        "accounts": 2 * count,
+        "events": 10,
+        "inputs_aligned": True,
+        "subscriptions_covered": True,
+        "max_backlog_seconds": 0.1,
+        "processing_seconds": 0.5,
+        "observed_seconds": 10,
+        "p99_event_seconds": 0.05,
+        "peak_rss_bytes": 1024,
+        "accepted_books_per_account": 1,
+        "valid_features_per_slot": 1,
+    }
 
 
 def event(kind: str, payload: Any, at: datetime = START) -> dict[str, Any]:
@@ -67,16 +85,7 @@ class CapacityTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(backlog.maximum, 1.18)
 
     def test_failed_measurement_prevents_extrapolation(self) -> None:
-        sample: dict[str, Any] = {
-            "slots": 1,
-            "inputs_aligned": True,
-            "subscriptions_covered": True,
-            "max_backlog_seconds": 0.1,
-            "processing_seconds": 0.5,
-            "observed_seconds": 10,
-            "accepted_books_per_account": 1,
-            "valid_features_per_slot": 1,
-        }
+        sample = measurement()
         for defect in (
             {"inputs_aligned": False},
             {"subscriptions_covered": False},
@@ -87,9 +96,103 @@ class CapacityTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(defect=defect):
                 self.assertEqual(
-                    assess([sample, {**sample, "slots": 2, **defect}, {**sample, "slots": 3}], 1), 1
+                    assess([sample, {**measurement(2), **defect}, measurement(3)], 1), 1
                 )
-        self.assertEqual(assess([{**sample, "slots": 2}], 1), 0)
+        self.assertEqual(assess([measurement(2)], 1), 0)
+
+    def test_missing_or_malformed_measurements_fail_closed(self) -> None:
+        invalid: Any
+        sample = measurement()
+        for field in sample:
+            missing = {key: value for key, value in sample.items() if key != field}
+            with self.subTest(missing=field):
+                self.assertEqual(assess([missing], 1), 0)
+        for field in (
+            "slots",
+            "accounts",
+            "events",
+            "accepted_books_per_account",
+            "valid_features_per_slot",
+            "peak_rss_bytes",
+            "observed_seconds",
+            "processing_seconds",
+            "max_backlog_seconds",
+            "p99_event_seconds",
+        ):
+            for invalid in (None, True, "1", -1, float("nan"), float("inf"), -float("inf")):
+                with self.subTest(field=field, invalid=invalid):
+                    self.assertEqual(assess([{**sample, field: invalid}], 1), 0)
+        for field in ("inputs_aligned", "subscriptions_covered"):
+            for invalid in (1, "true", [], None):
+                with self.subTest(field=field, invalid=invalid):
+                    self.assertEqual(assess([{**sample, field: invalid}], 1), 0)
+        for invalid in (None, [], 1, "sample"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(assess([invalid], 1), 0)
+        self.assertEqual(assess([sample, {**measurement(2), "processing_seconds": None}], 1), 0)
+
+    def test_invalid_budgets_and_inconsistent_counts_fail_closed(self) -> None:
+        invalid: Any
+        sample = measurement()
+        for invalid in (None, True, "1", 0, -1, float("nan"), float("inf"), 10**400):
+            with self.subTest(budget=invalid):
+                self.assertEqual(assess([sample], invalid), 0)
+        for defect in (
+            {"accounts": 1},
+            {"events": 0},
+            {"observed_seconds": 0},
+            {"accepted_books_per_account": 1.5},
+            {"valid_features_per_slot": 1.5},
+            {"processing_seconds": 10**400},
+        ):
+            with self.subTest(defect=defect):
+                self.assertEqual(assess([{**sample, **defect}], 1), 0)
+
+    def test_only_contiguous_successes_are_admitted(self) -> None:
+        samples = [measurement(count) for count in range(1, 4)]
+        self.assertEqual(assess(samples, 1), 3)
+        self.assertEqual(assess([samples[0], samples[2]], 1), 1)
+        self.assertEqual(assess([samples[0], samples[0]], 1), 1)
+        self.assertEqual(assess([], 1), 0)
+        failure = {
+            "slots": 2,
+            "inputs_aligned": False,
+            "subscriptions_covered": False,
+            "reason": "Protected positions exceed one connection capacity",
+        }
+        self.assertEqual(assess([samples[0], failure], 1), 1)
+
+    async def test_capacity_report_retains_provenance_and_measured_bound(self) -> None:
+        benchmark = CapacityBenchmark("US", 1000, 1)
+        failed = {**measurement(3), "max_backlog_seconds": 2}
+        with patch.object(
+            benchmark, "measure", side_effect=[measurement(), measurement(2), failed]
+        ):
+            report = await benchmark.run(actionable_feed(), "a" * 64, "b" * 64)
+        self.assertEqual(report["max_slots"], 2)
+        self.assertEqual(len(report["measurements"]), 3)
+        self.assertEqual(report["input_digest"], "a" * 64)
+        self.assertEqual(report["source_digest"], "b" * 64)
+        self.assertTrue(report["machine"])
+        self.assertIs(report["real_orders"], False)
+        admitted = Admission.load(report, "US", "b" * 64)
+        self.assertEqual(admitted.max_slots, 2)
+        self.assertEqual(len(admitted.initial()), 2)
+
+    async def test_protected_capacity_failure_keeps_previously_measured_slots(self) -> None:
+        benchmark = CapacityBenchmark("US", 1000, 1)
+        with patch.object(
+            benchmark,
+            "measure",
+            side_effect=[
+                measurement(),
+                ValueError("Protected positions exceed one connection capacity"),
+            ],
+        ):
+            report = await benchmark.run(actionable_feed(), "a" * 64, "b" * 64)
+        self.assertEqual(report["max_slots"], 1)
+        self.assertEqual(len(report["measurements"]), 2)
+        self.assertEqual(Admission.load(report, "US", "b" * 64).max_slots, 1)
 
     async def test_real_shared_runtime_receives_equal_paper_inputs(self) -> None:
         rows = actionable_feed()
