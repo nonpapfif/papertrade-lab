@@ -13,13 +13,13 @@ import os
 import signal
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from papertrade.api import ApiError, MarketClient, private_json
 from papertrade.core import SafetyError, Settings
@@ -84,6 +84,7 @@ SLOT_SOURCES = (
     "tools/slot_control.py",
 )
 KR_SOURCES = ("tools/kr_broker_profile.py",)
+HELD_QUOTE_RETRY_SECONDS = 5.0
 
 MARKET_CAPABILITY_SNAPSHOT = {
     "source": "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json",
@@ -297,6 +298,14 @@ class Runtime:
             for symbol in set(account.pending) | set(account.book.positions)
         }
         return {s for s, i in self.ids.items() if i in ids}
+
+    def stale_held_symbols(self, at: str) -> set[str]:
+        excluded = {
+            row["symbol"]
+            for account in self.accounts.values()
+            for row in account.quote_health(at)["comparison_exclusions"]
+        }
+        return {symbol for symbol, identifier in self.ids.items() if identifier in excluded}
 
     def inherit_accounts(self, source: Runtime, account_names: dict[str, str]) -> None:
         """Initialize an empty runtime from a committed observation cut."""
@@ -720,7 +729,11 @@ class Runtime:
                     symbol=symbol,
                 )
                 return
-            source_age = seconds(received) - seconds(book["timestamp"])
+            try:
+                source_age = seconds(received) - seconds(book["timestamp"])
+            except (ValueError, OverflowError):
+                self.counts["invalid_source_age"] += 1
+                return
             if not 0 <= source_age <= 60:
                 self.counts["invalid_source_age"] += 1
                 return
@@ -1060,7 +1073,7 @@ class Runtime:
         self._commit(entry)
         self.record(kind, sequence=self.sequence, previous_at=last, at=at)
 
-    def status(self) -> dict[str, Any]:
+    def status(self, at: str | None = None) -> dict[str, Any]:
         result = {
             "counts": dict(self.counts),
             "desired": self.desired,
@@ -1073,7 +1086,7 @@ class Runtime:
             },
             "queue_delay_seconds": latency_summary(self.queue_delays),
             "processing_seconds": latency_summary(self.processing_times),
-            "paper": self.account.summary() if self.account.last_at else None,
+            "paper": self.account.summary(at) if self.account.last_at else None,
         }
         if len(self.accounts) > 1:
             result["comparison"] = {
@@ -1095,7 +1108,7 @@ class Runtime:
                         "observations": self.delivered[name],
                         "book_observations": self.book_delivered[name],
                         "input_sha256": self.delivery_hashes[name].hexdigest(),
-                        "paper": account.summary() if account.last_at else None,
+                        "paper": account.summary(at) if account.last_at else None,
                     }
                     for name, account in self.accounts.items()
                 },
@@ -1151,7 +1164,7 @@ def write_comparison(
         if path.is_file():
             with path.open("rb") as stream:
                 hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-    runtime_status = runtime.status()
+    runtime_status = runtime.status(stats.get("at") or stats.get("ended_at"))
     comparison = runtime_status.get("comparison", {})
     if len(runtime.accounts) == 1:
         account = runtime.account
@@ -1243,6 +1256,50 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
     delay = min(error.retry_at - time.time(), deadline - time.monotonic())
     if delay > 0:
         await asyncio.sleep(delay)
+
+
+async def recover_held_quotes(
+    runtime: Runtime | SharedFeedSlots,
+    fetch_book: Callable[[str], Awaitable[None]],
+    attempted_at: dict[str, float],
+    deadline: float,
+) -> None:
+    for symbol in sorted(runtime.stale_held_symbols(now())):
+        current = time.monotonic()
+        if current >= deadline:
+            break
+        if current - attempted_at.get(symbol, -math.inf) >= HELD_QUOTE_RETRY_SECONDS:
+            await fetch_book(symbol)
+            attempted_at[symbol] = time.monotonic()
+
+
+async def fetch_rest_book(
+    client: MarketClient,
+    symbol: str,
+    raw: TextIO,
+    publish: Callable[..., None],
+    symbol_failure: Callable[[str, ApiError], Awaitable[None]],
+    *,
+    repair: bool = False,
+) -> None:
+    try:
+        book = await asyncio.to_thread(client.book, symbol)
+    except ApiError as error:
+        await symbol_failure(symbol, error)
+        return
+    raw.write(
+        json.dumps(
+            {
+                "kind": "rest_book",
+                "received_at": now(),
+                "symbol": symbol,
+                "result": book,
+                **({"purpose": "held_quote_recovery"} if repair else {}),
+            }
+        )
+        + "\n"
+    )
+    publish("book", (symbol, book))
 
 
 def websocket_retry_at(headers: list[str], now_epoch: float) -> float:
@@ -1622,12 +1679,36 @@ async def _campaign(
         )
 
         async def collect() -> None:
-            nonlocal calendar_day
+            nonlocal calendar_day, universe
             previous: dict[str, float] = {}
             metadata: dict[str, dict] = {}
+            repairs: dict[str, float] = {}
+
+            async def symbol_failure(symbol: str, error: ApiError) -> None:
+                record(
+                    "rest_symbol_failure",
+                    symbol=symbol,
+                    status=error.status,
+                    code=error.code,
+                    retry_at=error.retry_at,
+                )
+                await wait_for_rest_cooldown(error, deadline)
+
+            async def repair_book(symbol: str) -> None:
+                await fetch_rest_book(
+                    client, symbol, raw, runtime.publish, symbol_failure, repair=True
+                )
+
+            async def recover_held() -> None:
+                # A single collector owns the synchronous client's limiter and cooldown.
+                await recover_held_quotes(runtime, repair_book, repairs, deadline)
+
             cycle = 0
             while time.monotonic() < deadline:
                 begin = time.monotonic()
+                await recover_held()
+                if time.monotonic() >= deadline:
+                    break
                 day = market.trading_date(datetime.fromisoformat(now()))
                 if constrained and day != calendar_day:
                     calendar = await asyncio.to_thread(client.calendar, market.code, day)
@@ -1639,7 +1720,7 @@ async def _campaign(
                     if market is KR:
                         previous.clear()
                         metadata.clear()
-                        await asyncio.to_thread(feed.universe)
+                        universe = await asyncio.to_thread(feed.universe)
                 if not adaptive and cycle == 2:
                     before = runtime.counts["book_events"]
                     record("rest_delay_start", seconds=5)
@@ -1651,7 +1732,14 @@ async def _campaign(
                             "book_events_during": runtime.counts["book_events"] - before,
                         }
                     )
-                rows = await asyncio.to_thread(feed.snapshot)
+                rows: list[dict[str, Any]] = []
+                for offset in range(0, len(universe), 200):
+                    await recover_held()
+                    if time.monotonic() >= deadline:
+                        return
+                    rows.extend(
+                        await asyncio.to_thread(feed.snapshot, universe[offset : offset + 200])
+                    )
                 received = now()
                 raw.write(
                     json.dumps({"kind": "rest_prices", "received_at": received, "rows": rows})
@@ -1677,6 +1765,9 @@ async def _campaign(
                     batch = ranked[offset : offset + 50]
                     missing = [s for s in batch if s not in metadata]
                     if missing:
+                        await recover_held()
+                        if time.monotonic() >= deadline:
+                            return
                         for row in await asyncio.to_thread(client.stocks, missing):
                             metadata[row["symbol"]] = row
                             raw.write(
@@ -1688,12 +1779,16 @@ async def _campaign(
                         break
                 runtime.publish("selection", chosen[:50])
                 if market is US:
+                    await recover_held()
+                    if time.monotonic() >= deadline:
+                        return
                     fx = await asyncio.to_thread(feed.fx)
                     raw.write(json.dumps({"kind": "fx", "received_at": now(), "result": fx}) + "\n")
                     runtime.publish("fx", fx)
                 watch = subscription_set(chosen[:50], runtime.protected())
                 # Sequential REST calls share the client's rate controller off the event loop.
                 for symbol in watch:
+                    await recover_held()
                     if time.monotonic() >= deadline:
                         break
                     try:
@@ -1710,28 +1805,15 @@ async def _campaign(
                             + "\n"
                         )
                         runtime.publish("feature", (symbol, candles["candles"]))
-                        book = await asyncio.to_thread(client.book, symbol)
-                        raw.write(
-                            json.dumps(
-                                {
-                                    "kind": "rest_book",
-                                    "received_at": now(),
-                                    "symbol": symbol,
-                                    "result": book,
-                                }
-                            )
-                            + "\n"
-                        )
-                        runtime.publish("book", (symbol, book))
                     except ApiError as error:
-                        record(
-                            "rest_symbol_failure",
-                            symbol=symbol,
-                            status=error.status,
-                            code=error.code,
-                            retry_at=error.retry_at,
-                        )
-                        await wait_for_rest_cooldown(error, deadline)
+                        await symbol_failure(symbol, error)
+                        continue
+                    await recover_held()
+                    current = time.monotonic()
+                    if current >= deadline:
+                        break
+                    if current - repairs.get(symbol, -math.inf) >= HELD_QUOTE_RETRY_SECONDS:
+                        await fetch_rest_book(client, symbol, raw, runtime.publish, symbol_failure)
                 elapsed = time.monotonic() - begin
                 stats["rest_cycles"].append(
                     {
@@ -1744,13 +1826,14 @@ async def _campaign(
                 )
                 record("rest_cycle", **stats["rest_cycles"][-1])
                 cycle += 1
-                try:
-                    await asyncio.wait_for(
-                        resync.wait(), max(0.01, min(60 - elapsed, deadline - time.monotonic()))
-                    )
-                    resync.clear()
-                except TimeoutError:
-                    pass
+                next_cycle = min(begin + 60, deadline)
+                while (remaining := next_cycle - time.monotonic()) > 0:
+                    try:
+                        await asyncio.wait_for(resync.wait(), min(1, remaining))
+                        resync.clear()
+                        break
+                    except TimeoutError:
+                        await recover_held()
 
         async def collect_until_cutoff() -> None:
             try:
@@ -1891,15 +1974,17 @@ async def _campaign(
                     if task is consumer:
                         raise RuntimeError("Consumer stopped")
             runtime.publish("clock", None)
+            status_at = now()
             if slots is not None:
                 async with slots.committing:
                     if consumer.done():
                         consumer.result()
-                    status = slots.status()
+                    status_at = now()
+                    status = slots.status(status_at)
                     slots.control.snapshot(status["shared_slots"])
             else:
-                status = runtime.status()
-            private_json(output / "status.json", {**stats, "at": now(), **status})
+                status = runtime.status(status_at)
+            private_json(output / "status.json", {**stats, "at": status_at, **status})
             raw.flush()
             await asyncio.sleep(1)
         if slots is not None:
@@ -1944,7 +2029,12 @@ async def _campaign(
                 for account in runtime.accounts.values():
                     await account.advance(at)
         await runtime.close()
-        stats.update(state="complete", at=now(), **runtime.status())
+        report_at = (
+            datetime.fromtimestamp(end_epoch, UTC).isoformat()
+            if campaign_seeds is not None and end_epoch is not None
+            else at
+        )
+        stats.update(state="complete", at=report_at, ended_at=at, **runtime.status(report_at))
         checks = {
             "stream_observed": stats.get("market_messages", 0) > 0,
             "features_observed": runtime.counts[
@@ -1981,7 +2071,7 @@ async def _campaign(
                     row["comparison"]["inputs_aligned"] for row in rows
                 )
             else:
-                checks["matched_inputs"] = runtime.status()["comparison"]["inputs_aligned"]
+                checks["matched_inputs"] = stats["comparison"]["inputs_aligned"]
         stats.update(checks=checks, result="passed" if all(checks.values()) else "inconclusive")
     except (
         OSError,
@@ -1995,7 +2085,8 @@ async def _campaign(
         WebSocketException,
         CampaignCutoff,
     ) as error:
-        stats.update(state="failed", at=now(), **runtime.status(), **error_details(error, token))
+        at = now()
+        stats.update(state="failed", at=at, **runtime.status(at), **error_details(error, token))
         record("failed", **error_details(error, token))
         raise SystemExit("Live validation failed; inspect sanitized status") from None
     finally:
@@ -2005,10 +2096,11 @@ async def _campaign(
         await asyncio.gather(*tasks, return_exceptions=True)
         await runtime.close()
         if stats.get("state") not in ("complete", "failed", "interrupted"):
-            stats.update(state="interrupted", ended_at=now(), **runtime.status())
+            stats.update(state="interrupted", ended_at=now())
         elif stats.get("state") == "complete":
             stats.setdefault("ended_at", stats.get("at", now()))
-        stats.update(**runtime.status())
+        terminal_cut = stats.get("at") or stats.get("ended_at")
+        stats.update(**runtime.status(terminal_cut))
         if journal is not None:
             stats["journal"] = journal.evidence()
         private_json(output / "http-audit.json", {"requests": http_audit})
@@ -2035,7 +2127,7 @@ async def _campaign(
             stats.update(
                 state=comparison["state"],
                 result=comparison.get("result") or stats.get("result"),
-                **runtime.status(),
+                **runtime.status(terminal_cut),
             )
             stats.setdefault("comparison", {}).update(
                 complete=comparison["complete"],

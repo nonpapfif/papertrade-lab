@@ -1,20 +1,29 @@
 """Shared-feed lifecycle and recovery checks using synthetic provider observations."""
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
+from papertrade.api import ApiError, MarketClient
 from papertrade.core import Settings
 from tools.adaptive_journal import AdaptiveJournal, read_status
 from tools.async_layered_paper import NET_TARGET_BLOCKED
 from tools.layered_paper import REBOUND_NET_TARGET
-from tools.run_async_live_validation import Runtime, subscription_set
+from tools.run_async_live_validation import (
+    Runtime,
+    fetch_rest_book,
+    recover_held_quotes,
+    subscription_set,
+    wait_for_rest_cooldown,
+)
 from tools.shared_feed_slots import SharedFeedSlots
 from tools.slot_control import SlotCommand, SlotControl
 
@@ -331,6 +340,125 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         symbol = comparison.ids["C"]
         self.assertIn(symbol, comparison.account.pending)
         self.assertNotIn(symbol, comparison.accounts["candidate"].pending)
+
+    async def test_stale_source_branch_rejects_at_cut_and_replays_the_rejection(self) -> None:
+        await self.seed()
+        source = add("source", 100)
+        assert source.spec is not None
+        source.spec["incumbent"] = {**BASELINE, "policy": "rebound"}
+        await self.command(source)
+        await self.book("A", 1)
+        await self.book("A", 3)
+        runtime = self.slots.slots["source"].runtime
+        self.assertFalse(runtime.account.book.positions)
+        self.assertTrue(runtime.accounts["candidate"].book.positions)
+        self.assertTrue(runtime.accounts["candidate"].quote_health()["comparison_eligible"])
+
+        branch = SlotCommand(
+            "cut",
+            "branch",
+            "comparison",
+            {
+                "source_slot": "source",
+                "source_account": "candidate",
+                "candidate": {**BASELINE, "policy": "rebound"},
+            },
+        )
+        await self.command(branch, 64)
+        _, disposition, detail = self.slots.commands["cut"]
+        self.assertEqual(disposition, "rejected")
+        self.assertEqual(detail["reason"], "source_account_quote_ineligible")
+        self.assertEqual(detail["comparison_exclusions"][0]["age_seconds"], 61)
+        self.assertNotIn("comparison", self.slots.slots)
+        self.assertTrue(
+            runtime.account.quote_health(detail["quote_health_as_of"])["comparison_eligible"]
+        )
+
+        recovered = self.coordinator(self.journal)
+        self.addAsyncCleanup(recovered.close)
+        await recovered.restore()
+        self.assertEqual(recovered.commands["cut"], self.slots.commands["cut"])
+
+    async def test_shared_held_recovery_deduplicates_and_replays_source_time(self) -> None:
+        await self.seed()
+        for slot_id in ("one", "two"):
+            await self.command(add(slot_id, 100))
+        await self.book("A", 1)
+        await self.book("A", 3)
+        accounts = [
+            account for _, slot in self.slots.active() for account in slot.runtime.accounts.values()
+        ]
+        self.assertTrue(all(account.book.positions for account in accounts))
+        offset = 64
+        attempts: dict[str, float] = {}
+        raw = StringIO()
+        old_book = {
+            "timestamp": (START + timedelta(seconds=3)).isoformat(),
+            "currency": "USD",
+            "asks": [{"price": "10", "volume": "100"}],
+            "bids": [{"price": "9.99", "volume": "100"}],
+        }
+        fresh_book = {**old_book, "timestamp": (START + timedelta(seconds=76)).isoformat()}
+        client = Mock(spec=MarketClient)
+        client.book.side_effect = [old_book, ApiError("Rate limit", status=429, retry_at=102), fresh_book]
+
+        async def failure(symbol: str, error: ApiError) -> None:
+            self.assertEqual(symbol, "A")
+            await wait_for_rest_cooldown(error, 100)
+
+        async def fetch(symbol: str) -> None:
+            await fetch_rest_book(client, symbol, raw, self.slots.publish, failure, repair=True)
+            if not self.slots.queue.empty():
+                entry, _ = self.slots.queue.get_nowait()
+                entry["at"] = (START + timedelta(seconds=offset)).isoformat()
+                await self.slots._apply(entry, 0)
+                self.slots.queue.task_done()
+
+        with (
+            patch("tools.run_async_live_validation.now") as now,
+            patch("tools.shared_feed_slots.now", side_effect=lambda: now()),
+            patch("tools.run_async_live_validation.time") as clock,
+            patch("tools.run_async_live_validation.asyncio.sleep") as sleep,
+        ):
+            now.side_effect = lambda: (START + timedelta(seconds=offset)).isoformat()
+            clock.time.return_value = 100
+            clock.monotonic.side_effect = lambda: float(offset)
+            await recover_held_quotes(self.slots, fetch, attempts, 100)
+            client.book.assert_called_once_with("A")
+            self.assertEqual(self.slots.stale_held_symbols(now()), {"A"})
+            self.assertEqual(
+                [account.times[0] for account in accounts],
+                [(START + timedelta(seconds=3)).isoformat()] * 4,
+            )
+            await recover_held_quotes(self.slots, fetch, attempts, 100)
+            client.book.assert_called_once_with("A")
+
+            offset = 70
+            await recover_held_quotes(self.slots, fetch, attempts, 100)
+            sleep.assert_awaited_once_with(2)
+            self.assertEqual(self.slots.stale_held_symbols(now()), {"A"})
+            self.assertEqual(len(raw.getvalue().splitlines()), 1)
+
+            offset = 76
+            await recover_held_quotes(self.slots, fetch, attempts, 100)
+            self.assertEqual(self.slots.stale_held_symbols(now()), set())
+            self.assertTrue(all(account.times[0] == now() for account in accounts))
+            await recover_held_quotes(self.slots, fetch, attempts, 100)
+            self.assertEqual(client.book.call_args_list, [call("A")] * 3)
+
+        rows = [json.loads(line) for line in raw.getvalue().splitlines()]
+        self.assertEqual([row["result"] for row in rows], [old_book, fresh_book])
+        self.assertTrue(all(row["purpose"] == "held_quote_recovery" for row in rows))
+
+        recovered = self.coordinator(self.journal)
+        self.addAsyncCleanup(recovered.close)
+        await recovered.restore()
+        for slot_id, slot in self.slots.active():
+            restored = recovered.slots[slot_id].runtime
+            self.assertEqual(
+                [account.summary() for account in restored.accounts.values()],
+                [account.summary() for account in slot.runtime.accounts.values()],
+            )
 
     async def test_invalid_branch_options_do_not_enter_command_spool(self) -> None:
         invalid = SlotCommand(

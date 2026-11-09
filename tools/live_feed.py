@@ -75,10 +75,11 @@ class LiveFeed:
         self.symbols = sorted(listings)
         return list(self.symbols)
 
-    def snapshot(self) -> list[dict[str, Any]]:
-        if self.symbols is None:
-            self.universe()
-        symbols = self.symbols or []
+    def snapshot(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        if symbols is None:
+            if self.symbols is None:
+                self.universe()
+            symbols = self.symbols or []
         result = []
         for offset in range(0, len(symbols), 200):
             batch = symbols[offset : offset + 200]

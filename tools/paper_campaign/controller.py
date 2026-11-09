@@ -12,9 +12,11 @@ from tools.autotest_supervisor import read_json
 from tools.paper_campaign.calendar import MarketCalendar, Window
 from tools.paper_campaign.evidence import (
     MAX_BOOK_GAP_SECONDS,
+    account_eligible,
     aggregate,
     compact_rows,
     observed_coverage,
+    review_metrics,
 )
 from tools.paper_campaign.policy import (
     BASELINE,
@@ -31,6 +33,19 @@ from tools.paper_market import PaperMarket
 from tools.slot_control import SlotCommand
 
 MIN_SESSION_COVERAGE = 0.8
+
+
+def _review_history(statistics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        slot: {
+            **stats,
+            "latest": review_metrics(
+                stats["latest"],
+                comparable_pair=stats["comparison_eligible"] and stats["return_baseline_eligible"],
+            ),
+        }
+        for slot, stats in statistics.items()
+    }
 
 
 class Campaign:
@@ -194,7 +209,7 @@ class Campaign:
             and f"fork-{target}" not in used
             and f"fork-{target}" not in state["seeds"]
         }
-        metrics = compact_rows(summary, market.currency)
+        metrics = compact_rows(summary, market.currency, as_of=now)
         live_configs = {
             row["slot_id"]: {
                 name: {key: details["configuration"][key] for key in BASELINE}
@@ -208,6 +223,11 @@ class Campaign:
             for slot, accounts in metrics.items()
             for account, row in accounts.items()
         }
+        eligible_sources = {
+            slot: sorted(name for name, account in accounts.items() if account_eligible(account))
+            for slot, accounts in metrics.items()
+            if slot in running
+        }
         pending = intraday["pending"]
         if pending is None:
             statistics = aggregate(state["history"])
@@ -217,8 +237,10 @@ class Campaign:
                 if slot != admission.initial()[0]
                 and statistics.get(slot, {}).get("qualified_sessions", 0) >= MIN_QUALIFIED_SESSIONS
                 and statistics[slot]["qualified_closed_trades"] >= MIN_CLOSED_TRADES
+                and statistics[slot]["comparison_eligible"]
+                and statistics[slot]["return_baseline_eligible"]
                 and all(
-                    row["open_positions"] == row["pending_intents"] == 0
+                    row["open_positions"] == row["pending_intents"] == 0 and account_eligible(row)
                     for row in metrics.get(slot, {}).values()
                 )
                 and len(metrics.get(slot, {})) == 2
@@ -235,7 +257,11 @@ class Campaign:
                     for name in ("incumbent", "candidate"):
                         starting_fills.setdefault(f"{row['slot_id']}.{name}", inherited["fills"])
             old = {**starting_fills, **intraday["last_fills"]}
-            if not any(count > old.get(key, 0) for key, count in fills.items()):
+            if not any(
+                fills[f"{slot}.{name}"] > old.get(f"{slot}.{name}", 0)
+                for slot, names in eligible_sources.items()
+                for name in names
+            ):
                 return
             pending = {
                 "kind": "intraday",
@@ -245,11 +271,12 @@ class Campaign:
                 "sequence": sequence,
                 "next_slots": running,
                 "eligible_targets": targets,
-                "metrics": metrics,
+                "eligible_sources": eligible_sources,
+                "metrics": {slot: review_metrics(accounts) for slot, accounts in metrics.items()},
                 "source_configurations": live_configs,
                 "market_messages": summary.get("market_messages", 0),
                 "quality_counts": summary.get("counts", {}),
-                "history": statistics,
+                "history": _review_history(statistics),
                 "parkable": parkable,
                 "available_lanes": max(0, admission.max_slots - len(occupied)),
             }
@@ -273,8 +300,11 @@ class Campaign:
         elif (
             decision["quality"] == "sufficient"
             and decision.get("next_slots") == pending["next_slots"]
+            and isinstance(source, str)
             and source in running
             and account in ("incumbent", "candidate")
+            and account in pending.get("eligible_sources", {}).get(source, [])
+            and account in eligible_sources.get(source, [])
             and target in targets
             and target in pending["eligible_targets"]
             and targets[target] != live_configs.get(source, {}).get(account)
@@ -407,14 +437,42 @@ class Campaign:
             **admission.candidates,
             **{slot: config["candidate"] for slot, config in state["configs"].items()},
         }
+        performance_exclusions = {
+            slot
+            for slot, row in stats.items()
+            if not row["comparison_eligible"] or not row["return_baseline_eligible"]
+        }
+        running = close["next_slots"]
+        parked = [slot for slot in close["partial_slots"] if slot not in retired]
+        previous = list(dict.fromkeys([*running, *parked]))
+        required_carryover = {
+            slot for slot in previous if stats.get(slot, {}).get("has_exposure", True)
+        }
         evidence = {
             **close,
-            "eligible": {
-                slot: config for slot, config in candidates.items() if slot not in retired
+            "metrics": {
+                slot: review_metrics(accounts, comparable_pair=slot not in performance_exclusions)
+                for slot, accounts in close["metrics"].items()
             },
+            "branch_cuts": {
+                slot: {
+                    key: value
+                    for key, value in cut.items()
+                    if key != "source_metrics"
+                    or (slot not in performance_exclusions and account_eligible(value))
+                }
+                for slot, cut in close.get("branch_cuts", {}).items()
+            },
+            "eligible": {
+                slot: config
+                for slot, config in candidates.items()
+                if slot not in retired and slot not in performance_exclusions
+            },
+            "performance_exclusions": sorted(performance_exclusions),
+            "required_carryover": sorted(required_carryover),
             "retired_slots": sorted(retired),
             "max_slots": admission.max_slots,
-            "history": stats,
+            "history": _review_history(stats),
         }
         result = self.review.poll(output / "reviews", evidence)
         if result is None:
@@ -422,12 +480,10 @@ class Campaign:
             if next_window is None or next_window.day == active["day"] or now < next_window.start:
                 return
             result = {"quality": "degraded", "reason": "review_pending_at_next_market_open"}
-        running = close["next_slots"]
-        parked = [slot for slot in close["partial_slots"] if slot not in retired]
-        previous = list(dict.fromkeys([*running, *parked]))
         approved = previous[: admission.max_slots]
         retired_now: list[str] = []
-        if result["quality"] == "sufficient" and close["qualified"]:
+        usable = close["qualified"] and bool(close["metrics"].keys() - performance_exclusions)
+        if result["quality"] == "sufficient" and usable:
             try:
                 if any(
                     result[key]
@@ -442,6 +498,8 @@ class Campaign:
                 result.update(quality="degraded", disposition="unsafe_plan_rejected")
         elif not close["qualified"]:
             result["disposition"] = "degraded_market_evidence"
+        elif not usable:
+            result["disposition"] = "degraded_comparison_evidence"
         state["approved_slots"] = approved
         state["retired_slots"] = sorted(retired | set(retired_now))
         state["history"].append(

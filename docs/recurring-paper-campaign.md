@@ -93,6 +93,19 @@ failure from a losing strategy. A single profitable day, idle account, high win 
 correlated variants does not establish a winner. Keep unsupported statistical claims out of
 promotion decisions. Development data and subsequent live validation remain separate.
 
+Check every account's held symbols against usable orderbooks and their original source times.
+Prioritize shared REST recovery for missing or stale held quotes between discovery requests;
+one recovery request serves all accounts holding that symbol. Receiving an old quote again does
+not make it fresh. Provider cooldowns remain authoritative, and recovery cannot recreate missed
+observations.
+
+An account with unresolved held quotes keeps its positions, cash, ownership and diagnostic
+marks, but is excluded from performance comparisons and strategy selection. Record the affected
+symbols and reasons. Require fresh source-account evidence both when proposing a branch and at
+its actual execution cut. A matched comparison requires both accounts to be eligible. Invalid
+closing marks cannot establish a return baseline for the next session; a later fresh close can
+establish the following baseline. Operational carryover is not performance promotion.
+
 Store all retired strategies and reasons. New executable strategies and combined portfolios
 require engineering tests and fresh source-bound capacity measurements before admission;
 Astra cannot inject code, change fee accounting, expand broker access or rewrite past results.

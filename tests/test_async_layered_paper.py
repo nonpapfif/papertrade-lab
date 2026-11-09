@@ -42,6 +42,44 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(a.close)
         return a
 
+    async def test_held_quote_health_uses_provider_age_and_preserves_missing_marks(self):
+        account = await self.account()
+        self.assertTrue(account.quote_health(stamp(0))["comparison_eligible"])
+        await account.submit(event())
+        await account.submit(event(at=2))
+        self.assertIn(0, account.book.positions)
+        self.assertEqual(account.summary(stamp(62))["comparison_valid_until"], stamp(62))
+        self.assertTrue(account.summary(stamp(62))["comparison_eligible"])
+        self.assertFalse(account.summary(stamp(63))["comparison_eligible"])
+        self.assertIsNone(
+            account.summary(stamp(63))["account"]["bid_liquidation_equity_estimate_usd"]
+        )
+        self.assertEqual(account.last_at, stamp(2))
+
+        for source_at, reason in (
+            (stamp(3), "quote_future"),
+            (None, "quote_unusable"),
+            ("invalid", "quote_unusable"),
+        ):
+            with self.subTest(source_at=source_at):
+                account._books[0]["timestamp"] = source_at
+                account.times[0] = source_at
+                summary = account.summary()
+                self.assertEqual(summary["comparison_exclusions"][0]["reason"], reason)
+                self.assertFalse(summary["account"]["comparison_eligible"])
+                self.assertEqual(
+                    summary["positions"]["0"]["mark_at"],
+                    source_at if source_at == stamp(3) else None,
+                )
+        del account._books[0], account._source_times[0], account.times[0]
+        summary = account.summary()
+        self.assertEqual(
+            summary["comparison_exclusions"],
+            [{"symbol": 0, "reason": "quote_missing", "source_at": None, "age_seconds": None}],
+        )
+        self.assertIsNone(summary["account"]["oldest_open_quote_at"])
+        self.assertEqual(summary["positions"]["0"]["quantity"], account.book.positions[0].quantity)
+
     async def test_net_target_requires_strictly_positive_proceeds_in_both_markets(self):
         for market, ask, capital, fees, targets in (
             (US, 9, 9, {}, (9.009, 9.01, 9.011)),

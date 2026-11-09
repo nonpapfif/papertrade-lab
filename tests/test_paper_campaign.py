@@ -13,7 +13,7 @@ from tools.autotest_jobs import atomic_json
 from tools.autotest_supervisor import read_json
 from tools.paper_campaign.calendar import MarketCalendar, Window
 from tools.paper_campaign.controller import Campaign
-from tools.paper_campaign.evidence import observed_coverage
+from tools.paper_campaign.evidence import aggregate, compact_rows, observed_coverage
 from tools.paper_campaign.policy import BASELINE, Admission, fingerprint, next_plan
 from tools.paper_campaign.review import AstraReview
 from tools.paper_capacity import strategies
@@ -57,6 +57,17 @@ def capacity_report(count: int = 2) -> dict:
 
 def admission(count: int = 2) -> Admission:
     return Admission.load(capacity_report(count), "US", "approved")
+
+
+def account_row(**fields: Any) -> dict[str, Any]:
+    return {
+        "equity": 1000,
+        "initial_equity": 1000,
+        "closed": 0,
+        "open_positions": 0,
+        "pending_intents": 0,
+        **fields,
+    }
 
 
 class CampaignTests(unittest.TestCase):
@@ -154,6 +165,278 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(
             next_plan(selection, active, admitted, qualified, set()), selection["next_slots"]
         )
+
+    def test_held_quote_health_excludes_only_the_affected_pair(self) -> None:
+        def session(equity: int, closed: int, eligible: bool) -> dict[str, Any]:
+            cash = account_row(equity=equity, closed=closed)
+            holding = account_row(
+                equity=equity,
+                closed=closed,
+                open_positions=1,
+                comparison_eligible=eligible,
+            )
+            return {
+                "qualified": True,
+                "metrics": {
+                    "exposed": {"incumbent": cash, "candidate": holding},
+                    "healthy": {"incumbent": cash, "candidate": cash},
+                },
+            }
+
+        stale = session(2000, 4, False)
+        recovery = session(1100, 5, True)
+        later = session(1210, 7, True)
+        first = aggregate([stale])
+        self.assertEqual(first["exposed"]["qualified_sessions"], 0)
+        self.assertEqual(first["exposed"]["qualified_closed_trades"], 0)
+        self.assertEqual(first["exposed"]["qualified_candidate_return_pct_total"], 0)
+        self.assertEqual(first["exposed"]["latest"]["candidate"]["equity"], 2000)
+        self.assertTrue(first["exposed"]["has_exposure"])
+        self.assertEqual(first["healthy"]["qualified_sessions"], 1)
+        second = aggregate([stale, recovery])
+        self.assertTrue(second["exposed"]["comparison_eligible"])
+        self.assertFalse(second["exposed"]["return_baseline_eligible"])
+        self.assertEqual(second["exposed"]["qualified_sessions"], 0)
+        self.assertEqual(second["exposed"]["qualified_closed_trades"], 0)
+        stats = aggregate([stale, recovery, later])
+        self.assertEqual(stats["exposed"]["qualified_sessions"], 1)
+        self.assertEqual(stats["exposed"]["qualified_closed_trades"], 2)
+        self.assertAlmostEqual(stats["exposed"]["qualified_candidate_return_pct_total"], 10)
+        self.assertEqual(stats["healthy"]["qualified_sessions"], 3)
+
+    def test_missing_held_quote_health_fails_closed(self) -> None:
+        status = {
+            "shared_slots": [
+                {
+                    "slot_id": "slot",
+                    "comparison": {
+                        "accounts": {
+                            "incumbent": {"paper": {"account": account_row()}},
+                            "candidate": {"paper": {"account": account_row(open_positions=1)}},
+                        }
+                    },
+                }
+            ]
+        }
+        accounts = compact_rows(status, "USD")["slot"]
+        self.assertTrue(accounts["incumbent"]["comparison_eligible"])
+        self.assertFalse(accounts["candidate"]["comparison_eligible"])
+        self.assertEqual(
+            accounts["candidate"]["comparison_exclusions"][0]["reason"], "missing_quote_health"
+        )
+
+    def test_live_quote_health_must_cover_the_decision_time(self) -> None:
+        earlier = (START - timedelta(seconds=10)).isoformat()
+        later = (START + timedelta(seconds=10)).isoformat()
+        now = START.isoformat()
+        for cut, expiry, reason in (
+            (None, later, "missing_quote_health"),
+            (later, later, "future_quote_health"),
+            (earlier, None, "missing_quote_health"),
+            (earlier, earlier, "stale_quote_health"),
+            (earlier, now, None),
+            (earlier, later, None),
+        ):
+            with self.subTest(cut=cut, expiry=expiry):
+                account = account_row(
+                    open_positions=1,
+                    comparison_eligible=True,
+                    quote_health_as_of=cut,
+                    comparison_valid_until=expiry,
+                )
+                status = {
+                    "shared_slots": [
+                        {
+                            "slot_id": "slot",
+                            "comparison": {
+                                "accounts": {
+                                    "candidate": {
+                                        "paper": {
+                                            "account": account,
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    ]
+                }
+                live = compact_rows(status, "USD", as_of=START)["slot"]["candidate"]
+                self.assertEqual(live["comparison_eligible"], reason is None)
+                self.assertEqual(live["equity"], 1000)
+                self.assertEqual(
+                    [item["reason"] for item in live["comparison_exclusions"]],
+                    [] if reason is None else [reason],
+                )
+                close = compact_rows(status, "USD")["slot"]["candidate"]
+                self.assertTrue(close["comparison_eligible"])
+
+    def test_selection_rejects_an_excluded_new_slot_and_protects_its_carryover(self) -> None:
+        admitted = admission(3)
+        baseline, stale, healthy = admitted.initial()
+        tested = {"qualified_sessions": 3, "qualified_closed_trades": 3, "has_exposure": False}
+        statistics = dict.fromkeys(admitted.candidates, tested)
+        statistics[stale] = {**tested, "comparison_eligible": False, "has_exposure": True}
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            next_plan(
+                {"next_slots": [baseline, stale]}, [baseline, healthy], admitted, statistics, set()
+            )
+        with self.assertRaisesRegex(ValueError, "protected"):
+            next_plan(
+                {"next_slots": [baseline, healthy]}, admitted.initial(), admitted, statistics, set()
+            )
+        self.assertEqual(
+            next_plan(
+                {"next_slots": [baseline, stale]}, admitted.initial(), admitted, statistics, set()
+            ),
+            [baseline, stale],
+        )
+
+    def test_close_review_uses_healthy_pairs_and_carries_stale_exposure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, review = Mock(), Mock()
+            admitted = admission(3)
+            baseline, stale, removable = admitted.initial()
+            campaign = Campaign(root, Mock(), runner, review, {"US": admitted})
+
+            def metrics(closed: int, eligible: bool) -> dict[str, Any]:
+                flat = account_row(closed=closed)
+                held = account_row(
+                    equity=1900, closed=closed, open_positions=1, comparison_eligible=eligible
+                )
+                return {
+                    baseline: {"incumbent": flat, "candidate": flat},
+                    stale: {"incumbent": flat, "candidate": held},
+                    removable: {"incumbent": flat, "candidate": flat},
+                }
+
+            seeds = {stale: {"journal": "stale-sealed.sqlite3", "slot_id": stale}}
+            state: dict[str, Any] = {
+                "history": [
+                    {"qualified": True, "metrics": metrics(closed, True)} for closed in (1, 2)
+                ],
+                "active": {
+                    "day": DAY,
+                    "evidence": {
+                        "qualified": True,
+                        "metrics": metrics(3, False),
+                        "next_slots": admitted.initial(),
+                        "partial_slots": [],
+                    },
+                    "intraday": {},
+                },
+                "seeds": seeds,
+                "configs": {},
+                "retired_slots": sorted(admitted.candidates.keys() - set(admitted.initial())),
+            }
+            review.poll.return_value = {
+                "quality": "sufficient",
+                "next_slots": [baseline, stale],
+                "branch_source": "",
+                "branch_target": "",
+                "branch_account": "",
+                "park_slot": "",
+            }
+            campaign._close_review(root / "state.json", state, root, US, admitted, START)
+            evidence = review.poll.call_args.args[1]
+            self.assertNotIn(stale, evidence["eligible"])
+            self.assertEqual(evidence["required_carryover"], [stale])
+            self.assertNotIn("equity", evidence["metrics"][stale]["candidate"])
+            self.assertNotIn("equity", evidence["history"][stale]["latest"]["incumbent"])
+            self.assertEqual(evidence["metrics"][removable]["candidate"]["equity"], 1000)
+            self.assertEqual(state["history"][-1]["metrics"][stale]["candidate"]["equity"], 1900)
+            self.assertEqual(state["history"][-1]["retired_slots"], [removable])
+            self.assertEqual(state["approved_slots"], [baseline, stale])
+            self.assertEqual(state["seeds"], seeds)
+
+    def test_intraday_source_must_be_eligible_at_review_and_dispatch(self) -> None:
+        admitted = admission()
+        source = admitted.initial()[0]
+        target = f"fork-{admitted.initial()[1]}"
+        for frozen_eligible, current_eligible, delay in (
+            (False, True, 0),
+            (True, False, 0),
+            (True, True, 0),
+            (True, True, 2),
+        ):
+            with (
+                self.subTest(frozen=frozen_eligible, current=current_eligible, delay=delay),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                runner, review = Mock(), Mock()
+                campaign = Campaign(root, Mock(), runner, review, {"US": admitted})
+                decision = {
+                    "quality": "sufficient",
+                    "next_slots": [source],
+                    "branch_source": source,
+                    "branch_account": "candidate",
+                    "branch_target": target,
+                    "park_slot": "",
+                }
+                account = account_row(
+                    open_positions=1,
+                    comparison_eligible=frozen_eligible,
+                    quote_health_as_of=START.isoformat(),
+                    comparison_valid_until=(START + timedelta(seconds=1)).isoformat(),
+                )
+                details: dict[str, Any] = {
+                    "configuration": BASELINE,
+                    "paper": {"account": account, "outcomes": [{"status": "filled"}]},
+                }
+                runner.live.return_value = {
+                    "slots": [{"slot_id": source, "state": "active"}],
+                    "commands": [],
+                    "summary": {
+                        "committed_sequence": 2,
+                        "shared_slots": [
+                            {
+                                "slot_id": source,
+                                "state": "active",
+                                "comparison": {
+                                    "accounts": {
+                                        "incumbent": {
+                                            **details,
+                                            "paper": {
+                                                **details["paper"],
+                                                "account": account_row(
+                                                    quote_health_as_of=START.isoformat()
+                                                ),
+                                            },
+                                        },
+                                        "candidate": details,
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                }
+                state: dict[str, Any] = {
+                    "active": {
+                        "day": DAY,
+                        "end": (START + timedelta(hours=1)).isoformat(),
+                        "intraday": {"pending": None, "decisions": [], "last_fills": {}},
+                    },
+                    "history": [],
+                    "seeds": {},
+                }
+                review.poll.side_effect = [None, decision]
+                campaign._intraday(root / "state.json", state, root, US, admitted, START)
+                pending = state["active"]["intraday"]["pending"]
+                self.assertEqual(
+                    "candidate" in pending["eligible_sources"][source], frozen_eligible
+                )
+                self.assertEqual(
+                    "equity" in pending["metrics"][source]["candidate"], frozen_eligible
+                )
+                account["comparison_eligible"] = current_eligible
+                campaign._intraday(
+                    root / "state.json", state, root, US, admitted, START + timedelta(seconds=delay)
+                )
+                self.assertEqual(
+                    runner.branch.call_count,
+                    int(frozen_eligible and current_eligible and not delay),
+                )
 
     def test_provider_failure_is_backed_off_and_wrong_market_data_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

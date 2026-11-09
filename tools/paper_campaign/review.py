@@ -45,10 +45,15 @@ original mean after modeled sell fees does not cover the entry cost at intent or
 The mean is an analytical reference. Actual exits still use the rebound holding rule and
 observed depth. Equal allocation counts signal matches before the cost check.
 The baseline is present in every original pair. Preserve exposure and give newcomers enough
-sessions to be evaluated. Only choose supplied eligible strategy IDs. A close review may
-propose next_slots and must leave branch fields empty. It may leave capacity unused only when
-all eligible newcomers have been sufficiently tested. Explain any proposed retirement. An intraday review must keep next_slots
-unchanged. It may propose one branch only from an active source/account to an unused eligible
+sessions to be evaluated. Use both accounts for a matched comparison. If either account
+lacks a fresh held quote, disregard that pair's performance at that checkpoint. A fresh close
+after an excluded checkpoint can establish the following session's baseline.
+A close review may propose next_slots and must leave branch fields empty. Keep every
+required_carryover slot to manage its existing exposure. Keep any performance_exclusions
+slot already in the current plan as a continuation only. Choose new slots only from eligible.
+Leave capacity unused only when all eligible newcomers have been sufficiently tested.
+Explain any proposed retirement. An intraday review must keep next_slots unchanged. It may
+propose one branch only from an account listed in eligible_sources to an unused eligible
 target, preserving the original as the control, if the new fill evidence justifies an explicit
 testable hypothesis. If full, a fork requires one supplied parkable slot other than the
 source, with enough evidence to justify taking it out of active observation. Leave park_slot
