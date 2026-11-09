@@ -18,9 +18,10 @@ from typing import Any
 from tools.adaptive_journal import read_status as read_journal_status
 from tools.autotest_jobs import ROOT, STOP_SECONDS, atomic_json, poll_job, start_job
 from tools.autotest_supervisor import command, read_json, tree_digest
-from tools.slot_control import SPOOL_NAME, SlotControl
+from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
 
 CUTOFF_DRAIN_SECONDS = 60
+CAMPAIGN_RESTART_LIMIT = 3
 
 
 def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
@@ -41,6 +42,7 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     status = output / "status.json"
     recovery = spec.get("recover") is True
     dynamic_slots = spec.get("dynamic_slots") is True
+    recurring = "initial_slots" in spec
     journal = output / "journal.sqlite3"
     slot_spool = output / SPOOL_NAME
     restarts: list[dict[str, Any]] = []
@@ -94,7 +96,8 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                 if (
                     not isinstance(restart, dict)
                     or type(restart.get("cursor")) is not int
-                    or restart["cursor"] <= cursor
+                    or restart["cursor"] < cursor
+                    or (not recurring and restart["cursor"] == cursor)
                     or not isinstance(restart.get("journal_hash"), str)
                     or not isinstance(restart.get("job_exit"), dict)
                 ):
@@ -154,8 +157,10 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                     raise RuntimeError("Approved source changed before launch")
                 argv = list(spec["argv"])
                 if dynamic_slots:
-                    with SlotControl.open(slot_spool, initialize=not restarts):
-                        pass
+                    with SlotControl.open(slot_spool, initialize=not restarts) as control:
+                        if not restarts:
+                            for item in spec.get("initial_slots", []):
+                                control.submit(SlotCommand(**item), end_epoch=spec["end_epoch"])
                     argv.extend(["--slot-control", str(slot_spool)])
                 if recovery:
                     if restarts:
@@ -211,9 +216,15 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             cursor = verified["cursor"]
             if verified["state"] != "active" or type(cursor) is not int or cursor < 0:
                 raise RuntimeError("Journal does not contain a recoverable account")
-            if restarts and cursor <= restarts[-1]["cursor"]:
+            if restarts and cursor <= restarts[-1]["cursor"] and not recurring:
                 save("failed", job_exit=result, reason="Journal cursor did not advance")
                 return 1
+            if recurring and len(restarts) >= CAMPAIGN_RESTART_LIMIT:
+                save("failed", job_exit=result, reason="Recurring restart limit reached")
+                return 1
+            retry_at = run.get("api_retry_at")
+            if recurring:
+                retry_at = max(retry_at or 0, time.time() + 5 * 2 ** len(restarts))
             restarts.append(
                 {
                     "cursor": cursor,
@@ -222,7 +233,7 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                     "run_state": run_state,
                     "api_status": run.get("api_status"),
                     "api_code": run.get("api_code"),
-                    "retry_at": run.get("api_retry_at"),
+                    "retry_at": retry_at,
                     "at": time.time(),
                 }
             )
@@ -296,12 +307,16 @@ def main() -> int:
     parser.add_argument("--capital", required=True, type=float)
     parser.add_argument("--market", choices=("US", "KR"), default="US")
     parser.add_argument("--source-digest", required=True)
+    parser.add_argument("--source-commit")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--recover", action="store_true", help="Resume verified journal after a fault"
     )
     parser.add_argument(
         "--dynamic-slots", action="store_true", help="Enable local add, stop and list commands"
+    )
+    parser.add_argument(
+        "--campaign-plan", type=Path, help="Frozen recurring campaign plan and carryover seeds"
     )
     args = parser.parse_args()
     if args.start_at.utcoffset() is None or args.end_at.utcoffset() is None:
@@ -335,6 +350,20 @@ def main() -> int:
     ]
     if args.market == "KR":
         argv.extend(["--market", "KR"])
+    campaign = {}
+    if args.campaign_plan is not None:
+        if not args.dynamic_slots:
+            parser.error("--campaign-plan requires --dynamic-slots")
+        campaign = read_json(args.campaign_plan)
+        if set(campaign) != {"initial_slots", "seeds"}:
+            parser.error("Invalid campaign plan fields")
+        seeds = args.campaign_plan.with_name("campaign-seeds.json").resolve()
+        if seeds.exists():
+            if read_json(seeds) != campaign["seeds"]:
+                parser.error("Saved campaign seeds differ from the plan")
+        else:
+            atomic_json(seeds, campaign["seeds"])
+        argv.extend(["--campaign-seeds", str(seeds)])
     with (output / "schedule.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return run_schedule(
@@ -342,11 +371,12 @@ def main() -> int:
             {
                 "start_epoch": args.start_at.timestamp(),
                 "end_epoch": args.end_at.timestamp(),
-                "source_commit": command(["git", "rev-parse", "HEAD"], ROOT),
+                "source_commit": args.source_commit or command(["git", "rev-parse", "HEAD"], ROOT),
                 "source_digest": args.source_digest,
                 "argv": argv,
                 **({"recover": True} if args.recover else {}),
                 **({"dynamic_slots": True} if args.dynamic_slots else {}),
+                **({"initial_slots": campaign["initial_slots"]} if campaign else {}),
             },
         )
 

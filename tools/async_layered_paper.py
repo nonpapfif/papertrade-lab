@@ -104,6 +104,22 @@ class AsyncLayeredPaper(LayeredPaper):
     def reserved_cash(self) -> float:
         return sum(i.reserved for i in self.pending.values())
 
+    def fork(self) -> AsyncLayeredPaper:
+        """Copy account state at a completed observation with independent workers."""
+        if self._submitted != self._completed or self._lock.locked():
+            raise RuntimeError("Account fork requires a completed observation")
+        lock = asyncio.Lock()
+        return copy.deepcopy(
+            self,
+            {
+                id(self._lock): lock,
+                id(self._turn): asyncio.Condition(lock),
+                id(self._queues): {},
+                id(self._workers): {},
+                id(self.context.market): self.context.market,
+            },
+        )
+
     @property
     def available_cash(self) -> float:
         return max(0.0, self.book.cash - self.reserved_cash)

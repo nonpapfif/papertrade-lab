@@ -24,6 +24,15 @@ def encode(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def validate_entry_options(name: str, config: Any) -> None:
+    if (
+        not isinstance(config, dict)
+        or config.keys() != ENTRY_OPTIONS.keys()
+        or any(config[key] not in choices for key, choices in ENTRY_OPTIONS.items())
+    ):
+        raise ValueError(f"Invalid {name} policy. Supply all supported entry options")
+
+
 @dataclass(frozen=True)
 class SlotCommand:
     id: str
@@ -37,11 +46,11 @@ class SlotCommand:
 
     @property
     def capital(self) -> float | None:
-        return float(self.spec["capital"]) if self.spec else None
+        return float(self.spec["capital"]) if self.action == "add" and self.spec else None
 
     @property
     def incumbent(self) -> dict[str, str] | None:
-        return cast(dict[str, str], self.spec["incumbent"]) if self.spec else None
+        return cast(dict[str, str] | None, self.spec.get("incumbent")) if self.spec else None
 
     @property
     def candidate(self) -> dict[str, str] | None:
@@ -50,7 +59,28 @@ class SlotCommand:
     def validate(self) -> None:
         if not IDENTIFIER.fullmatch(self.id) or not IDENTIFIER.fullmatch(self.slot_id):
             raise ValueError("Command and slot IDs must be 1 to 64 ASCII letters, digits, _ or -")
-        if self.action == "stop" and self.spec is None:
+        if self.action in ("stop", "park") and self.spec is None:
+            return
+        if self.action == "branch" and self.spec is not None:
+            if set(self.spec) - {"evidence_sequence"} != {
+                "source_slot",
+                "source_account",
+                "candidate",
+            }:
+                raise ValueError("Invalid branch command")
+            source = self.spec["source_slot"]
+            if (
+                not isinstance(source, str)
+                or not IDENTIFIER.fullmatch(source)
+                or source == self.slot_id
+                or self.spec["source_account"] not in ("incumbent", "candidate")
+            ):
+                raise ValueError("Invalid branch source")
+            if "evidence_sequence" in self.spec:
+                sequence = self.spec["evidence_sequence"]
+                if type(sequence) is not int or sequence < 1:
+                    raise ValueError("Invalid branch evidence sequence")
+            validate_entry_options("candidate", self.spec["candidate"])
             return
         if (
             self.action != "add"
@@ -67,13 +97,7 @@ class SlotCommand:
         if type(capital) not in (int, float) or not math.isfinite(capital) or capital <= 0:
             raise ValueError("Capital must be positive and finite")
         for name in ("incumbent", "candidate"):
-            config = self.spec[name]
-            if (
-                not isinstance(config, dict)
-                or config.keys() != ENTRY_OPTIONS.keys()
-                or any(config[key] not in choices for key, choices in ENTRY_OPTIONS.items())
-            ):
-                raise ValueError(f"Invalid {name} policy. Supply all supported entry options")
+            validate_entry_options(name, self.spec[name])
 
 
 class SlotControl:
@@ -223,8 +247,10 @@ def main() -> int:
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("list")
     stop = actions.add_parser("stop")
+    park = actions.add_parser("park")
     add = actions.add_parser("add")
-    for action in (stop, add):
+    branch = actions.add_parser("branch")
+    for action in (stop, park, add, branch):
         action.add_argument("--command-id", required=True)
         action.add_argument("--slot-id", required=True)
     add.add_argument("--capital", type=float, required=True)
@@ -234,6 +260,10 @@ def main() -> int:
     add.add_argument(
         "--candidate", type=json.loads, required=True, help="Entry options JSON object"
     )
+    branch.add_argument("--source-slot", required=True)
+    branch.add_argument("--source-account", choices=("incumbent", "candidate"), required=True)
+    branch.add_argument("--candidate", type=json.loads, required=True)
+    branch.add_argument("--evidence-sequence", type=int)
     args = parser.parse_args()
 
     try:
@@ -258,6 +288,17 @@ def main() -> int:
                         "capital": args.capital,
                         "incumbent": args.incumbent,
                         "candidate": args.candidate,
+                    }
+                elif args.action == "branch":
+                    spec = {
+                        "source_slot": args.source_slot,
+                        "source_account": args.source_account,
+                        "candidate": args.candidate,
+                        **(
+                            {"evidence_sequence": args.evidence_sequence}
+                            if args.evidence_sequence is not None
+                            else {}
+                        ),
                     }
                 result = control.submit(
                     SlotCommand(args.command_id, args.action, args.slot_id, spec),

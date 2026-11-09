@@ -1,5 +1,12 @@
 # Autotrade scope and implementation plan
 
+## Active recurring campaign revision on 2026-11-09
+
+The user authorized the [recurring paper campaign](recurring-paper-campaign.md).
+Its C1-C4 criteria govern continuous KR/US scheduling, measured capacity, Astra session review
+and account branching. Earlier finite-scope exclusions below remain historical and do not
+block this expressly authorized work. Real trades and broker account/order access remain forbidden.
+
 ## Active revision on 2026-11-04
 
 The current task is the broker-constrained KR/US redesign in

@@ -39,7 +39,7 @@ from tools.probe_toss_websocket import (
     now,
     read_spec,
 )
-from tools.shared_feed_slots import SharedFeedSlots
+from tools.shared_feed_slots import SharedFeedSlots, validate_session_seeds
 from tools.slot_control import SlotControl
 from tools.us_adaptive_ai import ASTRA, ENTRY_OPTIONS, SOL, propose
 
@@ -161,9 +161,21 @@ class CampaignCutoff(Exception):
 
 
 class DeadlineMarketClient(CachedTokenClient):
-    def __init__(self, settings: Settings, end_epoch: float) -> None:
+    def __init__(
+        self, settings: Settings, end_epoch: float, *, recurring: bool = False
+    ) -> None:
         super().__init__(settings)
         self.end_epoch = end_epoch
+        self.recurring = recurring
+
+    def access_token(self) -> str:
+        return self.recovery_token() if self.recurring else super().access_token()
+
+    def _invalidate_token(self) -> None:
+        if self.recurring:
+            MarketClient._invalidate_token(self)
+        else:
+            super()._invalidate_token()
 
     def _reserve(self, group: str) -> None:
         if time.time() >= self.end_epoch:
@@ -274,6 +286,37 @@ class Runtime:
             for symbol in set(account.pending) | set(account.book.positions)
         }
         return {s for s, i in self.ids.items() if i in ids}
+
+    def inherit_accounts(self, source: Runtime, account_names: dict[str, str]) -> None:
+        """Initialize an empty runtime from a committed observation cut."""
+        for field in (
+            "ids",
+            "features",
+            "candidates",
+            "desired",
+            "books",
+            "unactionable_books",
+            "fx",
+            "counts",
+            "processing_clock",
+            "regular_window",
+        ):
+            setattr(self, field, copy.deepcopy(getattr(source, field)))
+        self.accounts = {
+            name: source.accounts[prior].fork() for name, prior in account_names.items()
+        }
+        self.account = self.accounts["incumbent"]
+        self.configurations = {
+            name: copy.deepcopy(source.configurations[prior])
+            for name, prior in account_names.items()
+        }
+        self.delivered = {name: source.delivered[prior] for name, prior in account_names.items()}
+        self.book_delivered = {
+            name: source.book_delivered[prior] for name, prior in account_names.items()
+        }
+        self.delivery_hashes = {
+            name: source.delivery_hashes[prior].copy() for name, prior in account_names.items()
+        }
 
     def publish(self, kind: str, payload: Any) -> None:
         self.sequence += 1
@@ -1199,7 +1242,12 @@ def websocket_retry_at(headers: list[str], now_epoch: float) -> float:
 
 
 def journal_identity(
-    capital: float, end_epoch: float, market: PaperMarket = US, *, slot_control: Path | None = None
+    capital: float,
+    end_epoch: float,
+    market: PaperMarket = US,
+    *,
+    slot_control: Path | None = None,
+    campaign_seeds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sources: tuple[str, ...] = ADAPTIVE_SOURCES
     if market is KR:
@@ -1210,6 +1258,7 @@ def journal_identity(
         "profile": "broker-constrained",
         "experiment": "adaptive_exploration" if slot_control is None else "shared_feed_slots",
         **({"slot_control": str(slot_control.resolve())} if slot_control is not None else {}),
+        **({"campaign_seeds": campaign_seeds} if campaign_seeds is not None else {}),
         "market": market.code,
         "currency": market.currency,
         "capital": float(capital),
@@ -1234,11 +1283,16 @@ async def campaign(
     slot_control: Path | None = None,
     resume: bool = False,
     market: PaperMarket = US,
+    campaign_seeds: dict[str, Any] | None = None,
 ) -> None:
     if market is KR and profile != "broker-constrained":
         raise ValueError("KR requires the broker-constrained profile")
     if slot_control is not None and journal_path is None:
         raise ValueError("Shared slots require a durable campaign journal")
+    if campaign_seeds is not None:
+        if slot_control is None:
+            raise ValueError("Campaign seeds require a shared-slot journal")
+        validate_session_seeds(campaign_seeds)
     if resume and journal_path is None:
         raise ValueError("Recovery requires an existing journal")
     if journal_path is None:
@@ -1259,7 +1313,9 @@ async def campaign(
         raise ValueError("Campaign cutoff reached before journal open")
     os.umask(0o077)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
-    identity = journal_identity(capital, end_epoch, market, slot_control=slot_control)
+    identity = journal_identity(
+        capital, end_epoch, market, slot_control=slot_control, campaign_seeds=campaign_seeds
+    )
     with ExitStack() as contexts:
         journal = contexts.enter_context(
             AdaptiveJournal.open(journal_path, identity, resume=resume)
@@ -1277,6 +1333,7 @@ async def campaign(
             control=control,
             resume=resume,
             market=market,
+            campaign_seeds=campaign_seeds,
         )
 
 
@@ -1293,6 +1350,7 @@ async def _campaign(
     control: SlotControl | None = None,
     resume: bool = False,
     market: PaperMarket = US,
+    campaign_seeds: dict[str, Any] | None = None,
 ) -> None:
     if adaptive and (
         profile != "broker-constrained"
@@ -1326,14 +1384,16 @@ async def _campaign(
         elif market is KR and kind in ("listings", "prices"):
             raw.write(json.dumps({"kind": kind, "received_at": now(), **payload}) + "\n")
 
-    def make_runtime(slot_capital: float, slot_record: Any) -> Runtime:
+    def make_runtime(
+        slot_capital: float, slot_record: Any, slot_end_epoch: float | None = end_epoch
+    ) -> Runtime:
         return Runtime(
             slot_capital,
             slot_record,
             candidate_policy=candidate_policy,
             profile=profile,
             adaptive=adaptive,
-            end_epoch=end_epoch,
+            end_epoch=slot_end_epoch,
             market=market,
         )
 
@@ -1341,7 +1401,9 @@ async def _campaign(
     runtime: Runtime | SharedFeedSlots
     if control is not None:
         assert journal is not None
-        slots = SharedFeedSlots(make_runtime, subscription_set, record, journal, control)
+        slots = SharedFeedSlots(
+            make_runtime, subscription_set, record, journal, control, session_seeds=campaign_seeds
+        )
         runtime = slots
     else:
         runtime = make_runtime(capital, record)
@@ -1364,6 +1426,7 @@ async def _campaign(
     resync = asyncio.Event()
     try:
         if slots is not None:
+            await slots.load_predecessors(make_runtime)
             if resume:
                 await slots.restore()
                 stats["recovered_from"] = slots.journal.evidence()
@@ -1393,6 +1456,7 @@ async def _campaign(
                 end_epoch,
                 market,
                 slot_control=Path(journal.identity["slot_control"]) if slots is not None else None,
+                campaign_seeds=campaign_seeds,
             )
             != journal.identity
         ):
@@ -1406,7 +1470,7 @@ async def _campaign(
         data["limits"]["minimum_request_interval"] = 0.08
         market_settings = Settings(ROOT, data)
         client = (
-            DeadlineMarketClient(market_settings, end_epoch)
+            DeadlineMarketClient(market_settings, end_epoch, recurring=campaign_seeds is not None)
             if adaptive and end_epoch is not None
             else CachedTokenClient(market_settings)
         )
@@ -1792,9 +1856,12 @@ async def _campaign(
             if slots is not None:
                 slots.check_reviews()
                 slots.poll_controls()
-            elif isinstance(runtime, Runtime) and runtime.review_task is not None:
-                if runtime.review_task.done():
-                    runtime.review_task.result()
+            elif (
+                isinstance(runtime, Runtime)
+                and runtime.review_task is not None
+                and runtime.review_task.done()
+            ):
+                runtime.review_task.result()
             for task in tasks:
                 if task.done():
                     task.result()
@@ -1841,7 +1908,9 @@ async def _campaign(
         at = now()
         if slots is not None:
             slots.check_reviews()
-            await slots.marker("final_advance", at)
+            await slots.marker(
+                "session_close" if campaign_seeds is not None else "final_advance", at
+            )
         else:
             assert isinstance(runtime, Runtime)
             if journal is not None:
@@ -1970,11 +2039,25 @@ def main() -> None:
         "--slot-control", type=Path, help="Enable shared slots with this command spool"
     )
     parser.add_argument(
+        "--campaign-seeds",
+        type=Path,
+        help="Enable recurring sessions with slot continuations from this JSON file",
+    )
+    parser.add_argument(
         "--resume", action="store_true", help="Recover an existing campaign journal"
     )
     args = parser.parse_args()
     if args.slot_control is not None and (args.journal is None or not args.adaptive):
         parser.error("--slot-control requires --adaptive and --journal")
+    campaign_seeds = None
+    if args.campaign_seeds is not None:
+        try:
+            if args.slot_control is None:
+                raise ValueError("--campaign-seeds requires --slot-control")
+            campaign_seeds = json.loads(args.campaign_seeds.read_text())
+            validate_session_seeds(campaign_seeds)
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(str(error))
     if args.market == "KR" and args.profile != "broker-constrained":
         parser.error("--market KR requires --profile broker-constrained")
     if (args.journal is not None and not args.adaptive) or (args.resume and args.journal is None):
@@ -2019,6 +2102,7 @@ def main() -> None:
                 slot_control=args.slot_control.resolve() if args.slot_control else None,
                 resume=args.resume,
                 market=MARKETS[args.market],
+                campaign_seeds=campaign_seeds,
             )
         finally:
             if args.adaptive:

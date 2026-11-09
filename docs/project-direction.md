@@ -1,5 +1,12 @@
 # Project direction
 
+## Active recurring campaign revision on 2026-11-09
+
+The user authorized the [recurring paper campaign](recurring-paper-campaign.md).
+Its C1-C4 criteria govern continuous KR/US scheduling, measured capacity, Astra session review
+and account branching. Earlier finite-scope exclusions below remain historical and do not
+block this expressly authorized work. Real trades and broker account/order access remain forbidden.
+
 This document records the direction agreed during the project review.
 It defines target behavior, not implementation status or permission to start real trading.
 Use `GLOSSARY.md` for shared terminology and `AGENTS.md` for the current execution boundaries.

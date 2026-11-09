@@ -113,3 +113,14 @@ There is no periodic AI heartbeat and no promise of a chat notification from the
 daemon. Inspect its status and logs when needed. Stop the launchd service to stop supervision;
 inspect child job identities before stopping an already running experiment. Preserve all audit
 files when resuming a blocked run, and reconcile its recorded cause before changing its phase.
+
+## Recurring campaign engineering scope
+
+Use `--scope recurring-paper` with a new audit output directory for the explicitly authorized
+[C1-C4 campaign](recurring-paper-campaign.md). Historical audit state cannot be reinterpreted.
+The initial action reviews implementation and deployment evidence instead of waiting for a
+finite inherited market run. Astra directly assigns fixes and tests; no Luna planning stage runs.
+Completion requires controller-owned passing checks and source-matching verified deployment
+evidence in the inherited directory. That evidence does not claim future sessions completed.
+The market service is independent and remains active after the engineering supervisor finishes.
+Supervisor authority, broker/auth machinery and scope definitions remain protected from workers.
