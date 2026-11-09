@@ -24,9 +24,20 @@ from typing import Any
 from papertrade.api import ApiError, MarketClient, private_json
 from papertrade.core import SafetyError, Settings
 from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
-from tools.async_layered_paper import AsyncLayeredPaper, ProcessingClock, seconds
+from tools.async_layered_paper import (
+    NET_TARGET_BLOCKED,
+    AsyncLayeredPaper,
+    ProcessingClock,
+    seconds,
+)
 from tools.kr_broker_profile import eligible as eligible_kr_stock
-from tools.layered_paper import FAMILIES, Feature, assign, eligible_stock, feature_from_bars
+from tools.layered_paper import (
+    REBOUND_NET_TARGET,
+    Feature,
+    assign,
+    eligible_stock,
+    feature_from_bars,
+)
 from tools.live_feed import LiveFeed
 from tools.paper_market import KR, US, PaperMarket
 from tools.probe_toss_websocket import (
@@ -408,7 +419,8 @@ class Runtime:
         opportunities: list[dict[str, Any]] = []
         allocation_became_blocked = False
         cash = candidate.available_cash
-        for family in ENTRY_OPTIONS["policy"]:
+        signal_policy = "rebound" if candidate.policy == REBOUND_NET_TARGET else candidate.policy
+        for family in ("trend", "rebound"):
             signals = {
                 symbol: feature
                 for symbol, feature in eligible.items()
@@ -420,7 +432,7 @@ class Runtime:
             affordable = [
                 symbol for symbol in signals if one_share_costs.get(symbol, math.inf) <= budget
             ]
-            if family == candidate.policy and candidate.allocation == "equal":
+            if family == signal_policy and candidate.allocation == "equal":
                 if affordable:
                     self.allocation_blocked = False
                 elif any(one_share_costs.get(symbol, math.inf) <= cash for symbol in signals):
@@ -837,6 +849,7 @@ class Runtime:
                 self._consider_review(sequence, at, prepared)
             for name, account in self.accounts.items():
                 before = len(account.intents), len(account.outcomes)
+                decisions_before = len(account.decisions)
                 excluded = set(account.pending) | set(account.book.positions)
                 candidate_count = max(
                     1,
@@ -881,6 +894,10 @@ class Runtime:
                 self._record_delivery(name, observation)
                 self.book_delivered[name] += 1
                 identity = {"account": name} if paired else {}
+                if len(account.decisions) > decisions_before:
+                    decision = account.decisions[-1]
+                    if decision.get("blocked_reason") == NET_TARGET_BLOCKED:
+                        self.record("entry_blocked", result=decision, sequence=sequence, **identity)
                 for i in account.intents[before[0] :]:
                     self.record(
                         "intent",
@@ -958,6 +975,12 @@ class Runtime:
                         "last_intent": asdict(account.intents[-1]) if account.intents else None,
                         "last_outcome": account.outcomes[-1] if account.outcomes else None,
                         "last_trade": account.book.trades[-1] if account.book.trades else None,
+                        **(
+                            {"last_net_target_block": account.decisions[-1]}
+                            if account.decisions
+                            and account.decisions[-1].get("blocked_reason") == NET_TARGET_BLOCKED
+                            else {}
+                        ),
                         "last_at": account.last_at,
                         "policy_version": account.entry_policy_version,
                         "input_hash": self.delivery_hashes[name].hexdigest(),
@@ -2029,7 +2052,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--duration", type=int, default=1200)
     parser.add_argument("--capital", type=float, default=100)
-    parser.add_argument("--candidate-policy", choices=("router", *FAMILIES))
+    parser.add_argument("--candidate-policy", choices=("router", *AsyncLayeredPaper.entry_policies))
     parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
     parser.add_argument("--market", choices=MARKETS, default="US")
     parser.add_argument("--adaptive", action="store_true")

@@ -272,4 +272,7 @@ class CapacityTests(unittest.IsolatedAsyncioTestCase):
     def test_enumeration_contains_no_duplicate_strategies(self) -> None:
         values = strategies()
         self.assertEqual(len(values), len({tuple(sorted(item.items())) for item in values}))
-        self.assertEqual({item["policy"] for item in values}, {"trend", "rebound"})
+        self.assertEqual(
+            [item["policy"] for item in values],
+            ["trend"] * 4 + ["rebound"] * 4 + ["rebound_net_target"] * 4,
+        )

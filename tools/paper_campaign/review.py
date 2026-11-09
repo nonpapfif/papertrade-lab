@@ -40,6 +40,10 @@ fields empty. Compare fee-inclusive marked return, drawdown, and consistency acr
 qualified sessions, and inspect closed-trade sample size before recommending a change. Marks
 are not actual liquidation proceeds. Separate the native currency accounts. Do not infer an
 edge or remove a strategy from one session. Explain any proposed selection with evidence.
+rebound_net_target retains rebound signals and holding rules, and skips new buys when the
+original mean after modeled sell fees does not cover the entry cost at intent or confirmation.
+The mean is an analytical reference. Actual exits still use the rebound holding rule and
+observed depth. Equal allocation counts signal matches before the cost check.
 The baseline is present in every original pair. Preserve exposure and give newcomers enough
 sessions to be evaluated. Only choose supplied eligible strategy IDs. A close review may
 propose next_slots and must leave branch fields empty. It may leave capacity unused only when
