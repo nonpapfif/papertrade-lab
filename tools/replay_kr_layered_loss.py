@@ -82,6 +82,12 @@ class Experiment(AsyncLayeredPaper):
         self.variant = variant
         self.eligible = eligible
         self.vetoed_bars: set[tuple[int, str, str]] = set()
+        self.excluded_at_dispatch: set[int] = set()
+
+    def _process(self, event: dict[str, Any]) -> None:
+        # Runtime computes its candidate count before the account expires pending intents.
+        self.excluded_at_dispatch = self.pending.keys() | self.book.positions.keys()
+        super()._process(event)
 
     def _intent(self, event: dict, f: Feature, strategy: str, side: str) -> None:
         bid, ask = quote_bounds(event["book"])
@@ -102,9 +108,9 @@ class Experiment(AsyncLayeredPaper):
             self.vetoed_bars.add((event["symbol"], side, f.bar_end))
             return
         if side == "BUY" and self.allocation == "equal":
-            excluded = self.pending.keys() | self.book.positions.keys()
             candidates = self.eligible(self.policy, self.selection, event["received_at"])
-            event = {**event, "candidate_count": max(1, len(set(candidates) - excluded))}
+            count = max(1, len(set(candidates) - self.excluded_at_dispatch))
+            event = {**event, "candidate_count": count}
         super()._intent(event, f, strategy, side)
 
 

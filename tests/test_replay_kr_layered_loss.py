@@ -74,6 +74,19 @@ class ReplayAttributionTests(unittest.TestCase):
         with self.assertRaisesRegex(JournalError, r"shared_slots\[0\].adaptive"):
             compare_status(status, recorded)
 
+    def test_equal_sizing_excludes_orders_pending_at_dispatch_even_if_the_book_expires_them(
+        self,
+    ) -> None:
+        account = Experiment(CONFIG, "control", lambda *_args: [0, 1])
+        pending = event(1, 995, 996, replace(FEATURE, symbol=1))
+        pending.update(symbol=1, provider_symbol="000660")
+        account._process(pending)
+        self.assertEqual(account.pending[1].quantity, 5)
+
+        account._process(event(32, 995, 996))
+        self.assertEqual(account.outcomes[-1]["status"], "expired")
+        self.assertEqual(account.pending[0].quantity, 10)
+
     def test_rebound_net_target_uses_fee_inclusive_limit_cost(self) -> None:
         account = experiment("entry_rebound_net_target")
         account._process(event(1, 998, 999))
