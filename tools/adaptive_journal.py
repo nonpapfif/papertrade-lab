@@ -88,6 +88,20 @@ class AdaptiveJournal:
 
     @classmethod
     @contextmanager
+    def read_completed(cls, path: Path, chain: str) -> Iterator[AdaptiveJournal]:
+        """Read a sealed predecessor in one consistent database snapshot."""
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                db.execute("BEGIN")
+                identity, state, _, _, anchor = _header(db)
+                if state != "complete" or anchor != chain:
+                    raise JournalError("Predecessor is incomplete or has a different hash")
+                yield cls(db, json.loads(identity))
+        except (sqlite3.Error, OSError, ValueError) as error:
+            raise JournalError("Cannot read completed predecessor") from error
+
+    @classmethod
+    @contextmanager
     def open(
         cls, path: Path, identity: dict[str, Any], *, resume: bool
     ) -> Iterator[AdaptiveJournal]:

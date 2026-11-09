@@ -19,9 +19,15 @@ from typing import Any
 from papertrade.ai import DISABLED_FEATURES, codex_environment, parse_codex_events
 from papertrade.usage import read_metadata
 from tools.autotest_jobs import atomic_json, poll_job, start_job
+from tools.supervisor_scopes import (
+    RECURRING_CONTRACT,
+    RECURRING_EDITABLE,
+    RECURRING_MODULES,
+    RECURRING_REQUIREMENTS,
+)
 
 MODELS = {
-    "plan": ("gpt-6-luna", "low"),
+    "plan": ("gpt-6-astra", "medium"),
     "implement": ("gpt-6.1-sol", "medium"),
     "review": ("gpt-6-astra", "medium"),
 }
@@ -127,6 +133,7 @@ PROTECTED = (
     "papertrade/core.py",
     "tools/autotest_supervisor.py",
     "tools/autotest_jobs.py",
+    "tools/supervisor_scopes.py",
     "AGENTS.md",
     "pyproject.toml",
     "tools/probe_toss_websocket.py",
@@ -265,13 +272,17 @@ def verify_index_matches_worktree(
             raise RuntimeError("Index and working tree differ; inspect staged content")
         if path.is_symlink():
             working_mode = "120000"
-            working_oid = subprocess.run(
-                ["git", "hash-object", "--stdin"],
-                cwd=repo,
-                input=os.fsencode(os.readlink(path)),
-                capture_output=True,
-                check=True,
-            ).stdout.decode().strip()
+            working_oid = (
+                subprocess.run(
+                    ["git", "hash-object", "--stdin"],
+                    cwd=repo,
+                    input=os.fsencode(os.readlink(path)),
+                    capture_output=True,
+                    check=True,
+                )
+                .stdout.decode()
+                .strip()
+            )
         else:
             working_mode = "100755" if path.stat().st_mode & 0o111 else "100644"
             working_oid = command(["git", "hash-object", "--no-filters", "--", name], repo)
@@ -292,15 +303,19 @@ def verify_index_matches_worktree(
     return command(["git", "write-tree"], repo)
 
 
-def check_changes(repo: Path, generated: list[str] | None = None) -> list[str]:
+def check_changes(
+    repo: Path, generated: list[str] | None = None, *, scope: str = "finite"
+) -> list[str]:
     paths = changed_paths(repo)
+    editable = EDITABLE_EXISTING | (RECURRING_EDITABLE if scope == "recurring-paper" else set())
     tracked = set(command(["git", "ls-files"], repo).splitlines())
     for name in paths:
         if name in PROTECTED or not name.startswith(("tools/", "tests/", "docs/")):
             raise RuntimeError(f"Change requires separate review of supervisor authority: {name}")
         if (
             name in tracked
-            and name not in EDITABLE_EXISTING
+            and name not in editable
+            and not (scope == "recurring-paper" and name.startswith("tools/paper_campaign/"))
             and name not in (generated or [])
             and not name.startswith("docs/")
         ):
@@ -379,9 +394,19 @@ class Supervisor:
         inherited: Path,
         *,
         kr_until: str | None = None,
+        scope: str = "finite",
     ) -> None:
+        if scope not in ("finite", "recurring-paper") or (kr_until and scope != "finite"):
+            raise ValueError("Invalid supervisor scope")
+        self.scope = scope
         self.kr_until = kr_until
-        self.requirements = KR_REQUIREMENTS if kr_until else REQUIREMENTS
+        self.requirements = (
+            RECURRING_REQUIREMENTS
+            if scope == "recurring-paper"
+            else KR_REQUIREMENTS
+            if kr_until
+            else REQUIREMENTS
+        )
         self.repo, self.output, self.binary = repo.resolve(), output.resolve(), binary.resolve()
         output.mkdir(parents=True, exist_ok=True)
         self.path = output / "status.json"
@@ -390,7 +415,8 @@ class Supervisor:
             if self.state["repo"] != str(self.repo):
                 raise RuntimeError("Supervisor repository does not match saved state")
             if (
-                self.state.get("requirements") != self.requirements
+                self.state.get("scope", "finite") != scope
+                or self.state.get("requirements") != self.requirements
                 or self.state.get("kr_until") != kr_until
             ):
                 raise RuntimeError(
@@ -398,7 +424,8 @@ class Supervisor:
                 )
         else:
             self.state = {
-                "phase": "inherit",
+                "phase": "review" if scope == "recurring-paper" else "inherit",
+                "scope": scope,
                 "requirements": self.requirements,
                 "repo": str(self.repo),
                 "inherited": str(inherited),
@@ -428,7 +455,11 @@ class Supervisor:
     def evidence(self) -> dict[str, Any]:
         return {
             "requirements": self.requirements,
-            "milestone_document": "docs/autotrade-implementation-plan.md",
+            "milestone_document": (
+                "docs/recurring-paper-campaign.md"
+                if self.scope == "recurring-paper"
+                else "docs/autotrade-implementation-plan.md"
+            ),
             "comparison": (
                 {
                     "currency": "KRW",
@@ -450,7 +481,17 @@ class Supervisor:
             "source_digest": tree_digest(self.worktree),
             "protected_files": PROTECTED,
             "editable_existing_files": sorted(
-                EDITABLE_EXISTING | set(self.state.get("generated_files", []))
+                EDITABLE_EXISTING
+                | set(self.state.get("generated_files", []))
+                | (RECURRING_EDITABLE if self.scope == "recurring-paper" else set())
+                | (
+                    {
+                        str(path.relative_to(self.worktree))
+                        for path in (self.worktree / "tools/paper_campaign").glob("*.py")
+                    }
+                    if self.scope == "recurring-paper"
+                    else set()
+                )
             ),
             "regression_modules": REGRESSION_MODULES,
             "live_source_policy": (
@@ -525,7 +566,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             if self.kr_until
             else ""
         )
-        prompt = CONTRACT + scope + instructions + "\nEvidence: " + str(job / "evidence.json")
+        contract = RECURRING_CONTRACT if self.scope == "recurring-paper" else CONTRACT
+        prompt = contract + scope + instructions + "\nEvidence: " + str(job / "evidence.json")
         (job / "prompt.txt").write_text(prompt)
         self.transition(
             "model_wait", role=role, job=str(job), review_digest=tree_digest(self.worktree)
@@ -599,7 +641,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             if value["status"] == "blocked":
                 self.transition("review")
             else:
-                check_changes(self.worktree, self.state.get("generated_files", []))
+                check_changes(
+                    self.worktree, self.state.get("generated_files", []), scope=self.scope
+                )
                 self.prepare_tests(value["experiment"])
 
     def after_review(self) -> None:
@@ -617,14 +661,24 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 or report.get("result") == "failed"
             ):
                 raise RuntimeError("Cannot complete without a completed persisted run")
+            if self.scope == "recurring-paper":
+                if not self.state.get("tests_passed"):
+                    raise RuntimeError("Recurring completion requires controller-owned tests")
+                if (
+                    report.get("real_orders") is not False
+                    or report.get("source_digest") != tree_digest(self.worktree)
+                    or report.get("service_verified") is not True
+                ):
+                    raise RuntimeError("Recurring deployment evidence missing or stale")
             comparison_path = run_path / "comparison.json"
             comparisons = [report, report.get("comparison", {})]
             if comparison_path.exists():
                 comparisons.append(read_json(comparison_path))
             for comparison in comparisons:
-                if comparison.get("state") not in (None, "complete") or comparison.get(
-                    "complete"
-                ) is False:
+                if (
+                    comparison.get("state") not in (None, "complete")
+                    or comparison.get("complete") is False
+                ):
                     raise RuntimeError("Cannot complete with incomplete comparison evidence")
                 for field in (
                     "source_unchanged",
@@ -659,6 +713,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if plan["kind"] == "blocked":
             self.transition("review", cycle=self.state["cycle"] + 1)
             return
+        if self.scope == "recurring-paper" and plan["kind"] == "live":
+            raise RuntimeError("Recurring deployment requires the reviewed campaign adapter")
         cycle = self.state["cycle"] + 1
         if plan["kind"] == "test":
             if changed_paths(self.worktree):
@@ -714,6 +770,12 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             ):
                 raise ValueError("Invalid unittest target")
         modules = list(REGRESSION_MODULES)
+        if self.scope == "recurring-paper":
+            modules.extend(RECURRING_MODULES)
+            modules.extend(
+                "tests." + path.stem
+                for path in (self.worktree / "tests").glob("test_paper_campaign*.py")
+            )
         for name in changed_paths(self.worktree) + self.state.get("generated_files", []):
             if re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", name):
                 module = name[:-3].replace("/", ".")
@@ -888,7 +950,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             raise RuntimeError("Reviewed source changed before publication")
         if self.state.get("tested_digest") != self.state["publication_digest"]:
             raise RuntimeError("Publication source was not tested")
-        paths = check_changes(self.worktree, self.state.get("generated_files", []))
+        paths = check_changes(
+            self.worktree, self.state.get("generated_files", []), scope=self.scope
+        )
         verify_index_matches_worktree(self.worktree, paths)
         tracked = set(command(["git", "ls-files"], self.worktree).splitlines())
         self.state["generated_files"] = sorted(
@@ -1050,6 +1114,7 @@ def main() -> None:
     parser.add_argument("--inherited", required=True, type=Path)
     parser.add_argument("--codex", required=True, type=Path)
     parser.add_argument("--kr-until", type=datetime.fromisoformat)
+    parser.add_argument("--scope", choices=("finite", "recurring-paper"), default="finite")
     args = parser.parse_args()
     if args.kr_until is not None and args.kr_until.tzinfo is None:
         parser.error("--kr-until requires a timezone offset")
@@ -1062,6 +1127,7 @@ def main() -> None:
             args.codex,
             args.inherited,
             kr_until=args.kr_until.isoformat() if args.kr_until else None,
+            scope=args.scope,
         )
         if "trusted_live_commit" not in supervisor.state:
             if command(["git", "status", "--porcelain"], args.repo):

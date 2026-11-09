@@ -96,20 +96,31 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.feed("selection", ["A", "B"])
         for symbol in ("A", "B"):
-            await self.feed(
-                "feature",
-                (
-                    symbol,
-                    [
-                        {
-                            "timestamp": (START - timedelta(minutes=15 - i)).isoformat(),
-                            "closePrice": 9 + i * 0.05,
-                            "highPrice": 9 + i * 0.05,
-                        }
-                        for i in range(16)
-                    ],
-                ),
-            )
+            await self.bars(symbol)
+
+    async def bars(
+        self,
+        symbol: str,
+        price: float = 9,
+        step: float = 0.05,
+        offset: int = 0,
+        start: datetime = START,
+    ) -> None:
+        await self.feed(
+            "feature",
+            (
+                symbol,
+                [
+                    {
+                        "timestamp": (start - timedelta(minutes=15 - i)).isoformat(),
+                        "closePrice": price + i * step,
+                        "highPrice": price + i * step,
+                    }
+                    for i in range(16)
+                ],
+            ),
+            offset,
+        )
 
     async def book(self, symbol: str, offset: int, price: float = 10.0) -> None:
         await self.feed(
@@ -204,6 +215,228 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controls.pending(), [])
         self.assertEqual(recovered.slots["one"].state, "active")
         self.assertEqual(read_status(self.path)["cursor"], 1)
+
+    async def test_branch_inherits_holdings_reservations_and_replays_once(self) -> None:
+        await self.seed()
+        await self.command(add("source", 100))
+        await self.book("A", 1)
+        await self.book("A", 3)
+        await self.book("B", 4, price=2)
+        source = self.slots.slots["source"].runtime.accounts["candidate"]
+        self.assertTrue(source.book.positions)
+        self.assertGreater(source.reserved_cash, 0)
+        branch = SlotCommand(
+            "cut",
+            "branch",
+            "comparison",
+            {
+                "source_slot": "source",
+                "source_account": "candidate",
+                "candidate": {**BASELINE, "policy": "rebound"},
+            },
+        )
+        self.controls.submit(branch, end_epoch=time.time() + 60)
+        cut = self.slots.consumed
+        with (
+            patch.object(self.controls, "record", side_effect=OSError("lost projection")),
+            self.assertRaises(OSError),
+        ):
+            await self.feed("slot_command", asdict(branch), 5)
+        copied = self.slots.slots["comparison"].runtime
+        for account in copied.accounts.values():
+            self.assertEqual(account.summary(), source.summary())
+            self.assertEqual(account.book.trades, source.book.trades)
+            self.assertIsNot(account.book.trades, source.book.trades)
+            self.assertIsNot(account.context, source.context)
+            self.assertEqual(account.pending, source.pending)
+            self.assertIsNot(account.pending, source.pending)
+            self.assertEqual(account.owner_policy_versions, source.owner_policy_versions)
+            self.assertEqual(account._workers, {})
+        self.assertEqual(copied.account.policy, "trend")
+        self.assertEqual(copied.accounts["candidate"].policy, "rebound")
+        self.assertEqual(copied.accounts["candidate"].entry_policy_version, 1)
+        lineage = self.slots.slots["comparison"].lineage
+        assert lineage is not None
+        self.assertEqual(lineage["through_sequence"], cut)
+
+        recovered = self.coordinator(self.journal)
+        self.addAsyncCleanup(recovered.close)
+        await recovered.restore()
+        recovered.poll_controls()
+        self.assertTrue(recovered.queue.empty())
+        self.assertEqual(self.controls.pending(), [])
+        self.assertEqual(recovered.slots["comparison"].runtime._checkpoint(), copied._checkpoint())
+        recovered.enable_reviews(Settings(Path("."), {}))
+        self.assertIsNone(recovered.slots["comparison"].runtime.review_settings)
+        await recovered.quiesce_reviews()
+
+        self.slots = recovered
+        await self.feed("selection", [], 6)
+        self.assertCountEqual(recovered.desired, ["A", "B"])
+        await self.book("B", 7, price=2)
+        for account in recovered.slots["comparison"].runtime.accounts.values():
+            self.assertEqual(account.owner_policy_versions[1], 0)
+            self.assertEqual(account.reserved_cash, 0)
+        self.assertGreater(source.reserved_cash, 0)
+        await self.feed("selection", ["C"], 8)
+        await self.bars("C", 0.4, 0.005, 8)
+        await self.book("C", 9, price=0.5)
+        comparison = recovered.slots["comparison"].runtime
+        symbol = comparison.ids["C"]
+        self.assertIn(symbol, comparison.account.pending)
+        self.assertNotIn(symbol, comparison.accounts["candidate"].pending)
+
+    async def test_invalid_branch_options_do_not_enter_command_spool(self) -> None:
+        invalid = SlotCommand(
+            "invalid",
+            "branch",
+            "comparison",
+            {"source_slot": "source", "source_account": "candidate", "candidate": {}},
+        )
+        with self.assertRaises(ValueError):
+            self.controls.submit(invalid, end_epoch=time.time() + 60)
+        self.assertEqual(self.controls.report()["commands"], [])
+        self.assertEqual(self.slots.slots, {})
+
+    async def test_sealed_session_replays_full_accounts_into_next_session(self) -> None:
+        root = self.path.parent
+        prior_path = root / "prior.sqlite"
+        prior_identity = {
+            **self.identity,
+            "campaign_seeds": {},
+            "end_epoch": (START + timedelta(hours=1)).timestamp(),
+        }
+        prior_journal = self.enterContext(
+            AdaptiveJournal.open(prior_path, prior_identity, resume=False)
+        )
+        self.slots = SharedFeedSlots(
+            make_runtime,
+            subscription_set,
+            lambda *_args, **_kwargs: None,
+            prior_journal,
+            self.controls,
+            session_seeds={},
+        )
+        self.addAsyncCleanup(self.slots.close)
+        await self.seed()
+        await self.command(add("one", 100))
+        await self.book("A", 1)
+        await self.book("A", 3)
+        await self.book("B", 4, price=2)
+        await self.book("B", 6, price=2)
+        await self.bars("A", 9, -0.05, 7)
+        await self.book("A", 8, price=7)
+        await self.book("A", 10, price=7)
+        await self.bars("A", 7, 0.05, 11)
+        await self.book("A", 12, price=7)
+        await self.command(SlotCommand("reject-park", "park", "one"), 12)
+        self.assertEqual(
+            self.controls.report()["commands"][-1]["detail"]["reason"], "slot_has_exposure"
+        )
+        await self.command(add("flat", 120), 12)
+        await self.command(SlotCommand("park-flat", "park", "flat"), 12)
+        self.assertEqual(self.slots.slots["flat"].state, "parked")
+        flat = self.slots.slots["flat"].runtime
+        await self.slots.marker("session_close", (START + timedelta(seconds=13)).isoformat())
+        prior_journal.complete()
+        prior = self.slots.slots["one"].runtime
+        self.assertTrue(prior.account.book.positions)
+        self.assertLess(prior.account.book.realized, 0)
+        self.assertGreater(prior.account.reserved_cash, 0)
+
+        seed = {
+            "journal": str(prior_path),
+            "slot_id": "one",
+            "chain_sha256": prior_journal.evidence()["chain_sha256"],
+        }
+        seeds = {"one": seed, "flat": {**seed, "slot_id": "flat"}}
+        next_end = (START + timedelta(days=1, hours=1)).timestamp()
+        identity = {
+            **prior_identity,
+            "campaign_seeds": seeds,
+            "end_epoch": next_end,
+        }
+
+        def runtime_at(capital: float, record: Any, end: float) -> Runtime:
+            return Runtime(
+                capital,
+                record,
+                profile="broker-constrained",
+                adaptive=True,
+                end_epoch=end,
+            )
+
+        self.controls = self.enterContext(
+            SlotControl.open(root / "next-control.sqlite", initialize=True)
+        )
+        journal = self.enterContext(
+            AdaptiveJournal.open(root / "next.sqlite", identity, resume=False)
+        )
+
+        def next_slots(next_seeds: dict[str, Any]) -> SharedFeedSlots:
+            return SharedFeedSlots(
+                lambda capital, record: runtime_at(capital, record, next_end),
+                subscription_set,
+                lambda *_args, **_kwargs: None,
+                journal,
+                self.controls,
+                session_seeds=next_seeds,
+            )
+
+        wrong_source = next_slots({"one": {**seed, "chain_sha256": "0" * 64}})
+        with self.assertRaisesRegex(RuntimeError, "different hash"):
+            await wrong_source.load_predecessors(runtime_at)
+        self.slots = next_slots(seeds)
+        self.addAsyncCleanup(self.slots.close)
+        await self.slots.load_predecessors(runtime_at)
+        self.slots.enable_reviews(Settings(Path("."), {}))
+        await self.command(add("one", 999, "wrong-capital"), offset=86_400)
+        self.assertNotIn("one", self.slots.slots)
+        await self.command(add("one", 100), offset=86_400)
+        await self.command(add("flat", 120), offset=86_400)
+        resumed = self.slots.slots["one"].runtime
+        self.assertEqual(resumed._checkpoint(), prior._checkpoint())
+        self.assertEqual(self.slots.slots["flat"].runtime._checkpoint(), flat._checkpoint())
+        self.assertEqual(self.slots.slots["flat"].state, "active")
+        self.assertIsNone(resumed.review_settings)
+        self.assertCountEqual(self.slots.protected(), ["A", "B"])
+        await self.feed("clock", None, 86_401)
+        self.assertEqual(resumed.account.reserved_cash, 0)
+        self.assertEqual(resumed.account.outcomes[-1]["status"], "expired")
+        self.assertGreater(prior.account.reserved_cash, 0)
+        await self.book("A", 86_402, price=7)
+        self.assertEqual(resumed.counts["outside_regular_session"], 1)
+        self.assertEqual(resumed.account.reserved_cash, 0)
+        next_start = START + timedelta(days=1)
+        day = next_start.date().isoformat()
+        await self.feed(
+            "calendar",
+            (
+                day,
+                {
+                    "today": {
+                        "date": day,
+                        "regularMarket": {
+                            "startTime": (next_start - timedelta(minutes=30)).isoformat(),
+                            "endTime": (next_start + timedelta(hours=2)).isoformat(),
+                        },
+                    }
+                },
+            ),
+            86_403,
+        )
+        await self.feed("selection", ["A", "B"], 86_403)
+        await self.bars("A", 7, 0.05, 86_403, next_start)
+        await self.book("A", 86_404, price=7)
+        self.assertGreater(resumed.account.reserved_cash, 0)
+        await self.book("A", 86_406, price=7)
+        self.assertIn(resumed.ids["A"], resumed.account.book.positions)
+
+        restored = next_slots(seeds)
+        self.addAsyncCleanup(restored.close)
+        await restored.load_predecessors(runtime_at)
+        await restored.restore()
+        self.assertEqual(restored.slots["one"].runtime._checkpoint(), resumed._checkpoint())
 
     async def test_review_is_slot_scoped_and_committed_before_external_call(self) -> None:
         self.slots.enable_reviews(Settings(Path("."), {}))

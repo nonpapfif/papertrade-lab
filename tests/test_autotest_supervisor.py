@@ -126,7 +126,7 @@ class AutotestSupervisorTests(unittest.TestCase):
 
     def test_model_commands_use_requested_roles_and_sandboxes(self) -> None:
         expected = {
-            "plan": ("gpt-6-luna", "read-only"),
+            "plan": ("gpt-6-astra", "read-only"),
             "implement": ("gpt-6.1-sol", "workspace-write"),
             "review": ("gpt-6-astra", "read-only"),
         }
