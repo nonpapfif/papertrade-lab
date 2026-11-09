@@ -7,9 +7,9 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from tools.async_layered_paper import AsyncLayeredPaper
-from tools.layered_paper import Feature
-from tools.paper_market import KR
+from tools.async_layered_paper import NET_TARGET_BLOCKED, AsyncLayeredPaper
+from tools.layered_paper import REBOUND_NET_TARGET, Feature
+from tools.paper_market import KR, US
 
 
 def stamp(seconds):
@@ -41,6 +41,80 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         a = AsyncLayeredPaper(capital, **kwargs)
         self.addAsyncCleanup(a.close)
         return a
+
+    async def test_net_target_requires_strictly_positive_proceeds_in_both_markets(self):
+        for market, ask, capital, fees, targets in (
+            (US, 9, 9, {}, (9.009, 9.01, 9.011)),
+            (
+                KR,
+                600,
+                675,
+                {"commission_rate": 0.125, "stock_sale_tax_rate": 0.125},
+                (899, 900, 901),
+            ),
+        ):
+            for target, blocked in zip(targets, (True, True, False), strict=True):
+                with self.subTest(market=market.code, target=target):
+                    account = await self.account(
+                        capital, policy=REBOUND_NET_TARGET, market=market, fees=fees
+                    )
+                    initial = event(price=ask)
+                    confirmation = event(at=2, price=ask)
+                    for row in (initial, confirmation):
+                        row["book"]["currency"] = market.currency
+                        if market is KR:
+                            row["book"]["bids"][0]["price"] = str(ask - 1)
+                        row["feature"] = replace(row["feature"], r15=-0.02, mean=target)
+                        await account.submit(row)
+                    self.assertEqual(bool(account.book.positions), not blocked)
+                    self.assertEqual(account.reserved_cash, 0)
+                    if blocked:
+                        self.assertEqual(account.intents, [])
+                        decision = account.decisions[0]
+                        self.assertEqual(decision["blocked_reason"], NET_TARGET_BLOCKED)
+                        self.assertLessEqual(decision["target_net_proceeds"], decision["entry_cost"])
+                        if target == targets[1]:
+                            self.assertEqual(decision["target_net_proceeds"], decision["entry_cost"])
+
+    async def test_net_target_rechecks_partial_depth_at_actual_price_and_retains_owner(self):
+        initial = event(price=4)
+        initial["feature"] = replace(initial["feature"], r15=-0.02, mean=4.006)
+        account = await self.account(8, policy=REBOUND_NET_TARGET)
+        await account.submit(initial)
+        self.assertEqual(account.pending[0].quantity, 2)
+        branch = account.fork()
+        self.addAsyncCleanup(branch.close)
+        branch.policy = "trend"
+        branch.entry_policy_version += 1
+
+        partial = event(at=2, price=4, volume=1)
+        await account.submit(partial)
+        self.assertEqual(account.outcomes[-1]["blocked_reason"], NET_TARGET_BLOCKED)
+        self.assertEqual(account.outcomes[-1]["evaluated_quantity"], 1)
+        self.assertEqual(account.outcomes[-1]["requested_quantity"], 2)
+        self.assertEqual(account.book.positions, {})
+        self.assertEqual(account.owners, {})
+        self.assertEqual(account.book.cash, 8)
+        self.assertEqual(account.reserved_cash, 0)
+
+        await branch.submit(event(at=2, price=3.99, volume=1))
+        self.assertEqual(branch.book.positions[0].quantity, 1)
+        self.assertEqual(branch.owners[0], (REBOUND_NET_TARGET, initial["feature"]))
+        self.assertEqual(branch.owner_policy_versions[0], 0)
+        invalid = event(at=3, price=4.01)
+        invalid["feature"] = replace(invalid["feature"], r15=0.1)
+        await branch.submit(invalid)
+        self.assertEqual(branch.pending[0].side, "SELL")
+        self.assertEqual(branch.pending[0].strategy, REBOUND_NET_TARGET)
+        await branch.submit(event(at=5, price=4.01))
+        self.assertEqual(branch.owners, {})
+
+        legacy = await self.account(8, policy="rebound")
+        await legacy.submit(initial)
+        await legacy.submit(partial)
+        self.assertEqual(legacy.book.positions[0].quantity, 1)
+        self.assertEqual(legacy.outcomes[-1]["status"], "partial")
+        self.assertNotIn(REBOUND_NET_TARGET, legacy.realized_by_strategy)
 
     async def test_other_symbol_decides_and_fills_before_delayed_quote(self):
         a = await self.account(200)

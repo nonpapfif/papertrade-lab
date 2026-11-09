@@ -12,6 +12,7 @@ from tools.live_execution import DEFAULT_FEES, KR_FEES, ExecutionBook, Execution
 from tools.paper_market import US, PaperMarket
 
 FAMILIES = ("trend", "breakout", "rebound")
+REBOUND_NET_TARGET = "rebound_net_target"
 
 
 def eligible_stock(row: dict[str, Any]) -> bool:
@@ -114,7 +115,7 @@ def entry_valid(strategy: str, f: Feature) -> bool:
         return f.r5 > 0 and f.price > f.prior_high
     if strategy == "trend":
         return f.r5 > 0 and f.r15 > 0 and f.efficiency >= 0.5
-    if strategy == "rebound":
+    if strategy in ("rebound", REBOUND_NET_TARGET):
         return f.r5 > 0 and f.r15 < 0 and f.price < f.mean
     raise ValueError("Unknown strategy")
 
@@ -129,13 +130,15 @@ def holding_valid(strategy: str, f: Feature, entry: Feature) -> bool:
         return f.price >= entry.prior_high * 0.998
     if strategy == "trend":
         return f.r15 >= 0
-    if strategy == "rebound":
+    if strategy in ("rebound", REBOUND_NET_TARGET):
         return f.r5 >= -0.003 and f.price < entry.mean
     raise ValueError("Unknown strategy")
 
 
 class LayeredPaper:
     """Prototype rule boundaries are hypotheses, not validated return forecasts."""
+
+    entry_policies: tuple[str, ...] = FAMILIES
 
     def __init__(
         self,
@@ -147,7 +150,7 @@ class LayeredPaper:
         fees: dict[str, float] | None = None,
         market: PaperMarket = US,
     ) -> None:
-        if policy not in ("router", *FAMILIES) or selection not in ("all", "active"):
+        if policy not in ("router", *self.entry_policies) or selection not in ("all", "active"):
             raise ValueError("Unknown signal policy")
         if allocation not in ("equal", "priority") or not math.isfinite(capital) or capital <= 0:
             raise ValueError("Invalid allocation or capital")

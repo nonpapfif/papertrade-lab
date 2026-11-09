@@ -11,8 +11,10 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from tools.layered_paper import Feature, LayeredPaper, assign, holding_valid
+from tools.layered_paper import REBOUND_NET_TARGET, Feature, LayeredPaper, assign, holding_valid
 from tools.toss_order_contract import whole_share_limit
+
+NET_TARGET_BLOCKED = "nonpositive_rebound_net_target"
 
 
 def seconds(at: str) -> float:
@@ -69,6 +71,8 @@ class AsyncLayeredPaper(LayeredPaper):
     Missing confirmations expire after 30 seconds. Remaining holdings stay managed.
     Equal allocation uses a caller-supplied, decision-time candidate count.
     """
+
+    entry_policies = (*LayeredPaper.entry_policies, REBOUND_NET_TARGET)
 
     def __init__(self, capital: float, *, delay: float = 1, **kwargs: Any) -> None:
         super().__init__(capital, **kwargs)
@@ -362,6 +366,11 @@ class AsyncLayeredPaper(LayeredPaper):
         )
         if not quantity:
             return
+        if side == "BUY" and strategy == REBOUND_NET_TARGET:
+            blocked = self._net_target_block(quantity, f.mean, reserve)
+            if blocked:
+                self.decisions[-1].update(blocked, entry_price=limit)
+                return
         order_request = None
         if "provider_symbol" in event:
             try:
@@ -394,6 +403,20 @@ class AsyncLayeredPaper(LayeredPaper):
         self.pending[symbol] = intent
         self.intents.append(intent)
 
+    def _net_target_block(
+        self, quantity: int, target: float, entry_cost: float
+    ) -> dict[str, Any]:
+        notional = quantity * target
+        proceeds = notional - self.book.fees(notional, quantity, "SELL")[self.book.total_fee_key]
+        if proceeds > entry_cost:
+            return {}
+        return {
+            "blocked_reason": NET_TARGET_BLOCKED,
+            "target_price": target,
+            "target_net_proceeds": proceeds,
+            "entry_cost": entry_cost,
+        }
+
     def _confirm(self, intent: Intent, quote: dict, event: dict) -> None:
         symbol, at = intent.symbol, event["received_at"]
         frame = {
@@ -416,6 +439,27 @@ class AsyncLayeredPaper(LayeredPaper):
             levels = self.book._quote(symbol, "BUY", self.prices[symbol])
             capacity = sum(v for _, v in levels[0]) if levels else 0
             count = min(requested, capacity)
+            if count and intent.strategy == REBOUND_NET_TARGET:
+                execution = self.book._execution(symbol, "BUY", count, self.prices[symbol])
+                if execution is not None:
+                    price, fees, _ = execution
+                    cost = count * price + fees[self.book.total_fee_key]
+                    blocked = self._net_target_block(count, intent.feature.mean, cost)
+                    if blocked:
+                        self.book._attempt(symbol, "BUY", requested, 0)
+                        self.outcomes.append(
+                            {
+                                "intent_id": intent.id,
+                                **self.book.order_attempts[-1],
+                                **blocked,
+                                "entry_price": price,
+                                "evaluated_quantity": count,
+                            }
+                        )
+                        del self.pending[symbol]
+                        return
+                else:
+                    count = 0
             if count:
                 self.book.entry_requested[symbol] = requested
                 self.book.fill(
@@ -459,6 +503,7 @@ class AsyncLayeredPaper(LayeredPaper):
             if symbol not in self.book.positions:
                 del self.owners[symbol]
                 del self.owner_policy_versions[symbol]
+        self.realized_by_strategy.setdefault(intent.strategy, 0.0)
         self.realized_by_strategy[intent.strategy] += self.book.realized - before
         self.outcomes.append({"intent_id": intent.id, **self.book.order_attempts[-1]})
         del self.pending[symbol]
@@ -511,4 +556,9 @@ class AsyncLayeredPaper(LayeredPaper):
             ],
             outcomes=copy.deepcopy(self.outcomes),
         )
+        blocked_entries = [
+            row for row in self.decisions if row.get("blocked_reason") == NET_TARGET_BLOCKED
+        ]
+        if blocked_entries:
+            result["net_target_blocked_entries"] = copy.deepcopy(blocked_entries)
         return result

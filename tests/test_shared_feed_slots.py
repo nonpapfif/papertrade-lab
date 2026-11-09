@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 from papertrade.core import Settings
 from tools.adaptive_journal import AdaptiveJournal, read_status
+from tools.async_layered_paper import NET_TARGET_BLOCKED
+from tools.layered_paper import REBOUND_NET_TARGET
 from tools.run_async_live_validation import Runtime, subscription_set
 from tools.shared_feed_slots import SharedFeedSlots
 from tools.slot_control import SlotCommand, SlotControl
@@ -153,6 +155,50 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 slot.runtime._checkpoint(), self.slots.slots[slot_id].runtime._checkpoint()
             )
+
+    async def test_net_target_candidate_replays_entry_block_and_owner(self) -> None:
+        await self.seed()
+        await self.feed(
+            "feature",
+            (
+                "A",
+                [
+                    {
+                        "timestamp": (START - timedelta(minutes=15 - i)).isoformat(),
+                        "closePrice": price,
+                        "highPrice": price,
+                    }
+                    for i, price in enumerate([11.0] * 10 + [9.0] * 5 + [10.0])
+                ],
+            ),
+        )
+        await self.command(
+            SlotCommand(
+                "test-net-target",
+                "add",
+                "comparison",
+                {
+                    "capital": 100,
+                    "incumbent": BASELINE,
+                    "candidate": {**BASELINE, "policy": REBOUND_NET_TARGET},
+                },
+            ),
+        )
+        await self.book("A", 1, price=10.35)
+        runtime = self.slots.slots["comparison"].runtime
+        candidate = runtime.accounts["candidate"]
+        self.assertEqual(candidate.decisions[-1]["blocked_reason"], NET_TARGET_BLOCKED)
+        self.assertEqual(candidate.pending, {})
+        await self.book("A", 2, price=10.1)
+        await self.book("A", 4, price=10.1)
+        self.assertEqual(candidate.owners[runtime.ids["A"]][0], REBOUND_NET_TARGET)
+
+        restored = self.coordinator(self.journal)
+        self.addAsyncCleanup(restored.close)
+        await restored.restore()
+        restored_runtime = restored.slots["comparison"].runtime
+        self.assertEqual(restored_runtime._checkpoint(), runtime._checkpoint())
+        self.assertEqual(restored_runtime.accounts["candidate"].summary(), candidate.summary())
 
     async def test_add_stop_replay_keeps_independent_ledgers_and_last_marks(self) -> None:
         await self.seed()
