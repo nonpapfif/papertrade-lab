@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from tools.paper_capacity import assess
+from tools.paper_capacity import assess, strategies
 from tools.slot_control import encode
 from tools.us_adaptive_ai import ENTRY_OPTIONS
 
@@ -31,9 +31,19 @@ class Admission:
     @classmethod
     def load(cls, report: dict[str, Any], market: str, source_digest: str) -> Admission:
         if (
-            report.get("market") != market
+            not isinstance(report, dict)
+            or report.get("market") != market
+            or market not in CAPITALS
+            or not isinstance(source_digest, str)
+            or not source_digest.strip()
             or report.get("source_digest") != source_digest
             or report.get("qualification") != "recorded_feed_capacity"
+            or not isinstance(report.get("input_digest"), str)
+            or len(report["input_digest"]) != 64
+            or any(character not in "0123456789abcdef" for character in report["input_digest"])
+            or not isinstance(report.get("machine"), str)
+            or not report["machine"].strip()
+            or report.get("real_orders") is not False
         ):
             raise ValueError("Capacity evidence does not match the approved market and source")
         limit, candidates = report.get("max_slots"), report.get("candidates")
@@ -64,6 +74,8 @@ class Admission:
             configs[slot_id] = config
         if not configs:
             raise ValueError("Capacity report has no eligible strategy")
+        if candidates != strategies():
+            raise ValueError("Capacity strategies do not match the measured candidate order")
         return cls(limit, configs, fingerprint(report))
 
     def initial(self) -> list[str]:
@@ -111,6 +123,11 @@ def next_plan(
 
 
 def numeric(value: Any) -> float | None:
-    if type(value) not in (int, float) or not math.isfinite(value):
+    if type(value) not in (int, float):
+        return None
+    try:
+        if not math.isfinite(value):
+            return None
+    except OverflowError:
         return None
     return float(value)

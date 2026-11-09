@@ -69,6 +69,12 @@ The complete repository suite is validated separately at deployment. Some legacy
 their own macOS sandbox, which cannot run inside the outer offline sandbox; these are not claimed
 as executed in automatic cycles. The sandbox boundary test itself is also checked on the host.
 Optional websocket tests explicitly skip when their pinned dependency is not installed.
+The recurring-paper offline suite lists seven additional host-only checks in
+`host_checks_not_run`. Two open a loopback WebSocket and five launch detached scheduler
+children whose identities use macOS `/bin/ps`. All other scheduler tests run offline.
+The list records checks that were outside the offline job, with no inferred pass or skip.
+Run these checks separately on the host against the exact reviewed source and retain that
+result with the deployment validation. The offline network and credential restrictions remain in force.
 
 Changes use an isolated branch/worktree. Failed implementations remain in that worktree for the
 next correction. After tests and Astra approval, the controller commits, pushes, creates a PR,

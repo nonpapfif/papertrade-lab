@@ -20,10 +20,12 @@ from papertrade.ai import DISABLED_FEATURES, codex_environment, parse_codex_even
 from papertrade.usage import read_metadata
 from tools.autotest_jobs import atomic_json, poll_job, start_job
 from tools.supervisor_scopes import (
+    PARTITIONED_TEST_MODULES,
     RECURRING_CONTRACT,
     RECURRING_EDITABLE,
     RECURRING_MODULES,
     RECURRING_REQUIREMENTS,
+    partition_recurring_tests,
 )
 
 MODELS = {
@@ -142,6 +144,7 @@ PROTECTED = (
     "tools/kr_comparison_ai.py",
     "tests/test_autotest_jobs.py",
     "tests/test_autotest_supervisor.py",
+    "tests/test_recurring_supervisor.py",
 )
 REGRESSION_MODULES = (
     "tests.test_kr_paper_comparison",
@@ -476,6 +479,11 @@ class Supervisor:
             "last_review": self.state.get("review"),
             "plan": self.state.get("plan"),
             "test_jobs": self.state.get("test_jobs", []),
+            **(
+                {"host_checks_not_run": self.state.get("host_checks_not_run", [])}
+                if self.scope == "recurring-paper"
+                else {}
+            ),
             "live_run": self.state.get("live_run"),
             "implementation": self.state.get("worker"),
             "source_digest": tree_digest(self.worktree),
@@ -772,6 +780,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         modules = list(REGRESSION_MODULES)
         if self.scope == "recurring-paper":
             modules.extend(RECURRING_MODULES)
+            modules.append("tests.test_recurring_supervisor")
             modules.extend(
                 "tests." + path.stem
                 for path in (self.worktree / "tests").glob("test_paper_campaign*.py")
@@ -788,7 +797,21 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 name
                 for name in sorted(set(targeted))
                 if ".".join(name.split(".")[:2]) not in modules
+                or (
+                    self.scope == "recurring-paper"
+                    and ".".join(name.split(".")[:2]) in PARTITIONED_TEST_MODULES
+                )
             )
+        host_checks_not_run: list[str] = []
+        if self.scope == "recurring-paper":
+            modules, host_checks_not_run = partition_recurring_tests(modules)
+            if not modules and host_checks_not_run:
+                self.state["host_checks_not_run"] = host_checks_not_run
+                self.save()
+                raise ValueError(
+                    "Requested tests require separate host validation: "
+                    + ", ".join(host_checks_not_run)
+                )
         tests = [[sys.executable, "-m", "unittest", "-q", *modules]]
         if experiment:
             path = self.worktree / experiment
@@ -838,6 +861,11 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             tested_digest=digest,
             test_index=0,
             test_signature=signature,
+            **(
+                {"host_checks_not_run": host_checks_not_run}
+                if self.scope == "recurring-paper"
+                else {}
+            ),
         )
 
     def test_step(self) -> None:
