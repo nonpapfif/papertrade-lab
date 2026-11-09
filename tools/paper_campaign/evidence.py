@@ -10,13 +10,63 @@ from tools.adaptive_journal import AdaptiveJournal
 from tools.paper_campaign.policy import numeric
 
 
-def compact_rows(status: dict[str, Any], currency: str) -> dict[str, Any]:
+def account_eligible(account: dict[str, Any]) -> bool:
+    if "comparison_eligible" in account:
+        return account["comparison_eligible"] is True
+    # Legacy checkpoints without open positions need no held quote.
+    return type(account.get("open_positions")) is int and account["open_positions"] == 0
+
+
+def _health_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.utcoffset() is not None else None
+
+
+def _live_quote_exclusion(account: dict[str, Any], as_of: datetime) -> str | None:
+    cut = _health_time(account.get("quote_health_as_of"))
+    if cut is None:
+        return "missing_quote_health"
+    if cut > as_of:
+        return "future_quote_health"
+    positions = account.get("open_positions")
+    if type(positions) is not int or positions < 0:
+        return "missing_quote_health"
+    if positions == 0:
+        return None
+    expiry = _health_time(account.get("comparison_valid_until"))
+    if expiry is None or expiry < cut:
+        return "missing_quote_health"
+    return "stale_quote_health" if as_of > expiry else None
+
+
+def compact_rows(
+    status: dict[str, Any], currency: str, *, as_of: datetime | None = None
+) -> dict[str, Any]:
     slots = {}
     for row in status.get("shared_slots", []):
         accounts = {}
         for name, details in row.get("comparison", {}).get("accounts", {}).items():
             paper = details.get("paper") or {}
             account = paper.get("account", {})
+            eligible = account_eligible(account)
+            exclusions = account.get("comparison_exclusions", [])
+            reason = (
+                _live_quote_exclusion(account, as_of) if as_of is not None and eligible else None
+            )
+            if reason is not None or not eligible and not exclusions:
+                exclusions = [
+                    {
+                        "symbol": None,
+                        "reason": reason or "missing_quote_health",
+                        "source_at": None,
+                        "age_seconds": None,
+                    }
+                ]
             accounts[name] = {
                 "equity": numeric(account.get("equity")),
                 "initial_equity": numeric(account.get("initial_equity")),
@@ -37,12 +87,42 @@ def compact_rows(status: dict[str, Any], currency: str) -> dict[str, Any]:
                 "max_drawdown_pct": numeric(account.get("max_drawdown_pct")),
                 "open_positions": account.get("open_positions"),
                 "stale_open_positions": account.get("stale_open_positions"),
+                "comparison_eligible": eligible and reason is None,
+                "comparison_exclusions": exclusions,
+                "quote_health_as_of": account.get("quote_health_as_of"),
+                "comparison_valid_until": account.get("comparison_valid_until"),
                 "pending_intents": paper.get("pending_intents"),
                 "observations": details.get("observations", 0),
                 "book_observations": details.get("book_observations", 0),
             }
         slots[row["slot_id"]] = accounts
     return slots
+
+
+def review_metrics(accounts: dict[str, Any], *, comparable_pair: bool = True) -> dict[str, Any]:
+    return {
+        name: (
+            account
+            if comparable_pair and account_eligible(account)
+            else {
+                key: value
+                for key, value in account.items()
+                if key
+                in {
+                    "open_positions",
+                    "stale_open_positions",
+                    "pending_intents",
+                    "comparison_eligible",
+                    "comparison_exclusions",
+                    "quote_health_as_of",
+                    "comparison_valid_until",
+                    "observations",
+                    "book_observations",
+                }
+            }
+        )
+        for name, account in accounts.items()
+    }
 
 
 def aggregate(history: list[dict[str, Any]]) -> dict[str, Any]:
@@ -64,6 +144,10 @@ def aggregate(history: list[dict[str, Any]]) -> dict[str, Any]:
             prior = stats["latest"]
             current = accounts["candidate"]
             prior_candidate = prior.get("candidate", {})
+            end_eligible = all(account_eligible(account) for account in accounts.values())
+            baseline_eligible = all(account_eligible(account) for account in prior.values())
+            stats["comparison_eligible"] = end_eligible
+            stats["return_baseline_eligible"] = baseline_eligible
             stats["has_exposure"] = any(
                 account["open_positions"] != 0 or account["pending_intents"] != 0
                 for account in accounts.values()
@@ -71,7 +155,7 @@ def aggregate(history: list[dict[str, Any]]) -> dict[str, Any]:
             partial = slot in session.get("new_branches", []) or slot in session.get(
                 "partial_slots", []
             )
-            if session.get("qualified") and not partial:
+            if session.get("qualified") and not partial and end_eligible and baseline_eligible:
                 stats["qualified_sessions"] += 1
                 stats["qualified_closed_trades"] += max(
                     0, current["closed"] - prior_candidate.get("closed", 0)

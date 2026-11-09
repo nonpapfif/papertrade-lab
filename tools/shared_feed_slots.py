@@ -164,6 +164,11 @@ class SharedFeedSlots:
     def protected(self) -> set[str]:
         return {symbol for _, slot in self.active() for symbol in slot.runtime.protected()}
 
+    def stale_held_symbols(self, at: str) -> set[str]:
+        return {
+            symbol for _, slot in self.active() for symbol in slot.runtime.stale_held_symbols(at)
+        }
+
     def publish(self, kind: str, payload: Any) -> None:
         self.sequence += 1
         self.queue.put_nowait(
@@ -300,6 +305,9 @@ class SharedFeedSlots:
         current = {key: getattr(account, key) for key in ENTRY_OPTIONS}
         if current == spec["candidate"]:
             return "rejected", {"reason": "candidate_policy_unchanged"}
+        health = account.quote_health(entry["at"])
+        if not health["comparison_eligible"]:
+            return "rejected", {"reason": "source_account_quote_ineligible", **health}
 
         def record(kind: str, **payload: Any) -> None:
             self.record(kind, slot_id=command.slot_id, **payload)
@@ -330,6 +338,7 @@ class SharedFeedSlots:
                 "closed": account.book.closed,
                 "closed_net_realized": account.book.closed_net,
                 "max_drawdown_pct": 100 * account.book.drawdown,
+                **health,
             },
             **({"evidence_sequence": evidence_sequence} if evidence_sequence is not None else {}),
         }
@@ -529,7 +538,7 @@ class SharedFeedSlots:
         for slot in self.slots.values():
             await slot.runtime.close()
 
-    def status(self) -> dict[str, Any]:
+    def status(self, at: str | None = None) -> dict[str, Any]:
         rows = [
             {
                 "slot_id": slot_id,
@@ -544,7 +553,7 @@ class SharedFeedSlots:
                     if slot.continued_from is not None
                     else {}
                 ),
-                **slot.runtime.status(),
+                **slot.runtime.status(slot.stopped_at or at),
             }
             for slot_id, slot in self.slots.items()
         ]

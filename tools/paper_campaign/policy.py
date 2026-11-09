@@ -93,25 +93,33 @@ def next_plan(
     chosen = review["next_slots"]
     chosen_ids = set(chosen)
     eligible = (admission.candidates.keys() | carried) - (retired or set())
+    previous_ids = set(previous)
+    excluded = {
+        slot
+        for slot, stats in statistics.items()
+        if stats.get("comparison_eligible") is False
+        or stats.get("return_baseline_eligible") is False
+    }
     if (
         not 1 <= len(chosen) <= admission.max_slots
         or len(chosen_ids) != len(chosen)
         or not chosen_ids <= eligible
+        or (chosen_ids - previous_ids) & excluded
         or admission.initial()[0] not in chosen
     ):
         raise ValueError("Review returned an invalid capacity-bounded plan")
-    previous_ids = set(previous)
     for slot in previous_ids - chosen_ids:
         stats = statistics.get(slot, {})
         if (
             stats.get("has_exposure", True)
+            or slot in excluded
             or stats.get("qualified_sessions", 0) < MIN_QUALIFIED_SESSIONS
             or stats.get("qualified_closed_trades", 0) < MIN_CLOSED_TRADES
         ):
             raise ValueError("Review tried to remove a protected or insufficiently tested slot")
     untested = {
         slot
-        for slot in eligible
+        for slot in eligible - excluded
         if statistics.get(slot, {}).get("qualified_sessions", 0) < MIN_QUALIFIED_SESSIONS
     }
     if untested - chosen_ids and (

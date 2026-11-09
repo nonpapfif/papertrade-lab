@@ -273,15 +273,35 @@ class LayeredPaper:
         self.seen.add(event_id)
         self.last_at = at
 
-    def summary(self) -> dict[str, Any]:
-        if self.last_at is None:
+    def summary(self, at: str | None = None) -> dict[str, Any]:
+        at = self.last_at if at is None else at
+        if at is None:
             raise ValueError("No account event has been processed")
+        cutoff = datetime.fromisoformat(at)
+        mark_times: dict[int, str] = {}
+        mark_ages: dict[int, float] = {}
+        for symbol in self.book.positions:
+            stamp = self.times.get(symbol)
+            if not isinstance(stamp, str):
+                continue
+            try:
+                mark_ages[symbol] = (cutoff - datetime.fromisoformat(stamp)).total_seconds()
+            except (ValueError, TypeError):
+                continue
+            mark_times[symbol] = stamp
+        account = self.book.summary(
+            self.prices, {symbol: mark_times.get(symbol, "") for symbol in self.book.positions}, at
+        )
+        if mark_ages:
+            account["oldest_open_quote_at"] = mark_times[max(mark_ages, key=mark_ages.__getitem__)]
+        else:
+            account["oldest_open_quote_at"] = None
         suffix = self.book.currency_suffix
         return {
-            "account": self.book.summary(self.prices, self.times, self.last_at),
+            "account": account,
             "realized_by_strategy": self.realized_by_strategy,
             "owned_positions": {str(s): owner[0] for s, owner in self.owners.items()},
-            "positions_as_of": self.last_at,
+            "positions_as_of": at,
             "positions": {
                 str(symbol): {
                     "strategy": self.owners[symbol][0],
@@ -290,11 +310,8 @@ class LayeredPaper:
                     f"entry_cost_{suffix}": position.quantity * position.entry,
                     f"remaining_entry_fees_{suffix}": self.book.entry_fees[symbol],
                     "mark_price": self.prices[symbol],
-                    "mark_at": self.times[symbol],
-                    "mark_age_seconds": (
-                        datetime.fromisoformat(self.last_at)
-                        - datetime.fromisoformat(self.times[symbol])
-                    ).total_seconds(),
+                    "mark_at": mark_times.get(symbol),
+                    "mark_age_seconds": mark_ages.get(symbol),
                     f"market_value_{suffix}": position.quantity * self.prices[symbol],
                     f"unrealized_{suffix}": position.quantity
                     * (self.prices[symbol] - position.entry),

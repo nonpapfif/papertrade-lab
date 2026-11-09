@@ -7,7 +7,7 @@ import copy
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -510,9 +510,56 @@ class AsyncLayeredPaper(LayeredPaper):
         if self.book.cash < -1e-9 or self.reserved_cash > self.book.cash + 1e-9:
             raise RuntimeError("Unfunded paper execution")
 
-    def summary(self) -> dict[str, Any]:
+    def quote_health(self, at: str | None = None) -> dict[str, Any]:
+        """Evaluate held marks against the account's quote-age contract at a fixed cut."""
+        at = self.last_at if at is None else at
+        cutoff = seconds(at) if at is not None else None
+        exclusions: list[dict[str, Any]] = []
+        valid_until = math.inf
+        max_age = self.context.schedule["max_quote_age_seconds"]
+        for symbol in sorted(self.book.positions):
+            quote = self._books.get(symbol)
+            source_at = quote.get("timestamp") if quote is not None else self.times.get(symbol)
+            age = None
+            try:
+                if cutoff is not None and isinstance(source_at, str):
+                    age = cutoff - seconds(source_at)
+                if quote is None:
+                    reason = "quote_unusable" if symbol in self._source_times else "quote_missing"
+                elif age is None or quote.get("currency") != self.context.market.currency:
+                    reason = "quote_unusable"
+                elif age < 0:
+                    reason = "quote_future"
+                elif age > max_age:
+                    reason = "quote_stale"
+                elif any(
+                    not any(float(row["volume"]) >= 1 for row in quote[side])
+                    for side in ("bids", "asks")
+                ):
+                    reason = "quote_unusable"
+                else:
+                    assert isinstance(source_at, str)
+                    valid_until = min(valid_until, seconds(source_at) + max_age)
+                    continue
+            except (KeyError, TypeError, ValueError, OverflowError):
+                reason = "quote_unusable"
+            exclusions.append(
+                {"symbol": symbol, "reason": reason, "source_at": source_at, "age_seconds": age}
+            )
+        return {
+            "comparison_eligible": not exclusions,
+            "comparison_exclusions": exclusions,
+            "quote_health_as_of": at,
+            "comparison_valid_until": datetime.fromtimestamp(valid_until, UTC).isoformat()
+            if not exclusions and math.isfinite(valid_until)
+            else None,
+        }
+
+    def summary(self, at: str | None = None) -> dict[str, Any]:
+        previous_frame = self.context.frame
+        previous_depth_at, previous_depth_used = self.book.depth_at, self.book.depth_used
         self.context.frame = {
-            "at": self.last_at,
+            "at": self.last_at if at is None else at,
             "orderbooks": self._books,
             "fx": self._fx[0],
             "fx_at": self._fx[1],
@@ -520,18 +567,15 @@ class AsyncLayeredPaper(LayeredPaper):
             "fx_valid_until": self._fx[3],
             "fx_provider_validity_required": self._fx[4],
         }
-        result = super().summary()
-        assert self.last_at is not None
-        cutoff = seconds(self.last_at)
-        result["account"]["stale_open_positions"] = sum(
-            not 0
-            <= cutoff - seconds(self.times[symbol])
-            <= self.context.schedule["max_quote_age_seconds"]
-            for symbol in self.book.positions
-        )
-        result["account"]["oldest_open_quote_at"] = min(
-            (self.times[symbol] for symbol in self.book.positions), key=seconds, default=None
-        )
+        try:
+            result = super().summary(at)
+        finally:
+            self.context.frame = previous_frame
+            self.book.depth_at, self.book.depth_used = previous_depth_at, previous_depth_used
+        health = self.quote_health(at)
+        result.update(health)
+        result["account"].update(health)
+        result["account"]["stale_open_positions"] = len(health["comparison_exclusions"])
         result["account"]["mark_basis"] = "book_midpoint_not_liquidated"
         result.update(
             reserved_cash=self.reserved_cash,
