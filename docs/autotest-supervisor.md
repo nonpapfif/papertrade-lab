@@ -130,3 +130,22 @@ Completion requires controller-owned passing checks and source-matching verified
 evidence in the inherited directory. That evidence does not claim future sessions completed.
 The market service is independent and remains active after the engineering supervisor finishes.
 Supervisor authority, broker/auth machinery and scope definitions remain protected from workers.
+
+## Concurrent refactor engineering scope
+
+Use `--scope concurrent-refactor` with a new audit directory and pass the failed run as
+`--inherited` for read-only diagnostics. The [R1-R4 contract](concurrent-refactor.md) governs this
+offline campaign. It starts with Astra review and uses Sol for code changes. Live plans and live
+launches are forbidden in this scope. The earlier finite and recurring deployment gates still
+apply to their own scopes.
+
+The runner and explicit data, journal, slot and campaign modules can change for this scope.
+Supervisor, broker/auth and execution-boundary protections still apply. Python uses the recurring
+test partition and retains introduced regression files across PR cycles. The offline suite must
+execute at least one test without skips. Host checks excluded by the partition are listed separately.
+Use the repository's pinned optional WebSocket dependency for applicable offline tests.
+
+Completion requires source-matched test and Astra exit records from the current cycle, all R1-R4
+requirements, a clean worktree and matching published source on local and remote-tracking master.
+The controller writes `refactor-report.json` with `live_validation_pending: true`. The report
+records offline evidence and excluded host checks. A later live validation is separate.
