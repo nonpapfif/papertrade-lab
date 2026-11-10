@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from tools.async_layered_paper import AsyncLayeredPaper, Intent
-from tools.runtime_audit import RuntimeAudit
+from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
 
 MODULE = "account_evaluation"
 EXECUTE = "execute"
+AUDIT_STORAGE_FAILED = "audit_storage_failed"
 ACCOUNT_HISTORY = ("intents", "outcomes", "decisions")
 BOOK_HISTORY = ("trades", "curve", "order_attempts")
 SYMBOL_FIELDS = ("prices", "times", "_source_times", "_receipts", "_books")
@@ -133,6 +134,35 @@ class _Patch:
         ):
             raise AccountProtocolError("Malformed account state patch")
 
+    def accepted_mark(
+        self, action: AccountAction, previous: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        payload = action.payload
+        book = self.symbol_values.get("_books")
+        if action.kind != "book" or not isinstance(payload, dict) or book is None or book == previous:
+            return None
+        if not self.processed or book != payload["book"]:
+            raise AccountProtocolError("Accepted account quote differs from dispatch")
+        midpoint = self.symbol_values["prices"]
+        equity, realized, fees = (self.book[key] for key in ("equity", "realized", "fee_totals"))
+        if not isinstance(fees, dict) or any(
+            type(value) not in (int, float) or not math.isfinite(value)
+            for value in (midpoint, equity, realized, *fees.values())
+        ):
+            raise AccountProtocolError("Invalid accepted account valuation")
+        return {
+            "symbol": payload["symbol"],
+            "event_id": payload["id"],
+            "source_at": book["timestamp"],
+            "received_at": action.published_at or payload["received_at"],
+            "decision_at": payload["received_at"],
+            "currency": book["currency"],
+            "midpoint": midpoint,
+            "equity": equity,
+            "realized": realized,
+            "fees": fees.copy(),
+        }
+
     def apply(self, account: AsyncLayeredPaper) -> None:
         vars(account).update(self.account)
         for key, value in self.book.items():
@@ -220,6 +250,18 @@ def _offsets(target: object, fields: tuple[str, ...]) -> dict[str, int]:
     return {key: len(getattr(target, key)) for key in fields}
 
 
+def _same_mark(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_mark(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, float):
+        return actual.hex() == expected.hex()
+    return actual == expected
+
+
 async def _evaluate(account: AsyncLayeredPaper, command: _Command) -> AccountResult:
     action = command.action
     account.policy, account.selection, account.allocation, account.entry_policy_version = (
@@ -229,25 +271,10 @@ async def _evaluate(account: AsyncLayeredPaper, command: _Command) -> AccountRes
     book_offsets = _offsets(account.book, BOOK_HISTORY)
     started_ns, cpu_start = time.perf_counter_ns(), time.process_time_ns()
     payload = action.payload
-    accepted_mark = None
+    previous = None
     if action.kind == "book" and isinstance(payload, dict):
-        symbol = payload["symbol"]
-        previous = account._books.get(symbol)
+        previous = account._books.get(payload["symbol"])
         await account.submit(payload)
-        book = account._books.get(symbol)
-        if book is not None and book is not previous:
-            accepted_mark = {
-                "symbol": symbol,
-                "event_id": payload["id"],
-                "source_at": book["timestamp"],
-                "received_at": action.published_at or payload["received_at"],
-                "decision_at": payload["received_at"],
-                "currency": book["currency"],
-                "midpoint": account.prices[symbol],
-                "equity": account.book.equity,
-                "realized": account.book.realized,
-                "fees": account.book.fee_totals.copy(),
-            }
     elif action.kind == "advance" and isinstance(payload, str):
         await account.advance(payload)
     elif action.kind == "cancel" and isinstance(payload, str):
@@ -255,6 +282,7 @@ async def _evaluate(account: AsyncLayeredPaper, command: _Command) -> AccountRes
     else:
         raise AccountProtocolError("Malformed account action")
     patch = _Patch.capture(account, action, account_offsets, book_offsets)
+    accepted_mark = patch.accepted_mark(action, previous)
     cpu_ns = time.process_time_ns() - cpu_start
     return AccountResult(
         command.account_id,
@@ -327,6 +355,8 @@ async def _serve(
                     progress=command.command_sequence,
                     pid=pid,
                 )
+                if not audit.healthy:
+                    raise RuntimeAuditError("Account worker audit storage is unhealthy")
             pipe.send(result)
             ack = pipe.recv()
             if not isinstance(ack, _Ack) or ack.command_sequence != command.command_sequence:
@@ -344,8 +374,10 @@ async def _serve(
         return
     except Exception as error:  # noqa: BLE001 - Isolate every child failure at the process boundary.
         code = "command_rejected" if isinstance(error, AccountProtocolError) else "execution_failed"
-        if audit:
+        if audit and audit.healthy:
             audit.report_exception(MODULE, code, error, context)
+        if audit and not audit.healthy:
+            code = AUDIT_STORAGE_FAILED
         pipe.send(_Fault(account_id, code, type(error).__name__))
     finally:
         try:
@@ -419,6 +451,7 @@ class AccountExecutor:
         self._results: dict[str, AccountResult] = {}
         self._rollback: dict[str, tuple[_Patch, dict[str, int], dict[str, int]]] = {}
         self._busy = False
+        self._child_audit_failed = False
         self._incidents: set[tuple[str, str]] = set()
 
     def _identity(self, name: str) -> str:
@@ -429,6 +462,8 @@ class AccountExecutor:
         return {name: worker.process.pid for name, worker in self._workers.items()}
 
     def assert_committable(self) -> None:
+        if self._child_audit_failed:
+            raise AccountWorkerError("Account worker audit failed; fresh journal replay required")
         if self.audit and not self.audit.healthy:
             raise AccountWorkerError("Account audit storage is unhealthy")
 
@@ -505,6 +540,8 @@ class AccountExecutor:
         if isinstance(result, _Fault):
             if result.account_id != command.account_id:
                 raise AccountProtocolError("Account fault identity mismatch")
+            if result.code == AUDIT_STORAGE_FAILED:
+                self._child_audit_failed = True
             raise AccountWorkerError(
                 f"Account worker {result.code}: {name} ({result.exception_type})"
             )
@@ -523,22 +560,22 @@ class AccountExecutor:
         ):
             raise AccountProtocolError(f"Malformed or unordered account result: {name}")
         try:
-            result.patch.check(self.accounts[name], command.action)
+            account = self.accounts[name]
+            result.patch.check(account, command.action)
             expected_protected = (
                 result.patch.account["pending"].keys() | result.patch.book["positions"].keys()
             )
             if result.protected_symbols != expected_protected:
                 raise AccountProtocolError(f"Account protection mismatch: {name}")
-            if result.accepted_mark is not None:
-                book = result.patch.symbol_values["_books"]
-                if (
-                    command.action.kind != "book"
-                    or result.accepted_mark["source_at"] != book["timestamp"]
-                    or result.accepted_mark["symbol"] != result.patch.symbol
-                    or result.accepted_mark["event_id"] != result.patch.event_id
-                ):
-                    raise AccountProtocolError(f"Account mark provenance mismatch: {name}")
-        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            symbol = result.patch.symbol
+            previous = account._books.get(symbol) if symbol is not None else None
+            expected_mark = result.patch.accepted_mark(command.action, previous)
+            if (
+                expected_mark is not None
+                and expected_mark["fees"].keys() != account.book.fee_totals.keys()
+            ) or not _same_mark(result.accepted_mark, expected_mark):
+                raise AccountProtocolError(f"Account mark mismatch: {name}")
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as error:
             raise AccountProtocolError(f"Malformed account result: {name}") from error
         return result
 
@@ -613,7 +650,11 @@ class AccountExecutor:
                     else "dispatch_failed"
                 )
                 for name in commands:
-                    self._record(code, name, sequence, error)
+                    try:
+                        self._record(code, name, sequence, error)
+                    except RuntimeAuditError:
+                        error.add_note("The runtime audit could not persist the dispatch failure.")
+                        break
             raise
         finally:
             interrupt.close()

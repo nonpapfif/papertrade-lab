@@ -68,6 +68,12 @@ warning filters on exit. Diagnostic records keep the source basename, line and c
 exception type. Application messages and arguments stay outside the audit. A logging call that
 Python filters before creating a record does not emit a diagnostic.
 
+The scoped `warnings.warn` and `warnings.warn_explicit` functions record warnings raised as
+errors before application code can catch them. Previously bound aliases and C-extension
+emitters bypass those hooks. The display hook and scope-exit handler still capture displayed
+warnings and escaping warning exceptions from those sources. Internally caught exceptions
+from those sources can be missed.
+
 Normal queue waits, receive polling, client EOF, expected task cancellation and market or calendar
 cutoffs are control flow. Rejected data, protocol violations, unexpected disconnects and failed
 cleanup are recorded separately.

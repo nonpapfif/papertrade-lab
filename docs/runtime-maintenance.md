@@ -54,8 +54,12 @@ The runtime captures Python warnings, created logging diagnostics, unhandled asy
 thread failures within a scoped process owner. Records contain safe origin, line, category and
 exception metadata. Raw diagnostic messages, credentials and authentication headers are omitted.
 Hooks and warning filters are restored on exit. Existing warning-as-error policies retain their
-first-match precedence and exception behavior. Normal cancellation, polling timeouts and orderly
-peer shutdown remain control flow, not incident spam. Unexpected cleanup failures are recorded
+first-match precedence and exception behavior. Calls through the scoped `warnings.warn` and
+`warnings.warn_explicit` functions are recorded when their warning is raised, even if the caller
+catches it. Previously bound aliases and C-extension emitters bypass those function hooks.
+Their displayed warnings and warning exceptions escaping the diagnostic scope remain visible,
+while exceptions caught internally at those bypasses can be missed. Normal cancellation, polling
+timeouts and orderly peer shutdown remain control flow. Unexpected cleanup failures are recorded
 without replacing the original exception.
 
 | Runtime role | Error and warning owner |

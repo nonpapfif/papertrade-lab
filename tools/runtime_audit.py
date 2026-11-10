@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import operator
 import os
 import re
 import sqlite3
@@ -19,7 +20,8 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
+from types import CodeType, FrameType
 from typing import Any, Literal, Protocol, cast
 
 from papertrade.audit import sanitize
@@ -169,6 +171,50 @@ def _diagnostic_context(category: str, filename: str, lineno: int) -> dict[str, 
     return {"event_id": identity, "event_type": category, "origin": origin, "line": lineno}
 
 
+def _importlib_warning_frame(frame: FrameType) -> bool:
+    filename = frame.f_code.co_filename
+    return "importlib" in filename and "_bootstrap" in filename
+
+
+def _warning_frame_skipped(frame: FrameType, prefixes: tuple[str, ...]) -> bool:
+    # CPython 3.12 checks prefixes before the last character, so a full filename does not skip.
+    return _importlib_warning_frame(frame) or frame.f_code.co_filename.startswith(
+        prefixes, 0, -1
+    )
+
+
+def _warning_frame(
+    frame: FrameType | None, level: int, prefixes: tuple[str, ...], *, internal: bool
+) -> FrameType | None:
+    for _ in range(level - 1):
+        if frame is None:
+            break
+        frame = frame.f_back
+        while not internal and frame is not None and _warning_frame_skipped(frame, prefixes):
+            frame = frame.f_back
+    return frame
+
+
+def _wrapped_warning(error: Warning, emitters: tuple[CodeType, CodeType], scope: object) -> bool:
+    tb = error.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code in emitters and tb.tb_frame.f_locals.get("audited_scope") is scope:
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def _warning_escape_context(error: Warning) -> dict[str, str | int] | None:
+    tb = error.__traceback__
+    if tb is None:
+        return None
+    # Skip the context manager's yield and stop where a reused exception joins old frames.
+    tb = tb.tb_next or tb
+    while tb.tb_next is not None and tb.tb_next.tb_frame.f_back is tb.tb_frame:
+        tb = tb.tb_next
+    return _diagnostic_context(type(error).__name__, tb.tb_frame.f_code.co_filename, tb.tb_lineno)
+
+
 @contextmanager
 def _forward_diagnostic() -> Iterator[None]:
     forwarding = getattr(_diagnostics, "forwarding", False)
@@ -247,6 +293,7 @@ class RuntimeAudit:
         self._operation_lanes: dict[tuple[str, str], set[int]] = {}
         self._emergency_sink = emergency
         self._storage_failed = Event()
+        self._publication_lock = RLock()
         with self._transaction("initialize", initialize=True) as db:
             for statement in _SCHEMA.strip().rstrip(";").split(";"):
                 db.execute(statement)
@@ -263,8 +310,15 @@ class RuntimeAudit:
     def healthy(self) -> bool:
         return not self._storage_failed.is_set()
 
+    @contextmanager
+    def publication_guard(self) -> Iterator[None]:
+        """Serialize synchronous publication with local audit transactions."""
+        with self._publication_lock:
+            if not self.healthy:
+                raise RuntimeAuditError("Runtime audit storage is unhealthy")
+            yield
+
     def _emergency(self, action: str, error: OSError | sqlite3.Error) -> None:
-        self._storage_failed.set()
         event = json.dumps(
             {
                 "run_id": self.run_id,
@@ -292,20 +346,26 @@ class RuntimeAudit:
     def _transaction(
         self, action: str, *, initialize: bool = False
     ) -> Iterator[sqlite3.Connection]:
-        try:
-            with closing(sqlite3.connect(self.path, timeout=self._busy_timeout)) as db, db:
-                db.row_factory = sqlite3.Row
-                if (
-                    initialize
-                    and db.execute("PRAGMA journal_mode").fetchone()[0] != "wal"
-                    and db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal"
-                ):
-                    raise sqlite3.OperationalError("Could not enable WAL for runtime audit")
-                db.execute("BEGIN IMMEDIATE")
-                yield db
-        except (sqlite3.Error, OSError) as error:
-            self._emergency(action, error)
-            raise RuntimeAuditError(f"Runtime audit storage failed during {action}") from None
+        # Acquire the publication lock before opening either SQLite write transaction.
+        with self._publication_lock:
+            try:
+                with closing(sqlite3.connect(self.path, timeout=self._busy_timeout)) as db, db:
+                    db.row_factory = sqlite3.Row
+                    if (
+                        initialize
+                        and db.execute("PRAGMA journal_mode").fetchone()[0] != "wal"
+                        and db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal"
+                    ):
+                        raise sqlite3.OperationalError("Could not enable WAL for runtime audit")
+                    db.execute("BEGIN IMMEDIATE")
+                    yield db
+            except (sqlite3.Error, OSError) as error:
+                self._storage_failed.set()
+                failure = error
+            else:
+                return
+        self._emergency(action, failure)
+        raise RuntimeAuditError(f"Runtime audit storage failed during {action}") from None
 
     def _record(
         self,
@@ -494,10 +554,16 @@ class RuntimeAudit:
                 raise RuntimeError("A different task owns this process diagnostic scope")
             depth = existing[1] + 1 if existing is not None else 1
             _diagnostic_owners[pid] = (owner, depth)
-        # A new scope is a new operation even if it reuses a prior warning instance.
+        if depth == 1:
+            _diagnostics.warning_emitters = warnings.warn, warnings.warn_explicit
+        scope = object()
+        # A new scope is a new operation for warnings raised outside the hooked emitters.
         _diagnostics.last_warning_error = None
         try:
-            with self._capture_runtime_failures(component), warnings.catch_warnings():
+            with (
+                self._capture_runtime_failures(component, scope) as emitters,
+                warnings.catch_warnings(),
+            ):
                 # Keep first-match precedence, including nonfatal filters before error filters.
                 filters = cast(list[tuple[Any, ...]], warnings.filters)
                 filters[:] = [
@@ -512,37 +578,116 @@ class RuntimeAudit:
                 except Warning as error:
                     if _diagnostics.last_warning_error is not error:
                         _diagnostics.last_warning_error = error
-                        frames = traceback.extract_tb(error.__traceback__, limit=-1)
-                        context = (
-                            _diagnostic_context(
-                                type(error).__name__,
-                                frames[0].filename,
-                                frames[0].lineno or 0,
+                        if not _wrapped_warning(error, emitters, scope):
+                            self.report_exception(
+                                component, "python_warning", error, _warning_escape_context(error)
                             )
-                            if frames
-                            else None
-                        )
-                        self.report_exception(component, "python_warning", error, context)
                     raise
         finally:
             with _diagnostic_lock:
                 if depth == 1:
                     del _diagnostic_owners[pid]
                     del _diagnostics.last_warning_error
+                    del _diagnostics.warning_emitters
                 else:
                     _diagnostic_owners[pid] = (owner, depth - 1)
 
     @contextmanager
-    def _capture_runtime_failures(self, component: str) -> Iterator[None]:
+    def _capture_runtime_failures(
+        self, component: str, scope: object
+    ) -> Iterator[tuple[CodeType, CodeType]]:
         pid = os.getpid()
         previous_log_factory = logging.getLogRecordFactory()
         previous_warning = warnings.showwarning
+        previous_warn, previous_explicit = warnings.warn, warnings.warn_explicit
+        native_warn, native_explicit = _diagnostics.warning_emitters
         previous_thread = threading.excepthook
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         previous_async = loop.get_exception_handler() if loop is not None else None
+
+        def warn(
+            message: Warning | str,
+            category: type[Warning] | None = None,
+            stacklevel: int = 1,
+            source: Any = None,
+            *,
+            skip_file_prefixes: tuple[str, ...] = (),
+        ) -> None:
+            stacklevel = operator.index(stacklevel)
+            level = max(stacklevel, 2 if skip_file_prefixes else 1)
+            caller = sys._getframe(1)
+            valid_prefixes = isinstance(skip_file_prefixes, tuple) and all(
+                isinstance(prefix, str) for prefix in skip_file_prefixes
+            )
+            internal = _importlib_warning_frame(caller)
+            target = _warning_frame(
+                caller, level, skip_file_prefixes if valid_prefixes else (), internal=internal
+            )
+            filename, lineno = (
+                (target.f_code.co_filename, target.f_lineno) if target is not None else ("sys", 1)
+            )
+            valid_level = -sys.maxsize - 1 <= stacklevel <= sys.maxsize
+            valid_category = (
+                isinstance(message, Warning)
+                or category is None
+                or (isinstance(category, type) and issubclass(category, Warning))
+            )
+            try:
+                if internal and valid_prefixes and valid_level and valid_category:
+                    # CPython uses a raw frame count when warn is called directly from importlib.
+                    # Forward that frame's module and registry without the wrapper's stack frame.
+                    globals_ = target.f_globals if target is not None else vars(sys)
+                    module = globals_.get("__name__", "<string>")
+                    if module is not None and not isinstance(module, str):
+                        module = "<string>"
+                    native_explicit(
+                        message, UserWarning if category is None else category, filename, lineno,
+                        module=module, registry=globals_.setdefault("__warningregistry__", {}),
+                        source=source,
+                    )
+                else:
+                    # The native external-frame count can already skip our caller by prefix.
+                    caller_skipped = valid_prefixes and _warning_frame_skipped(
+                        caller, skip_file_prefixes
+                    )
+                    forwarded = (
+                        min(level + (not caller_skipped), sys.maxsize) if valid_level else stacklevel
+                    )
+                    native_warn(
+                        message, category, forwarded, source, skip_file_prefixes=skip_file_prefixes
+                    )
+            except Warning as error:
+                audited_scope = scope if os.getpid() == pid and warnings.warn is warn else None
+                if audited_scope is not None:
+                    self.report_exception(
+                        component, "python_warning", error,
+                        _diagnostic_context(type(error).__name__, filename, lineno),
+                    )
+                raise
+
+        def warn_explicit(
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            try:
+                native_explicit(message, category, filename, lineno, *args, **kwargs)
+            except Warning as error:
+                audited_scope = (
+                    scope if os.getpid() == pid and warnings.warn_explicit is warn_explicit else None
+                )
+                if audited_scope is not None:
+                    self.report_exception(
+                        component, "python_warning", error,
+                        _diagnostic_context(type(error).__name__, filename, lineno),
+                    )
+                raise
 
         def warning(
             message: Warning | str,
@@ -627,17 +772,23 @@ class RuntimeAudit:
             return record
 
         logging.setLogRecordFactory(log_record)
+        warnings.warn = warn
+        warnings.warn_explicit = warn_explicit
         warnings.showwarning = warning
         threading.excepthook = thread_failed
         if loop is not None:
             loop.set_exception_handler(task_failed)
         try:
-            yield
+            yield warn.__code__, warn_explicit.__code__
         finally:
             if logging.getLogRecordFactory() is log_record:
                 logging.setLogRecordFactory(previous_log_factory)
             if warnings.showwarning is warning:
                 warnings.showwarning = previous_warning
+            if warnings.warn is warn:
+                warnings.warn = previous_warn
+            if warnings.warn_explicit is warn_explicit:
+                warnings.warn_explicit = previous_explicit
             if threading.excepthook is thread_failed:
                 threading.excepthook = previous_thread
             if loop is not None and loop.get_exception_handler() is task_failed:

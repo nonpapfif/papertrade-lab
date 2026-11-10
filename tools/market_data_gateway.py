@@ -142,7 +142,7 @@ class MarketDataGateway:
         self._worker: asyncio.Task[None] | None = None
         self._closing = False
         self._services: set[asyncio.Task[Any]] = set()
-        self._open_incidents: dict[tuple[DataGroup, tuple[str, ...]], set[str]] = {}
+        self._open_incidents: dict[tuple[DataGroup, tuple[str, ...], float | None], set[str]] = {}
 
     def cut(self) -> DataCut:
         with self._operation("market_data_store", "cut_failed"):
@@ -172,14 +172,17 @@ class MarketDataGateway:
     async def _request(self, request: DataRequest) -> DataResult:
         if self._closing:
             return _failure_result(request, "gateway_stopped")
+        group = request.group
         cached = self.cached(request)
         cache_hits = tuple(symbol for symbol in request.symbols if symbol in cached)
         missing = tuple(symbol for symbol in request.symbols if symbol not in cached)
         if request.as_of_cut is not None or not missing:
+            if request.as_of_cut is None:
+                for symbol in cache_hits:
+                    self._resolve_recovered(group, (symbol,), max_age=request.max_age)
             return DataResult(tuple(cached[s] for s in cache_hits), missing, (), cache_hits)
 
         waiting = []
-        group = request.group
         for symbol in missing:
             key = (group, symbol)
             if key not in self._inflight:
@@ -197,7 +200,12 @@ class MarketDataGateway:
             if isinstance(outcome, DataRecord):
                 if request.max_age and not self._fresh(outcome, request, now):
                     failures.append(DataFailure(symbol, "stale_market_data"))
+                    self._record(
+                        group, "stale_market_data", (symbol,),
+                        severity="warning", max_age=request.max_age,
+                    )
                 else:
+                    self._resolve_recovered(group, (symbol,), max_age=request.max_age)
                     records.append(outcome)
             elif isinstance(outcome, DataFailure):
                 failures.append(outcome)
@@ -354,15 +362,18 @@ class MarketDataGateway:
         error: BaseException | None = None,
         severity: IncidentSeverity = "error",
         resolved: bool = False,
+        max_age: float | None = None,
     ) -> None:
         if self._audit is not None:
-            incident_key = (group, tuple(sorted(symbols)))
-            identity = finite_json(
-                [group[0], group[1], [list(p) for p in group[2]], sorted(symbols)]
-            )
+            ordered = sorted(symbols)
+            incident_key = (group, tuple(ordered), max_age)
+            identity: list[object] = [group[0], group[1], [list(p) for p in group[2]], ordered]
+            if max_age is not None:
+                # Normalize equal integer and float ages without rounding either value.
+                identity.append(list(max_age.as_integer_ratio()))
             context: dict[str, object] = {
                 "market": group[0],
-                "request_id": hashlib.sha256(identity.encode()).hexdigest(),
+                "request_id": hashlib.sha256(finite_json(identity).encode()).hexdigest(),
             }
             if len(symbols) == 1:
                 context["symbol"] = symbols[0]
@@ -379,9 +390,11 @@ class MarketDataGateway:
             if not resolved:
                 self._open_incidents.setdefault(incident_key, set()).add(code)
 
-    def _resolve_recovered(self, group: DataGroup, symbols: tuple[str, ...]) -> None:
-        for code in self._open_incidents.pop((group, tuple(sorted(symbols))), ()):
-            self._record(group, code, symbols, resolved=True)
+    def _resolve_recovered(
+        self, group: DataGroup, symbols: tuple[str, ...], *, max_age: float | None = None
+    ) -> None:
+        for code in self._open_incidents.pop((group, tuple(sorted(symbols)), max_age), ()):
+            self._record(group, code, symbols, resolved=True, max_age=max_age)
 
     async def close(self) -> None:
         self._closing = True

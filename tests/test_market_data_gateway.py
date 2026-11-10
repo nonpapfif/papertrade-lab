@@ -1,10 +1,13 @@
 """Exercise owner-side batching, failures, recovery and cross-process pipe clients."""
 
 import asyncio
+import json
 import multiprocessing
+import sqlite3
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -15,6 +18,7 @@ from unittest.mock import patch
 from papertrade.api import ApiError
 from tools.market_data_gateway import DataResult, GatewayPipeClient, MarketDataGateway
 from tools.market_data_repository import DataGroup, DataRequest, MarketDataRepository
+from tools.runtime_audit import RuntimeAudit
 
 START = datetime(2026, 11, 10, 15, tzinfo=UTC)
 
@@ -67,7 +71,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.repo = MarketDataRepository(Path(directory.name) / "data.sqlite3")
+        self.root = Path(directory.name)
+        self.repo = MarketDataRepository(self.root / "data.sqlite3")
         self.addCleanup(self.repo.close)
         self.current = START
         self.provider = Provider(self.clock)
@@ -77,6 +82,20 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     def clock(self) -> str:
         return self.current.isoformat()
+
+    def audited_gateway(self) -> tuple[MarketDataGateway, RuntimeAudit]:
+        audit = RuntimeAudit(self.root / "audit.sqlite3", "fixture")
+        gateway = MarketDataGateway(self.repo, self.provider, audit, clock=self.clock)
+        self.addAsyncCleanup(gateway.close)
+        return gateway, audit
+
+    def stale_incidents(self, audit: RuntimeAudit) -> list[sqlite3.Row]:
+        with closing(sqlite3.connect(audit.path)) as db:
+            db.row_factory = sqlite3.Row
+            return db.execute("""
+                SELECT context, severity, state, occurrences
+                FROM runtime_incidents WHERE code = 'stale_market_data'
+            """).fetchall()
 
     async def test_batches_unique_compatible_prices_and_reuses_hits(self) -> None:
         symbols = tuple(f"P{i}" for i in range(320))
@@ -140,6 +159,76 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.failures[0].code, "stale_market_data")
         historical_row = (await self.gateway.prices("US", ("A",))).require("A")
         self.assertEqual(historical_row.source_time, self.provider.clock())
+
+    async def test_stale_responses_aggregate_and_only_fresh_fetch_recovers(self) -> None:
+        gateway, audit = self.audited_gateway()
+        self.provider.clock = lambda: (self.current - timedelta(seconds=20)).isoformat()
+        for age in (10, 10.0):
+            result = await gateway.prices("US", ("A",), max_age=age)
+            self.assertEqual(result.records, ())
+            self.assertEqual(result.failures[0].code, "stale_market_data")
+        (incident,) = self.stale_incidents(audit)
+        self.assertEqual(tuple(incident)[1:], ("warning", "open", 2))
+        context = json.loads(incident["context"])
+        self.assertEqual(set(context), {"market", "symbol", "request_id"})
+        self.assertEqual((context["market"], context["symbol"]), ("US", "A"))
+        self.assertRegex(context["request_id"], r"^[a-f0-9]{64}$")
+
+        self.provider.clock = self.clock
+        recovered = await gateway.prices("US", ("A",), max_age=10)
+        self.assertEqual(recovered.require("A").source_time, self.clock())
+        self.assertEqual(recovered.cache_hits, ())
+        (resolved,) = self.stale_incidents(audit)
+        self.assertEqual(tuple(resolved), (incident["context"], "warning", "resolved", 2))
+        self.assertEqual(len(self.provider.calls), 3)
+
+    async def test_shared_fetch_resolves_only_the_age_policy_it_satisfies(self) -> None:
+        gateway, audit = self.audited_gateway()
+        self.provider.clock = lambda: (self.current - timedelta(seconds=40)).isoformat()
+        strict = DataRequest("US", "price", ("A",), max_age=10)
+        relaxed = DataRequest("US", "price", ("A",), max_age=30)
+        for request in (strict, relaxed):
+            result = await gateway.request(request)
+            self.assertEqual(result.failures[0].code, "stale_market_data")
+        self.assertEqual(len(self.stale_incidents(audit)), 2)
+
+        self.provider.clock = lambda: (self.current - timedelta(seconds=20)).isoformat()
+        strict_result, relaxed_result = await asyncio.gather(
+            gateway.request(strict), gateway.request(relaxed)
+        )
+        self.assertEqual(len(self.provider.calls), 3)
+        self.assertEqual(strict_result.failures[0].code, "stale_market_data")
+        self.assertEqual(relaxed_result.require("A").source_time, self.provider.clock())
+        self.assertEqual(relaxed_result.cache_hits, ())
+        relaxed_hit = await gateway.request(relaxed)
+        self.assertEqual(relaxed_hit.cache_hits, ("A",))
+        self.assertEqual(len(self.provider.calls), 3)
+        self.assertEqual(
+            {row["occurrences"]: row["state"] for row in self.stale_incidents(audit)},
+            {2: "open", 1: "resolved"},
+        )
+
+    async def test_fresh_live_cache_hit_recovers_but_historical_hit_is_lookup_only(self) -> None:
+        gateway, audit = self.audited_gateway()
+        self.provider.clock = lambda: (self.current - timedelta(seconds=20)).isoformat()
+        stale = await gateway.prices("US", ("A",), max_age=10)
+        self.assertEqual(stale.failures[0].code, "stale_market_data")
+
+        self.provider.clock = self.clock
+        self.assertEqual((await gateway.prices("US", ("A",))).require("A").source_time, self.clock())
+        historical = await gateway.request(
+            DataRequest("US", "price", ("A",), max_age=10, as_of_cut=gateway.cut())
+        )
+        self.assertEqual(historical.cache_hits, ("A",))
+        (open_incident,) = self.stale_incidents(audit)
+        self.assertEqual(open_incident["state"], "open")
+
+        live = await gateway.prices("US", ("A",), max_age=10.0)
+        self.assertEqual(live.cache_hits, ("A",))
+        self.assertEqual(live.require("A"), historical.require("A"))
+        self.assertEqual(len(self.provider.calls), 2)
+        (resolved,) = self.stale_incidents(audit)
+        self.assertEqual(tuple(resolved), (open_incident["context"], "warning", "resolved", 1))
 
     async def test_cancellation_does_not_cancel_shared_fetch(self) -> None:
         self.provider.release.clear()

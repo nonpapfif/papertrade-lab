@@ -441,10 +441,9 @@ class SharedFeedSlots:
                         progress=self.consumed,
                         pid=os.getpid(),
                     )
-                    if not self.audit.healthy:
-                        raise JournalError("Shared runtime audit storage is unhealthy")
                 try:
-                    self.journal.append(entry)
+                    with self.audit.publication_guard() if self.audit is not None else nullcontext():
+                        self.journal.append(entry)
                 except JournalError as error:
                     if self.audit is not None:
                         self.audit.report_exception(
@@ -477,7 +476,8 @@ class SharedFeedSlots:
         ack_error: Exception | None = None
         for slot in self.slots.values():
             try:
-                slot.runtime.acknowledge_accounts()
+                with self.audit.publication_guard() if self.audit is not None else nullcontext():
+                    slot.runtime.acknowledge_accounts()
                 if slot.stopped_sequence == self.consumed:
                     await slot.runtime.close()
             except Exception as error:  # noqa: BLE001 - Finish acknowledging the durable cut.
@@ -492,6 +492,8 @@ class SharedFeedSlots:
                     ack_error = error
         if ack_error is not None:
             self._failed_cut = True
+            if saved is None:
+                ack_error.add_note(f"Journal cut {self.consumed} is durable and requires replay.")
             raise ack_error
         if command_result is not None:
             self.commands[command_result[0].id] = command_result

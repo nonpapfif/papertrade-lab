@@ -6,6 +6,7 @@ import signal
 import subprocess
 import unittest
 from dataclasses import replace
+from functools import partial
 from multiprocessing.connection import Connection
 from typing import Any
 from unittest.mock import patch
@@ -251,4 +252,81 @@ class AccountExecutorTests(unittest.IsolatedAsyncioTestCase):
         duplicate = await runner.apply(2, {"a": AccountAction("book", book)})
         runner.commit()
         self.assertFalse(duplicate["a"].accepted_book)
+        same_quote = {**book, "id": "duplicate-source", "received_at": stamp(1)}
+        unchanged = await runner.apply(3, {"a": AccountAction("book", same_quote)})
+        runner.commit()
+        self.assertFalse(unchanged["a"].accepted_book)
+        rejected_book = event(at=2, price=3000)
+        rejected_book["book"]["currency"] = KR.currency
+        rejected_book["book"]["asks"] = []
+        rejected = await runner.apply(4, {"a": AccountAction("book", rejected_book)})
+        runner.commit()
+        self.assertFalse(rejected["a"].accepted_book)
+        self.assertEqual(runner.accounts["a"]._books, {})
         self.assertIs(US, AsyncLayeredPaper(100).fork().context.market)
+
+    async def test_malformed_and_inconsistent_worker_marks_are_rejected(self) -> None:
+        account = AsyncLayeredPaper(100, policy="trend")
+        runner = self.executor(a=account)
+        await runner.apply(1, {"a": AccountAction("book", event())})
+        runner.commit()
+        exchange = runner._exchange
+        actions = {"a": AccountAction("book", event(at=2), stamp(3))}
+        prior = account.summary()
+        replacements = {
+            "symbol": 42,
+            "event_id": "other",
+            "source_at": stamp(3),
+            "received_at": stamp(2),
+            "decision_at": stamp(3),
+            "currency": "KRW",
+            "midpoint": 42.0,
+            "equity": 999999999,
+            "realized": 5.0,
+            "fees": {"total_usd": 42.0},
+        }
+
+        def corrupt(field: str, value: Any, *args: Any) -> dict[str, Any]:
+            replies = exchange(*args)
+            result = replies["a"]
+            mark = result.accepted_mark.copy()
+            if field == "mark":
+                mark = value
+            elif field == "missing":
+                del mark[value]
+            elif field == "fee_value":
+                mark["fees"] = {**mark["fees"], "total_usd": value}
+            elif field == "fee_key":
+                mark["fees"] = {**mark["fees"], value: 0.0}
+            else:
+                mark[field] = value
+            replies["a"] = replace(result, accepted_mark=mark)
+            return replies
+
+        for field, value in (
+            *replacements.items(),
+            ("mark", None),
+            ("mark", []),
+            ("missing", "equity"),
+            ("unexpected", 1),
+            ("equity", "100.0"),
+            ("equity", float("nan")),
+            ("realized", -0.0),
+            ("symbol", False),
+            ("midpoint", float("inf")),
+            ("fee_value", float("-inf")),
+            ("fee_value", 42.0),
+            ("fee_key", "unknown_usd"),
+        ):
+            with self.subTest(field=field, value=value):
+                with (
+                    patch.object(runner, "_exchange", side_effect=partial(corrupt, field, value)),
+                    self.assertRaisesRegex(AccountProtocolError, "Account mark mismatch"),
+                ):
+                    await runner.apply(2, actions)
+                self.assertEqual(runner._committed, {"a": (1, 1)})
+                self.assertEqual(runner.pids, {})
+                self.assertEqual(account.summary(), prior)
+        result = await runner.apply(2, actions)
+        self.assertTrue(result["a"].accepted_book)
+        runner.commit()

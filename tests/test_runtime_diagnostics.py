@@ -7,11 +7,12 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 import unittest
 import warnings
-from contextlib import closing
+from contextlib import closing, nullcontext
 from multiprocessing.connection import Pipe
 from pathlib import Path
 from typing import Any, cast
@@ -169,6 +170,8 @@ class RuntimeDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     def test_error_filter_before_ignore_audits_and_propagates_original_warning(self) -> None:
         warning = RuntimeWarning("private warning-as-error detail")
         with warnings.catch_warnings():
+            prior_warn, prior_explicit = warnings.warn, warnings.warn_explicit
+            prior_show = warnings.showwarning
             warnings.simplefilter("ignore", RuntimeWarning)
             warnings.filterwarnings(
                 "error", message="private warning-as-error", category=RuntimeWarning
@@ -182,13 +185,180 @@ class RuntimeDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 warnings.warn(warning, stacklevel=1)
             self.assertIs(raised.exception, warning)
             self.assertEqual(warnings.filters, original_filters)
+            self.assertIs(warnings.warn, prior_warn)
+            self.assertIs(warnings.warn_explicit, prior_explicit)
+            self.assertIs(warnings.showwarning, prior_show)
         (row,) = self.incidents()
         self.assertEqual(
             (row["component"], row["code"], row["severity"], row["exception_type"]),
             ("inner", "python_warning", "error", "RuntimeWarning"),
         )
         self.assertEqual(json.loads(row["context"])["origin"], Path(__file__).name)
+        self.assertEqual(row["occurrences"], 1)
         self.assertNotIn("private warning-as-error detail", repr(row))
+
+    def test_caught_warning_as_error_records_repeated_same_instance(self) -> None:
+        warning = UserWarning("private warning")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with (
+                self.audit.capture_runtime_failures("outer"),
+                self.audit.capture_runtime_failures("inner"),
+            ):
+                for _ in range(2):
+                    with self.assertRaises(UserWarning) as raised:
+                        line = sys._getframe().f_lineno + 1
+                        warnings.warn(warning, stacklevel=0)
+                    self.assertIs(raised.exception, warning)
+        (row,) = self.incidents()
+        self.assertEqual(
+            (row["component"], row["severity"], row["occurrences"]), ("inner", "error", 2)
+        )
+        self.assertEqual(json.loads(row["context"])["line"], line)
+        self.assertNotIn("private warning", repr(row))
+
+    def test_reused_warning_with_old_emitter_trace_still_audits_new_scope_failure(self) -> None:
+        warning = UserWarning("private repeated warning")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with self.audit.capture_runtime_failures("first"):
+                try:
+                    warnings.warn(warning, stacklevel=1)
+                except UserWarning as caught:
+                    self.assertIs(caught, warning)
+            with self.assertRaises(UserWarning), self.audit.capture_runtime_failures("second"):
+                line = sys._getframe().f_lineno + 1
+                raise warning
+        rows = self.incidents()
+        self.assertEqual(
+            {(row["component"], row["occurrences"]) for row in rows},
+            {("first", 1), ("second", 1)},
+        )
+        context = json.loads(next(row for row in rows if row["component"] == "second")["context"])
+        self.assertEqual((context["origin"], context["line"]), (Path(__file__).name, line))
+
+    def test_second_caught_warning_in_finally_does_not_duplicate_escaping_warning(self) -> None:
+        first = UserWarning("first")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with self.assertRaises(UserWarning) as raised, self.audit.capture_runtime_failures(
+                "runtime"
+            ):
+                try:
+                    warnings.warn(first, stacklevel=1)
+                finally:
+                    with self.assertRaises(UserWarning):
+                        warnings.warn("second", UserWarning, stacklevel=1)
+            self.assertIs(raised.exception, first)
+        self.assertEqual([row["occurrences"] for row in self.incidents()], [1, 1])
+
+    def test_caught_explicit_warning_as_error_preserves_source_and_exception(self) -> None:
+        warning = RuntimeWarning("private explicit diagnostic")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=RuntimeWarning, module="fixture_source")
+            with self.audit.capture_runtime_failures("runtime"):
+                with self.assertRaises(RuntimeWarning) as raised:
+                    warnings.warn_explicit(
+                        warning, RuntimeWarning, "/fixture/explicit.py", 17, module="fixture_source"
+                    )
+                self.assertIs(raised.exception, warning)
+        (row,) = self.incidents()
+        self.assertEqual((row["severity"], row["occurrences"]), ("error", 1))
+        context = json.loads(row["context"])
+        self.assertEqual((context["origin"], context["line"]), ("explicit.py", 17))
+        self.assertNotIn("private explicit diagnostic", repr(row))
+
+    def test_caught_warning_as_error_retains_stacklevel_and_skip_prefix_origin(self) -> None:
+        def emit() -> None:
+            warnings.warn("stacklevel diagnostic", UserWarning, stacklevel=2)
+
+        def emit_skipping_caller() -> None:
+            warnings.warn(
+                "prefix diagnostic", UserWarning, skip_file_prefixes=(str(Path(__file__).parent),)
+            )
+
+        def emit_full_filename_prefix() -> None:
+            warnings.warn("full filename diagnostic", UserWarning, skip_file_prefixes=(__file__,))
+
+        with warnings.catch_warnings(record=True) as baseline:
+            warnings.simplefilter("always", UserWarning)
+            for emit_warning in (emit, emit_skipping_caller, emit_full_filename_prefix):
+                emit_warning()
+        self.assertEqual(len(baseline), 3)
+        self.assertEqual(baseline[2].filename, baseline[0].filename)
+        self.assertEqual(baseline[2].lineno, baseline[0].lineno)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with self.audit.capture_runtime_failures("runtime"):
+                with self.assertRaises(UserWarning):
+                    line = sys._getframe().f_lineno + 1
+                    emit()
+                with self.assertRaises(UserWarning):
+                    emit_skipping_caller()
+                with self.assertRaises(UserWarning):
+                    full_prefix_line = sys._getframe().f_lineno + 1
+                    emit_full_filename_prefix()
+        sources = {
+            (context["origin"], context["line"])
+            for context in (json.loads(row["context"]) for row in self.incidents())
+        }
+        self.assertEqual(
+            sources,
+            {
+                (Path(__file__).name, line),
+                (Path(__file__).name, full_prefix_line),
+                (Path(baseline[1].filename).name, baseline[1].lineno),
+            },
+        )
+
+    def test_importlib_warning_keeps_native_module_filter_and_raw_stacklevel(self) -> None:
+        module = "importlib._bootstrap"
+        filename = f"<frozen {module}>"
+        namespace: dict[str, Any] = {"__name__": module, "warnings": warnings}
+        exec(  # noqa: S102 - Synthetic importlib frames without loading a real module.
+            compile(
+                "def emit(message, level=1, category=None):\n"
+                "    warnings.warn(message, category=category, stacklevel=level)\n"
+                "def indirect(message):\n"
+                "    emit(message, 2)\n",
+                filename,
+                "exec",
+            ),
+            namespace,
+        )
+        emitters = (namespace["emit"], namespace["indirect"])
+        with warnings.catch_warnings(record=True) as baseline:
+            warnings.simplefilter("always", RuntimeWarning)
+            for emit in emitters:
+                emit(RuntimeWarning("source fixture"))
+        self.assertEqual(
+            [(row.filename, row.lineno) for row in baseline], [(filename, 2), (filename, 4)]
+        )
+        registry = namespace["__warningregistry__"]
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=RuntimeWarning, module=r"^importlib\._bootstrap$")
+            for emit in emitters:
+                for scoped in (False, True):
+                    warning = RuntimeWarning("filter fixture")
+                    context = (
+                        self.audit.capture_runtime_failures("runtime") if scoped else nullcontext()
+                    )
+                    with self.assertRaises(RuntimeWarning) as raised, context:
+                        emit(warning)
+                    self.assertIs(raised.exception, warning)
+            with (
+                self.assertRaises(TypeError),
+                self.audit.capture_runtime_failures("runtime"),
+            ):
+                namespace["emit"]("invalid category", category=int)
+        self.assertIs(namespace["__warningregistry__"], registry)
+        rows = self.incidents()
+        self.assertEqual(sorted(json.loads(row["context"])["line"] for row in rows), [2, 4])
+        self.assertEqual(
+            [(row["severity"], row["occurrences"]) for row in rows], [("error", 1), ("error", 1)]
+        )
 
     def test_ignore_filter_before_error_keeps_warning_nonfatal_and_restores_filter(self) -> None:
         with warnings.catch_warnings(), patch("warnings.showwarning") as display:
