@@ -19,35 +19,30 @@ import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from papertrade.clock import utc_iso
+from papertrade.jsonio import canonical_json as encode
+from papertrade.jsonio import save_canonical_json as save
+from tools.research_metadata import read_metadata
+from tools.source_identity import file_digest as digest
 
 DAYS = tuple(f"2026-10-{day}" for day in range(26, 31))
 ROOT = Path(__file__).resolve().parents[1]
 FAMILIES = ("momentum", "reversal", "breakout", "mean_reversion", "transition", "volume_trend")
 
 
-def encode(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False)
-
-
-def digest(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def save(path: Path, value: Any) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(encode(value) + "\n")
-    temporary.replace(path)
-
-
 def metadata(db: sqlite3.Connection, key: str) -> Any:
-    row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-    if row is None:
+    missing = object()
+    value = read_metadata(db, key, missing)
+    if value is missing:
         raise ValueError("Missing experiment metadata: " + key)
-    return json.loads(row[0])
+    return value
 
 
 def readonly(path: Path) -> sqlite3.Connection:
@@ -184,7 +179,7 @@ def prepare_day(output: Path, day: str, prepared_output: Path | None = None) -> 
             "day": day,
             "portfolio_sha256": portfolio_hash,
             "feature_sha256": feature_hash,
-            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_at": utc_iso(),
             "ai_calls": 0,
         },
     )
@@ -192,9 +187,9 @@ def prepare_day(output: Path, day: str, prepared_output: Path | None = None) -> 
 
 def load_worker_modules() -> Any:
     package = types.ModuleType("tools")
-    package.__path__ = []  # type: ignore[attr-defined]
+    vars(package)["__path__"] = []
     sys.modules["tools"] = package
-    for name in ("search_portfolios", "week_hypotheses"):
+    for name in ("source_identity", "research_metadata", "search_portfolios", "week_hypotheses"):
         spec = importlib.util.spec_from_file_location(
             "tools." + name, ROOT / "tools" / (name + ".py")
         )
@@ -279,9 +274,11 @@ class IsolatedWorker:
         from tools.replay_market_day import sandbox_profile
 
         script = Path(__file__).resolve()
-        profile = sandbox_profile(script, forbidden[0], output)
-        for name in ("search_portfolios.py", "week_hypotheses.py"):
-            profile += "\n(allow file-read* (literal " + encode(str(script.with_name(name))) + "))"
+        profile = sandbox_profile(
+            script, forbidden[0], output,
+            source_dependencies=("tools/research_metadata.py", "tools/search_portfolios.py",
+                                 "tools/week_hypotheses.py"),
+        )
         for path in forbidden:
             profile += "\n(deny file-read* (literal " + encode(str(path.resolve())) + "))"
         self.error = (result / "worker-stderr.log").open("a")
@@ -785,7 +782,7 @@ def evaluate(
                                 "day": day,
                                 "at": last_at,
                                 "frames": sequence,
-                                "updated_at": datetime.now(UTC).isoformat(),
+                                "updated_at": utc_iso(),
                                 "ai_calls": 0,
                             },
                         )
@@ -826,7 +823,7 @@ def evaluate(
                         "state": "running",
                         "completed_day": day,
                         "frames": sequence,
-                        "updated_at": datetime.now(UTC).isoformat(),
+                        "updated_at": utc_iso(),
                         "ai_calls": 0,
                     },
                 )
@@ -865,7 +862,7 @@ def evaluate(
                 "state": "complete",
                 "frames": sequence,
                 "ai_calls": 0,
-                "updated_at": datetime.now(UTC).isoformat(),
+                "updated_at": utc_iso(),
             },
         )
         return group
@@ -877,7 +874,7 @@ def evaluate(
                 "error_type": type(error).__name__,
                 "message": str(error),
                 "frames": sequence,
-                "updated_at": datetime.now(UTC).isoformat(),
+                "updated_at": utc_iso(),
                 "ai_calls": 0,
             },
         )
@@ -926,7 +923,7 @@ def make_manifest(
             for row in db.execute("SELECT market,symbol FROM symbols ORDER BY market,symbol")
         ]
     return {
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": utc_iso(),
         "deadline": deadline.isoformat() if deadline else None,
         "days": DAYS,
         "excluded_days": ["2026-10-23"],
@@ -946,14 +943,25 @@ def make_manifest(
         "prepared_output": str(prepared_output) if prepared_output else None,
         "fixed_oct30_ids": {} if long_only else fixed_winners(output),
         "code_sha256": {
-            name: digest(ROOT / "tools" / name)
-            for name in (
-                "run_week_experiment.py",
-                "week_hypotheses.py",
-                "search_portfolios.py",
-                "search_up_candles.py",
-                "replay_market_day.py",
-            )
+            **{
+                name: digest(ROOT / "tools" / name)
+                for name in (
+                    "run_week_experiment.py",
+                    "week_hypotheses.py",
+                    "search_portfolios.py",
+                    "search_up_candles.py",
+                    "replay_market_day.py",
+                )
+            },
+            **{
+                name: digest(ROOT / name)
+                for name in (
+                    "papertrade/clock.py",
+                    "papertrade/jsonio.py",
+                    "tools/research_metadata.py",
+                    "tools/source_identity.py",
+                )
+            },
         },
         "initial_equity_per_market_hypothesis": None if whole_shares else 1000,
         "ai_calls": 0,
@@ -1001,7 +1009,8 @@ def make_manifest(
 
 def verify_code(manifest: dict[str, Any]) -> None:
     for name, expected in manifest["code_sha256"].items():
-        if digest(ROOT / "tools" / name) != expected:
+        source = ROOT / name if "/" in name else ROOT / "tools" / name
+        if digest(source) != expected:
             raise ValueError("Frozen experiment source changed: " + name)
 
 
@@ -1121,7 +1130,7 @@ def run(
                         "pid": os.getpid(),
                         "ai_calls": 0,
                         "hypotheses": len(manifest["policies"]),
-                        "updated_at": datetime.now(UTC).isoformat(),
+                        "updated_at": utc_iso(),
                     },
                 )
                 time.sleep(2)
@@ -1132,7 +1141,7 @@ def run(
                     "deadline": deadline_text,
                     "pid": os.getpid(),
                     "ai_calls": 0,
-                    "updated_at": datetime.now(UTC).isoformat(),
+                    "updated_at": utc_iso(),
                 },
             )
             groups = []
@@ -1153,7 +1162,7 @@ def run(
                             "deadline": deadline_text,
                             "pid": os.getpid(),
                             "ai_calls": 0,
-                            "updated_at": datetime.now(UTC).isoformat(),
+                            "updated_at": utc_iso(),
                         },
                     )
             for day, source in manifest["sources"].items():
@@ -1201,7 +1210,7 @@ def run(
                     "deadline": deadline_text,
                     "pid": os.getpid(),
                     "ai_calls": 0,
-                    "updated_at": datetime.now(UTC).isoformat(),
+                    "updated_at": utc_iso(),
                 },
             )
         except BaseException as error:
@@ -1214,7 +1223,7 @@ def run(
                     "deadline": deadline_text,
                     "pid": os.getpid(),
                     "ai_calls": 0,
-                    "updated_at": datetime.now(UTC).isoformat(),
+                    "updated_at": utc_iso(),
                 },
             )
             raise

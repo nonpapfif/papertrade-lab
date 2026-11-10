@@ -14,22 +14,15 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self, cast
 
-from tools.us_adaptive_ai import ENTRY_OPTIONS
+from papertrade.jsonio import canonical_json as encode
+from tools.strategy_catalog import valid_entry_options
 
 SPOOL_NAME = "slot-control.sqlite3"
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
-def encode(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
 def validate_entry_options(name: str, config: Any) -> None:
-    if (
-        not isinstance(config, dict)
-        or config.keys() != ENTRY_OPTIONS.keys()
-        or any(config[key] not in choices for key, choices in ENTRY_OPTIONS.items())
-    ):
+    if not valid_entry_options(config):
         raise ValueError(f"Invalid {name} policy. Supply all supported entry options")
 
 

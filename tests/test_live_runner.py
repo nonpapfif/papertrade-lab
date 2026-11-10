@@ -103,7 +103,8 @@ class LiveRunnerTests(unittest.TestCase):
             feed.orderbook_batch.side_effect = orderbooks
             with (
                 patch("tools.run_live_parallel.LiveFeed", return_value=feed),
-                patch("tools.run_live_parallel.datetime", FrozenDateTime),
+                patch("tools.run_live_parallel.now_utc", side_effect=FrozenDateTime.now),
+                patch("papertrade.clock.now_utc", side_effect=FrozenDateTime.now),
                 patch("tools.run_live_parallel.time.time", side_effect=lambda: clock[0]),
                 patch("tools.run_live_parallel.time.sleep", side_effect=sleep),
                 patch(
@@ -282,7 +283,8 @@ class LiveRunnerTests(unittest.TestCase):
             output = Path(folder)
             with (
                 patch("tools.run_live_parallel.LiveFeed", Feed),
-                patch("tools.run_live_parallel.datetime", FrozenDateTime),
+                patch("tools.run_live_parallel.now_utc", side_effect=FrozenDateTime.now),
+                patch("papertrade.clock.now_utc", side_effect=FrozenDateTime.now),
                 patch("tools.run_live_parallel.time.time", Clock.time),
                 patch("tools.run_live_parallel.time.sleep", Clock.sleep),
                 patch(

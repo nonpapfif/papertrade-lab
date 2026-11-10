@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from multiprocessing.connection import Connection
 from typing import Any, Protocol
 
-from papertrade.api import ApiError
+from papertrade.api import SYMBOL, ApiError
+from papertrade.clock import utc_iso
 from tools.market_data_repository import (
     DataCut,
     DataGroup,
@@ -23,26 +23,11 @@ from tools.market_data_repository import (
     epoch,
     finite_json,
 )
+from tools.runtime_audit import IncidentSeverity, RuntimeAuditSink
 
 
 class Provider(Protocol):
     def fetch(self, group: DataGroup, symbols: tuple[str, ...]) -> dict[str, dict[str, Any]]: ...
-
-
-class Audit(Protocol):
-    def operation(
-        self, component: str, code: str, context: Mapping[str, object] | None = None,
-        *, timeout: float | None = None,
-    ) -> AbstractContextManager[None]: ...
-
-    def record(
-        self,
-        component: str,
-        code: str,
-        context: Mapping[str, object],
-        *,
-        error: BaseException | None = None,
-    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +61,6 @@ class DataResult:
             if record.symbol == symbol:
                 return record
         raise ApiError("Requested market data is unavailable", code="missing_market_data")
-
-
-def _clock() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _number(value: object) -> float:
@@ -146,9 +127,9 @@ class MarketDataGateway:
         self,
         repository: MarketDataRepository,
         provider: Provider,
-        audit: Audit | None = None,
+        audit: RuntimeAuditSink | None = None,
         *,
-        clock: Callable[[], str] = _clock,
+        clock: Callable[[], str] = utc_iso,
         batch_window: float = 0.005,
     ) -> None:
         self.repository = repository
@@ -161,6 +142,7 @@ class MarketDataGateway:
         self._worker: asyncio.Task[None] | None = None
         self._closing = False
         self._services: set[asyncio.Task[Any]] = set()
+        self._open_incidents: dict[tuple[DataGroup, tuple[str, ...]], set[str]] = {}
 
     def cut(self) -> DataCut:
         with self._operation("market_data_store", "cut_failed"):
@@ -171,7 +153,8 @@ class MarketDataGateway:
             self._audit.operation(
                 component, code, timeout=120 if component == "market_data_gateway" else 10
             )
-            if self._audit is not None else nullcontext()
+            if self._audit is not None
+            else nullcontext()
         )
 
     def cached(self, request: DataRequest) -> dict[str, DataRecord]:
@@ -264,11 +247,13 @@ class MarketDataGateway:
         group = DataRequest(market, "book", (symbol,)).group
         try:
             observation = _observation(group, symbol, payload, received_time, source_identity)
-            with self._operation("market_data_store", "publish_failed"):
-                return self.repository.publish(group, [observation])[symbol]
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            self._record(group, "invalid_response", (symbol,))
+            self._record(group, "invalid_response", (symbol,), error=error)
             raise ApiError("Invalid streamed market data", code="invalid_response") from error
+        with self._operation("market_data_store", "publish_failed"):
+            record = self.repository.publish(group, [observation])[symbol]
+        self._resolve_recovered(group, (symbol,))
+        return record
 
     async def _drain(self) -> None:
         try:
@@ -305,7 +290,14 @@ class MarketDataGateway:
             if not isinstance(payloads, dict) or set(payloads) - set(symbols):
                 raise ApiError("Unexpected market-data result", code="invalid_response")
         except ApiError as error:
-            self._record(group, error.code, symbols, status=error.status, error=error)
+            self._record(
+                group,
+                error.code,
+                symbols,
+                status=error.status,
+                error=error,
+                severity="warning" if error.code == "cooldown" else "error",
+            )
             return {
                 symbol: DataFailure(symbol, error.code, error.status, error.retry_at)
                 for symbol in symbols
@@ -331,13 +323,20 @@ class MarketDataGateway:
             self._record(group, "invalid_response", tuple(invalid))
         absent = tuple(symbol for symbol in symbols if symbol not in payloads)
         if absent:
-            self._record(group, "missing_market_data", absent)
+            self._record(group, "missing_market_data", absent, severity="warning")
         try:
             with self._operation("market_data_store", "publish_failed"):
                 outcomes.update(self.repository.publish(group, observations))
         except Exception as error:
             self._record(group, "storage_failure", symbols, error=error)
             raise
+        for symbol, outcome in outcomes.items():
+            if isinstance(outcome, DataRecord):
+                self._resolve_recovered(group, (symbol,))
+        if len(symbols) > 1 and all(
+            isinstance(outcomes.get(symbol), DataRecord) for symbol in symbols
+        ):
+            self._resolve_recovered(group, symbols)
         return outcomes
 
     def _provider_read(
@@ -353,9 +352,14 @@ class MarketDataGateway:
         *,
         status: int | None = None,
         error: BaseException | None = None,
+        severity: IncidentSeverity = "error",
+        resolved: bool = False,
     ) -> None:
         if self._audit is not None:
-            identity = finite_json([group[0], group[1], [list(p) for p in group[2]], sorted(symbols)])
+            incident_key = (group, tuple(sorted(symbols)))
+            identity = finite_json(
+                [group[0], group[1], [list(p) for p in group[2]], sorted(symbols)]
+            )
             context: dict[str, object] = {
                 "market": group[0],
                 "request_id": hashlib.sha256(identity.encode()).hexdigest(),
@@ -364,12 +368,31 @@ class MarketDataGateway:
                 context["symbol"] = symbols[0]
             if status is not None:
                 context["http_status"] = status
-            self._audit.record("market_data_gateway", code, context, error=error)
+            self._audit.record(
+                "market_data_gateway",
+                code,
+                context,
+                error=error,
+                severity=severity,
+                state="resolved" if resolved else "open",
+            )
+            if not resolved:
+                self._open_incidents.setdefault(incident_key, set()).add(code)
+
+    def _resolve_recovered(self, group: DataGroup, symbols: tuple[str, ...]) -> None:
+        for code in self._open_incidents.pop((group, tuple(sorted(symbols))), ()):
+            self._record(group, code, symbols, resolved=True)
 
     async def close(self) -> None:
         self._closing = True
         if self._services:
-            await asyncio.gather(*tuple(self._services), return_exceptions=True)
+            results = await asyncio.gather(*tuple(self._services), return_exceptions=True)
+            if self._audit is not None:
+                self._audit.report_task_failures(
+                    "market_data_gateway",
+                    "pipe_service_failed",
+                    results,
+                )
         if self._worker is not None:
             await asyncio.shield(self._worker)
 
@@ -396,7 +419,9 @@ class MarketDataGateway:
                             await asyncio.to_thread(connection.send, response.result())
                             break
                         if connection.poll():
-                            # A blocking client sends nothing further until the reply.
+                            # EOF and the explicit close marker are ordinary client shutdown.
+                            if await asyncio.to_thread(connection.recv) is not None:
+                                raise ValueError("Pipe client sent a request before its reply")
                             return
                 finally:
                     if not response.done():
@@ -404,6 +429,10 @@ class MarketDataGateway:
                     await asyncio.gather(response, return_exceptions=True)
         except (EOFError, BrokenPipeError, ConnectionResetError):
             pass
+        except (OSError, TypeError, ValueError) as error:
+            if self._audit is not None:
+                self._audit.report_exception("market_data_gateway", "pipe_protocol_failed", error)
+            raise
         finally:
             connection.close()
             self._services.discard(service)
@@ -413,10 +442,14 @@ class MarketDataGateway:
             if request.as_of_cut is not None:
                 request = replace(request, as_of_cut=replace(request.as_of_cut))
             request = replace(request)
-        except (TypeError, ValueError, OverflowError):
+        except (AttributeError, TypeError, ValueError, OverflowError) as error:
+            if self._audit is not None:
+                self._audit.report_exception("market_data_gateway", "pipe_request_invalid", error)
             return _failure_result(request, "invalid_request")
         (result,) = await asyncio.gather(self.request(request), return_exceptions=True)
         if isinstance(result, Exception):
+            if self._audit is not None:
+                self._audit.report_exception("market_data_gateway", "pipe_request_failed", result)
             return _failure_result(request, "gateway_failure")
         if isinstance(result, BaseException):
             raise result
@@ -424,7 +457,14 @@ class MarketDataGateway:
 
 
 def _failure_result(request: DataRequest, code: str) -> DataResult:
-    return DataResult((), (), tuple(DataFailure(symbol, code) for symbol in request.symbols))
+    symbols = getattr(request, "symbols", ())
+    if not isinstance(symbols, tuple):
+        return DataResult((), (), ())
+    return DataResult(
+        (),
+        (),
+        tuple(DataFailure(s, code) for s in symbols if isinstance(s, str) and SYMBOL.fullmatch(s)),
+    )
 
 
 class GatewayPipeClient:

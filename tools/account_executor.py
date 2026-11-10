@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, fields
 from multiprocessing.connection import Connection, Pipe, wait
 from pathlib import Path
@@ -281,6 +282,9 @@ async def _serve(
     last_command, last_cut = committed
     pid = os.getpid()
     context: dict[str, str | int] = {"account_id": account_id}
+    diagnostics = ExitStack()
+    if audit:
+        diagnostics.enter_context(audit.capture_runtime_failures(MODULE))
     try:
         if audit:
             audit.heartbeat(
@@ -341,10 +345,14 @@ async def _serve(
     except Exception as error:  # noqa: BLE001 - Isolate every child failure at the process boundary.
         code = "command_rejected" if isinstance(error, AccountProtocolError) else "execution_failed"
         if audit:
-            audit.record(MODULE, code, context, error=error)
+            audit.report_exception(MODULE, code, error, context)
         pipe.send(_Fault(account_id, code, type(error).__name__))
     finally:
-        await account.close()
+        try:
+            with audit.cleanup(MODULE, "account_cleanup_failed") if audit else nullcontext():
+                await account.close()
+        finally:
+            diagnostics.close()
 
 
 def _worker_main(fd: int) -> None:
@@ -631,6 +639,7 @@ class AccountExecutor:
                 context,
                 error=error,
                 state="resolved" if resolved else "open",
+                severity="warning" if code in ("worker_disconnected", "ack_failed") else "error",
             )
             if resolved:
                 self._incidents.discard((name, code))

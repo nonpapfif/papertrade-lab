@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.adaptive_journal import AdaptiveJournal
-from tools.paper_campaign.policy import numeric
+from tools.capacity_admission import finite_number as numeric
 from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
 
 

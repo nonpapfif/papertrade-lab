@@ -17,21 +17,20 @@ import re
 import time
 import urllib.request
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from papertrade.api import SYMBOL, ApiError, MarketClient, private_json, secret_file
+from papertrade.api import SYMBOL, ApiError, MarketClient, secret_file
+from papertrade.clock import now_utc
+from papertrade.clock import utc_iso as now
 from papertrade.core import SafetyError, Settings
+from papertrade.jsonio import private_json
 
 ROOT = Path(__file__).resolve().parents[1]
 URL = "wss://openapi-ws.tossinvest.com/ws/v1"
 SPEC = "https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json"
 KR_SYMBOL = re.compile(r"[A-Za-z0-9]{6}")
-
-
-def now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def read_spec() -> bytes:
@@ -158,7 +157,7 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
     os.umask(0o077)
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     logging.getLogger("websockets").setLevel(logging.CRITICAL)
-    started = datetime.now(UTC)
+    started = now_utc()
     monotonic_start = time.monotonic()
     deadline = monotonic_start + duration
     state: dict[str, Any] = {
@@ -281,7 +280,7 @@ async def run(output: Path, market: str, symbols: list[str], duration: int) -> N
                             if tick - last_status >= 10:
                                 state.update(state="running", at=now(), counts=dict(counts))
                                 detail["wall_clock_step_seconds"] = (
-                                    datetime.now(UTC) - started
+                                    now_utc() - started
                                 ).total_seconds() - (tick - monotonic_start)
                                 private_json(output / "status.json", state)
                                 stream.flush()

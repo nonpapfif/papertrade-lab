@@ -16,11 +16,12 @@ import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from papertrade.api import ApiError, MarketClient
+from papertrade.clock import now_utc
 from papertrade.core import SafetyError, Settings, stamp
 from tools.download_market_day import (
     EXCHANGES,
@@ -38,7 +39,7 @@ def reverse_dates(month: str, through: str) -> list[str]:
     end = date.fromisoformat(through)
     if (start.year, start.month) != (end.year, end.month):
         raise ValueError("The final date must belong to the requested month")
-    if end >= datetime.now(UTC).date():
+    if end >= now_utc().date():
         raise ValueError("Only completed historical dates are supported")
     return [(end - timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
 
@@ -236,7 +237,7 @@ class ParallelDay(Downloader):
             end = max(stamp(w["end"]) for w in windows)
             if market == "US":
                 end = max(end, start + timedelta(days=1))
-            if end > datetime.now(UTC):
+            if end > now_utc():
                 raise ValueError("The requested session has not finished")
             scopes[market] = {
                 "start": start.isoformat(),

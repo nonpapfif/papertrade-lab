@@ -11,14 +11,19 @@ import shutil
 from collections import Counter
 from datetime import datetime
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from papertrade.core import Settings, encode
-from tools.autotest_jobs import atomic_json, poll_job
+from papertrade.clock import now_utc as now
+from papertrade.core import Settings
+from papertrade.jsonio import atomic_json
+from papertrade.jsonio import paper_json as encode
+from tools.autotest_jobs import poll_job
 from tools.kr_comparison_ai import SOL, review_cascade
+from tools.kr_comparison_events import write_event
 from tools.kr_whole_share_accounts import seed_accounts
-from tools.run_kr_paper_comparison import ALLOCATION_LOOKBACK, ROOT, Comparison, now
+from tools.run_kr_paper_comparison import ALLOCATION_LOOKBACK, ROOT, Comparison
 
 
 def reviewable(pair: Comparison) -> list[dict[str, Any]]:
@@ -298,8 +303,7 @@ async def continue_campaign(
         (output / "events.jsonl").open("a", buffering=1) as events,
     ):
 
-        def record(kind: str, **fields: Any) -> None:
-            events.write(encode({"kind": kind, "recorded_at": now(), **fields}) + "\n")
+        record = partial(write_event, events, now)
 
         async def review(key: str, signals: list[dict[str, Any]]) -> None:
             def audit(kind: str, **fields: Any) -> None:

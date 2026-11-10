@@ -18,10 +18,22 @@ import time
 from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+from functools import partial
 from itertools import product
 from pathlib import Path
 from typing import IO, Any
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from papertrade.clock import utc_iso
+from papertrade.jsonio import canonical_json as encode
+from tools.research_metadata import read_metadata as meta
+from tools.research_metadata import write_metadata
+from tools.source_identity import file_digest as digest
+
+put = partial(write_metadata, encode=encode)
 
 FAMILIES = ("momentum", "reversal", "breakout", "mean_reversion", "transition", "volume_trend")
 LOOKBACKS = (5, 10, 15, 30, 60)
@@ -62,35 +74,14 @@ CREATE TABLE IF NOT EXISTS details (
 """
 
 
-def encode(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False)
-
-
-def digest(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
 def parse(value: str) -> datetime:
     return datetime.fromisoformat(value)
-
-
-def meta(db: sqlite3.Connection, key: str, default: Any = None) -> Any:
-    row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-    return json.loads(row[0]) if row else default
-
-
-def put(db: sqlite3.Connection, key: str, value: Any) -> None:
-    db.execute(
-        "INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, encode(value)),
-    )
 
 
 def progress(db: sqlite3.Connection, output: Path, stage: str, **extra: Any) -> None:
     record = {
         "stage": stage,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": utc_iso(),
         "pid": os.getpid(),
         "ai_calls": 0,
         **extra,
@@ -709,7 +700,9 @@ class Worker:
             [
                 "/usr/bin/sandbox-exec",
                 "-p",
-                sandbox_profile(script, dataset, output),
+                sandbox_profile(
+                    script, dataset, output, source_dependencies=("tools/research_metadata.py",)
+                ),
                 str(Path(sys.executable).resolve()),
                 "-I",
                 "-B",

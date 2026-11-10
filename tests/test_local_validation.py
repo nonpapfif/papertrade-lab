@@ -18,7 +18,7 @@ class LocalValidationTests(unittest.TestCase):
         self.repo = Path(temp.name)
         self.output = self.repo / "audit"
         self.digest = self.enterContext(
-            patch("tools.autotest_supervisor.tree_digest", return_value="source")
+            patch("tools.local_validation.tree_digest", return_value="source")
         )
         self.tools = self.enterContext(
             patch("tools.local_validation.shutil.which", side_effect=lambda name: f"/bin/{name}")

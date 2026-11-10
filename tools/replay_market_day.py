@@ -17,6 +17,13 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, TextIO
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from papertrade.clock import utc_iso
+from papertrade.jsonio import recorded_json as encode
+from tools.source_identity import file_digest as hash_file
+
 STEP = 300
 ALGORITHMS = (
     "flat", "up_10bp", "momentum_5m", "reversion_5m", "trend_15m", "acceleration",
@@ -55,23 +62,11 @@ CREATE TABLE ai_requests (
 """
 
 
-def encode(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-
-
 def parse_at(value: str) -> datetime:
     at = datetime.fromisoformat(value)
     if at.tzinfo is None:
         raise ValueError("Timestamps require a timezone")
     return at.astimezone(UTC)
-
-
-def hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def algorithm_predictions(row: dict[str, Any]) -> dict[str, float | None]:
@@ -192,8 +187,15 @@ def worker_loop(source: TextIO, target: TextIO) -> None:
         target.flush()
 
 
-def sandbox_profile(script: Path, dataset: Path, output: Path) -> str:
+def sandbox_profile(
+    script: Path,
+    dataset: Path,
+    output: Path,
+    *,
+    source_dependencies: tuple[str, ...] = (),
+) -> str:
     binary = Path(sys.executable).resolve()
+    root = script.resolve().parents[1]
     lines = ["(version 1)", "(allow default)", "(deny network*)", "(deny file-write*)",
              "(deny process-exec)",
              f"(allow process-exec (literal {encode(str(binary))}))"]
@@ -203,6 +205,16 @@ def sandbox_profile(script: Path, dataset: Path, output: Path) -> str:
         f"(allow file-read* (subpath {encode(str(Path(sys.prefix).resolve()))}))",
         f"(allow file-read* (literal {encode(str(script.resolve()))}))",
     ])
+    for name in ("", "papertrade", "tools"):
+        lines.append(f"(allow file-read* (literal {encode(str(root / name))}))")
+    for name in (
+        "papertrade/__init__.py",
+        "papertrade/clock.py",
+        "papertrade/jsonio.py",
+        "tools/source_identity.py",
+        *source_dependencies,
+    ):
+        lines.append(f"(allow file-read* (literal {encode(str(root / name))}))")
     return "\n".join(lines)
 
 
@@ -342,7 +354,7 @@ def settle(
                     meter["signed_return_sum"] += actual if prediction > 0 else -actual
     if pending:
         output.execute("UPDATE ticks SET evaluated_at=? WHERE id=?",
-                       (datetime.now(UTC).isoformat(), tick_id))
+                       (utc_iso(), tick_id))
 
 
 def write_report(
@@ -454,7 +466,7 @@ def replay(dataset: Path, destination: Path) -> dict[str, Any]:
                         tick_id, at.isoformat(), len(features), len(candidates),
                         hashlib.sha256(encode(request).encode()).hexdigest(),
                         hashlib.sha256(encode(decisions).encode()).hexdigest(),
-                        datetime.now(UTC).isoformat(),
+                        utc_iso(),
                     ))
                     for feature, decision in zip(features, decisions, strict=True):
                         output.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,NULL,NULL,NULL)", (

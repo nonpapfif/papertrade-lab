@@ -7,11 +7,13 @@ import math
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from papertrade.api import SYMBOL
+from papertrade.clock import utc_iso
+from papertrade.jsonio import canonical_json
 
 DataKind = Literal["price", "book", "candles"]
 type Parameters = tuple[tuple[str, str | int], ...]
@@ -41,7 +43,7 @@ def finite_json(value: object) -> str:
             raise ValueError("Market data must contain JSON values")
 
     validate(value)
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return canonical_json(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +69,13 @@ class DataRequest:
     def __post_init__(self) -> None:
         if self.market not in ("KR", "US") or self.kind not in ("price", "book", "candles"):
             raise ValueError("Invalid market-data request group")
-        if not isinstance(self.symbols, tuple) or not self.symbols or any(
-            not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol) for symbol in self.symbols
+        if (
+            not isinstance(self.symbols, tuple)
+            or not self.symbols
+            or any(
+                not isinstance(symbol, str) or not SYMBOL.fullmatch(symbol)
+                for symbol in self.symbols
+            )
         ):
             raise ValueError("Invalid market-data request symbols")
         if len(self.symbols) != len(set(self.symbols)):
@@ -202,7 +209,7 @@ class MarketDataRepository:
         (sequence,) = self._db.execute(
             "SELECT coalesce(max(sequence), 0) FROM market_data_history"
         ).fetchone()
-        return DataCut(sequence, at if at is not None else datetime.now(UTC).isoformat())
+        return DataCut(sequence, at if at is not None else utc_iso())
 
     def lookup(self, request: DataRequest, *, now: str) -> dict[str, DataRecord]:
         cut = request.as_of_cut
@@ -258,8 +265,15 @@ class MarketDataRepository:
                      source_epoch, received_epoch, source_identity, payload)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (*key, row.source_time, row.received_time, source, received,
-                     row.source_identity, payload),
+                    (
+                        *key,
+                        row.source_time,
+                        row.received_time,
+                        source,
+                        received,
+                        row.source_identity,
+                        payload,
+                    ),
                 )
                 sequence = cursor.lastrowid
                 if sequence is None:
@@ -278,7 +292,14 @@ class MarketDataRepository:
                     (*key, sequence, source, received),
                 )
                 result[row.symbol] = DataRecord(
-                    market, kind, row.symbol, parameters, row.source_time, row.received_time,
-                    sequence, row.source_identity, payload,
+                    market,
+                    kind,
+                    row.symbol,
+                    parameters,
+                    row.source_time,
+                    row.received_time,
+                    sequence,
+                    row.source_identity,
+                    payload,
                 )
         return result

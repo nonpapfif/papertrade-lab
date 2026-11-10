@@ -6,14 +6,8 @@ from typing import Any
 
 from papertrade.core import SafetyError, Settings
 from tools.kr_comparison_ai import ASTRA, SOL, request_review
-from tools.layered_paper import REBOUND_NET_TARGET
+from tools.strategy_catalog import ENTRY_OPTIONS
 
-# Candle highs are excluded from the supported strategy set for this experiment.
-ENTRY_OPTIONS = {
-    "policy": ("trend", "rebound", REBOUND_NET_TARGET),
-    "selection": ("all", "active"),
-    "allocation": ("equal", "priority"),
-}
 ACTIONS = ("keep", "change", "defer")
 SCHEMA: dict[str, Any] = {
     "type": "object",

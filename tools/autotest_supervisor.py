@@ -14,14 +14,16 @@ import time
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from threading import Event, Thread
 from typing import Any
 
 from papertrade.ai import DISABLED_FEATURES, codex_environment, parse_codex_events
+from papertrade.clock import utc_iso as now
+from papertrade.jsonio import atomic_json, read_json
 from papertrade.usage import read_metadata
-from tools.autotest_jobs import atomic_json, poll_job, start_job
+from tools.autotest_jobs import poll_job, start_job
 from tools.local_validation import require_report
 from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
+from tools.source_identity import command, tree_digest
 from tools.supervisor_scopes import (
     PARTITIONED_TEST_MODULES,
     RECURRING_CONTRACT,
@@ -140,8 +142,11 @@ PROTECTED = (
     "papertrade/ai.py",
     "papertrade/usage.py",
     "papertrade/core.py",
+    "papertrade/clock.py",
+    "papertrade/jsonio.py",
     "tools/autotest_supervisor.py",
     "tools/autotest_jobs.py",
+    "tools/source_identity.py",
     "tools/supervisor_scopes.py",
     "AGENTS.md",
     "pyproject.toml",
@@ -174,22 +179,6 @@ EDITABLE_EXISTING = {
     "tools/live_execution.py",
     *(name.replace(".", "/") + ".py" for name in REGRESSION_MODULES),
 }
-
-
-def now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text())
-    if not isinstance(value, dict):
-        raise TypeError(f"Expected JSON object: {path.name}")
-    return value
-
-
-def command(argv: list[str], cwd: Path) -> str:
-    result = subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True)
-    return result.stdout.strip()
 
 
 def validate_result(role: str, value: dict[str, Any]) -> None:
@@ -232,22 +221,6 @@ def validate_fields(fields: dict[str, Any], value: dict[str, Any]) -> None:
                 raise ValueError(f"Unknown requirement: {name}")
         if "minimum" in field and item < field["minimum"]:
             raise ValueError(f"Invalid result minimum: {name}")
-
-
-def tree_digest(repo: Path) -> str:
-    paths = command(["git", "ls-files", "--cached", "--others", "--exclude-standard"], repo)
-    digest = hashlib.sha256()
-    for name in sorted(set(paths.splitlines())):
-        path = repo / name
-        digest.update(name.encode())
-        if path.is_symlink():
-            digest.update(b"symlink:" + os.readlink(path).encode())
-        elif path.is_file():
-            digest.update(path.read_bytes())
-            digest.update(b"executable" if path.stat().st_mode & 0o111 else b"regular")
-        else:
-            digest.update(b"missing")
-    return digest.hexdigest()
 
 
 def changed_paths(repo: Path) -> list[str]:
@@ -1322,55 +1295,54 @@ def main() -> None:
     with (args.output / "supervisor.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         audit = RuntimeAudit(args.output / "runtime-audit.sqlite3", "engineering-supervisor")
-        supervisor = Supervisor(
-            args.repo,
-            args.output,
-            args.codex,
-            args.inherited,
-            kr_until=args.kr_until.isoformat() if args.kr_until else None,
-            scope=args.scope,
-            audit=audit,
-            local_validation=args.local_validation.resolve() if args.local_validation else None,
-        )
-        terminal_phases = {"complete", "blocked", "pr_ready", "validation_pending"}
-        if supervisor.state["phase"] == "validation_pending" and args.local_validation:
-            supervisor.transition("publish")
-        if supervisor.state["phase"] in terminal_phases:
-            return
-        if args.scope != REFACTOR_SCOPE and "trusted_live_commit" not in supervisor.state:
-            if command(["git", "status", "--porcelain"], args.repo):
-                raise RuntimeError("Initial trusted live checkout must be clean")
-            supervisor.state["trusted_live_commit"] = command(
-                ["git", "rev-parse", "HEAD"], args.repo
+        with (
+            audit.capture_runtime_failures("engineering_handoff"),
+            audit.watching(),
+            audit.operation("engineering_handoff", "supervisor_failed"),
+        ):
+            supervisor = Supervisor(
+                args.repo,
+                args.output,
+                args.codex,
+                args.inherited,
+                kr_until=args.kr_until.isoformat() if args.kr_until else None,
+                scope=args.scope,
+                audit=audit,
+                local_validation=args.local_validation.resolve() if args.local_validation else None,
             )
-            supervisor.state["trusted_live_digest"] = tree_digest(args.repo)
-            supervisor.save()
-        if supervisor.state["phase"] not in ("publish", "pr_wait"):
-            metadata = read_metadata(
-                [str(args.codex), "app-server", "--listen", "stdio://", "-c", "mcp_servers={}"],
-                codex_environment(),
-            )
-            catalog = {item["model"]: item["efforts"] for item in metadata["models"]}
-            for role in ("implement", "review"):
-                model, effort = MODELS[role]
-                if effort not in catalog.get(model, []):
-                    raise RuntimeError(f"Requested model/effort unavailable: {model}/{effort}")
-            atomic_json(args.output / "metadata.json", metadata)
-        stop = Event()
-        watchdog = Thread(target=audit.watch, args=(stop,), name="supervisor-audit")
-        watchdog.start()
-        try:
-            while supervisor.state["phase"] not in terminal_phases:
-                before = supervisor.state["phase"]
-                supervisor.step()
-                if supervisor.state["phase"] == before:
-                    time.sleep(2)
-        except Exception as error:
-            supervisor.transition("blocked", reason=type(error).__name__, failure_phase=before)
-            raise
-        finally:
-            stop.set()
-            watchdog.join()
+            terminal_phases = {"complete", "blocked", "pr_ready", "validation_pending"}
+            if supervisor.state["phase"] == "validation_pending" and args.local_validation:
+                supervisor.transition("publish")
+            if supervisor.state["phase"] in terminal_phases:
+                return
+            if args.scope != REFACTOR_SCOPE and "trusted_live_commit" not in supervisor.state:
+                if command(["git", "status", "--porcelain"], args.repo):
+                    raise RuntimeError("Initial trusted live checkout must be clean")
+                supervisor.state["trusted_live_commit"] = command(
+                    ["git", "rev-parse", "HEAD"], args.repo
+                )
+                supervisor.state["trusted_live_digest"] = tree_digest(args.repo)
+                supervisor.save()
+            if supervisor.state["phase"] not in ("publish", "pr_wait"):
+                metadata = read_metadata(
+                    [str(args.codex), "app-server", "--listen", "stdio://", "-c", "mcp_servers={}"],
+                    codex_environment(),
+                )
+                catalog = {item["model"]: item["efforts"] for item in metadata["models"]}
+                for role in ("implement", "review"):
+                    model, effort = MODELS[role]
+                    if effort not in catalog.get(model, []):
+                        raise RuntimeError(f"Requested model/effort unavailable: {model}/{effort}")
+                atomic_json(args.output / "metadata.json", metadata)
+            try:
+                while supervisor.state["phase"] not in terminal_phases:
+                    before = supervisor.state["phase"]
+                    supervisor.step()
+                    if supervisor.state["phase"] == before:
+                        time.sleep(2)
+            except Exception as error:
+                supervisor.transition("blocked", reason=type(error).__name__, failure_phase=before)
+                raise
 
 
 if __name__ == "__main__":

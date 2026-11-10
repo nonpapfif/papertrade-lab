@@ -9,9 +9,10 @@ import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+from papertrade.jsonio import journal_json as encode
 
 SCHEMA = 1
 
@@ -28,10 +29,6 @@ def _made_progress(event: dict[str, Any]) -> bool:
 
 class JournalError(RuntimeError):
     """The journal cannot safely be used for recovery."""
-
-
-def encode(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=asdict)
 
 
 def digest(value: str) -> str:

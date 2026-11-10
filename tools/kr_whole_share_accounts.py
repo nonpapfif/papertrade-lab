@@ -6,10 +6,13 @@ import json
 from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from tools.kr_comparison_account import Account
 from tools.replay_kr_paper_costs import COMMISSION, STOCK_SELL_TAX, Ledger, listings
-from tools.run_kr_paper_comparison import Account, Comparison
+
+if TYPE_CHECKING:
+    from tools.run_kr_paper_comparison import Comparison
 
 
 class WholeShareAccount(Account):

@@ -11,7 +11,7 @@ import signal
 import tempfile
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -22,7 +22,9 @@ from papertrade.ai import (
     parse_codex_events,
     sandbox_profile,
 )
-from papertrade.core import SafetyError, Settings, decimal, encode
+from papertrade.clock import now_utc
+from papertrade.core import SafetyError, Settings, decimal
+from papertrade.jsonio import paper_json as encode
 
 if TYPE_CHECKING:
     from tools.run_kr_paper_comparison import Comparison
@@ -417,7 +419,7 @@ async def review_cascade(
     decide_signal: Callable[..., Awaitable[tuple[dict[str, str], dict[str, Decimal]]]] = decide,
 ) -> None:
     account = comparison.accounts["ai"]
-    payload = review_payload(comparison, signals, datetime.now(UTC))
+    payload = review_payload(comparison, signals, now_utc())
     if unavailable := payload.get("unavailable_context"):
         record("ai_context_unavailable", symbols=unavailable)
     signals = payload["signals"]
@@ -433,7 +435,7 @@ async def review_cascade(
         approved, watches = await decide_signal(
             settings, payload, model=model, deferred=deferred, holds=holds
         )
-        decided = datetime.now(UTC)
+        decided = now_utc()
         record(
             "ai_decision",
             review_id=review_id,
@@ -456,12 +458,12 @@ async def review_cascade(
             and comparison.ai_latest.get(signal["symbol"]) == signal
             and account.wants(signal)
         ]
-        escalation = review_payload(comparison, remaining, datetime.now(UTC))
+        escalation = review_payload(comparison, remaining, now_utc())
         if unavailable := escalation.get("unavailable_context"):
             record("ai_context_unavailable", symbols=unavailable)
         remaining = escalation["signals"]
         selected = {signal["symbol"] for signal in remaining}
-        if not selected or datetime.now(UTC) >= until:
+        if not selected or now_utc() >= until:
             if deferred:
                 record(
                     "ai_handoff_not_started",
@@ -492,7 +494,7 @@ async def review_cascade(
             **escalation,
         )
         approved, watches = await decide_signal(settings, escalation, model=model, holds=holds)
-        decided = datetime.now(UTC)
+        decided = now_utc()
         if decided < until:
             completed[model] += 1
             deferred_symbols = {signal["symbol"] for signal in remaining}

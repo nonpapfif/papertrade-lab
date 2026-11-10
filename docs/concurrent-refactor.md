@@ -1,5 +1,8 @@
 # Concurrent paper refactor
 
+The [runtime maintenance contract](runtime-maintenance.md) defines common utility ownership,
+dependency direction and error/warning audit coverage for this implementation.
+
 This contract defines the authorized offline engineering scope. Use the constrained paper
 execution rules and existing accounting. The failed r4 run remains read-only diagnostic evidence.
 Use a new run identity and data directory. Do not resume r4 against changed code or reuse its
@@ -53,6 +56,21 @@ Reuse existing modules and classes. These are logical responsibilities, so they 
 
 `tools/runtime_audit.py` persists incidents and monitors registered workers. Campaign and finite
 session watchdogs run separately from the work they observe.
+
+The audit stores warning and error severity with sanitized identity and origin fields. Repeated
+incidents share an identity. An active warning can escalate to an error, and a verified successful
+observation can resolve the matching incident. When audit storage fails, a separate sanitized
+emergency record identifies the failure and the runtime blocks the next economic commit.
+
+Active campaign and account processes scope Python warning, emitted logging, unhandled asynchronous
+task and thread capture to their runtime owner. The scopes restore the previous handlers and
+warning filters on exit. Diagnostic records keep the source basename, line and category or
+exception type. Application messages and arguments stay outside the audit. A logging call that
+Python filters before creating a record does not emit a diagnostic.
+
+Normal queue waits, receive polling, client EOF, expected task cancellation and market or calendar
+cutoffs are control flow. Rejected data, protocol violations, unexpected disconnects and failed
+cleanup are recorded separately.
 
 The engineering supervisor runs focused offline regression jobs and gives Astra the corresponding
 source and evidence. Full local validation checks the same source separately and includes tests

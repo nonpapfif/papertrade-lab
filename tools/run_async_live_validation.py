@@ -22,10 +22,13 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, TextIO
 
-from papertrade.api import ApiError, MarketClient, private_json
+from papertrade.api import ApiError, MarketClient
+from papertrade.clock import utc_iso as now
 from papertrade.core import SafetyError, Settings
+from papertrade.jsonio import journal_json as encode
+from papertrade.jsonio import private_json
 from tools.account_executor import AccountAction, AccountExecutor, AccountResult
-from tools.adaptive_journal import AdaptiveJournal, JournalError, digest, encode
+from tools.adaptive_journal import AdaptiveJournal, JournalError, digest
 from tools.async_layered_paper import (
     NET_TARGET_BLOCKED,
     AsyncLayeredPaper,
@@ -53,50 +56,51 @@ from tools.probe_toss_websocket import (
     CachedTokenClient,
     declaration,
     error_details,
-    now,
     read_spec,
 )
 from tools.runtime_audit import DISPATCH_BACKLOG_TIMEOUT, DISPATCH_TIMEOUT, RuntimeAudit
 from tools.shared_feed_slots import SharedFeedSlots, validate_session_seeds
 from tools.slot_control import SlotControl
-from tools.us_adaptive_ai import ASTRA, ENTRY_OPTIONS, SOL, propose
+from tools.source_identity import file_digest
+from tools.strategy_catalog import ENTRY_OPTIONS
+from tools.us_adaptive_ai import ASTRA, SOL, propose
 
-LEGACY_SOURCES = (
+SOURCES = (
     "tools/run_async_live_validation.py",
+    "papertrade/__init__.py",
+    "papertrade/ai.py",
+    "papertrade/api.py",
+    "papertrade/audit.py",
+    "papertrade/clock.py",
+    "papertrade/core.py",
+    "papertrade/jsonio.py",
+    "papertrade/store.py",
+    "papertrade/usage.py",
+    "tools/account_executor.py",
+    "tools/adaptive_journal.py",
     "tools/async_layered_paper.py",
+    "tools/kr_broker_profile.py",
+    "tools/kr_comparison_ai.py",
     "tools/layered_paper.py",
     "tools/live_execution.py",
-    "papertrade/api.py",
-    "tools/paper_market.py",
-    "tools/toss_order_contract.py",
-    "tools/account_executor.py",
+    "tools/live_feed.py",
     "tools/market_data_adapter.py",
     "tools/market_data_gateway.py",
     "tools/market_data_repository.py",
-    "tools/runtime_audit.py",
-    "papertrade/audit.py",
-)
-SOURCES = (
-    *LEGACY_SOURCES,
-    "papertrade/core.py",
-    "tools/live_feed.py",
+    "tools/paper_market.py",
     "tools/probe_toss_websocket.py",
+    "tools/replay_market_day.py",
+    "tools/research_metadata.py",
+    "tools/runtime_audit.py",
     "tools/search_portfolios.py",
-    "tools/week_hypotheses.py",
-)
-
-ADAPTIVE_SOURCES = (
-    *SOURCES,
-    "tools/us_adaptive_ai.py",
-    "tools/adaptive_journal.py",
-    "tools/kr_comparison_ai.py",
-    "papertrade/ai.py",
-)
-SLOT_SOURCES = (
     "tools/shared_feed_slots.py",
     "tools/slot_control.py",
+    "tools/source_identity.py",
+    "tools/strategy_catalog.py",
+    "tools/toss_order_contract.py",
+    "tools/us_adaptive_ai.py",
+    "tools/week_hypotheses.py",
 )
-KR_SOURCES = ("tools/kr_broker_profile.py",)
 HELD_QUOTE_RETRY_SECONDS = 5.0
 
 MARKET_CAPABILITY_SNAPSHOT = {
@@ -246,6 +250,7 @@ class Runtime:
         self._delivery_backup: tuple[dict[str, int], dict[str, int], dict[str, Any]] | None = None
         self._account_records: list[tuple[str, dict[str, Any]]] = []
         self._failed_cut = False
+        self._feed_incidents: dict[str | None, set[str]] = {}
         self.adaptive = adaptive
         if adaptive and (not self.constrained or candidate_policy is not None or end_epoch is None):
             raise ValueError("Adaptive experiment requires a constrained profile and fixed end")
@@ -462,6 +467,28 @@ class Runtime:
         self._account_records.clear()
         self._failed_cut = True
 
+    def _feed_incident(
+        self, code: str, sequence: int, symbol: str | None = None, *,
+        error: BaseException | None = None,
+    ) -> None:
+        if self.audit is None:
+            return
+        self.audit.record(
+            "ordered_dispatch", code,
+            {"account_id": self.account_prefix or "runtime", "symbol": symbol, "sequence": sequence},
+            severity="warning", error=error,
+        )
+        self._feed_incidents.setdefault(symbol, set()).add(code)
+
+    def _resolve_feed_incidents(self, sequence: int, symbol: str | None = None) -> None:
+        if self.audit is None:
+            return
+        context = {
+            "account_id": self.account_prefix or "runtime", "symbol": symbol, "sequence": sequence,
+        }
+        for code in self._feed_incidents.pop(symbol, ()):
+            self.audit.record("ordered_dispatch", code, context, state="resolved")
+
     def _record_account(self, kind: str, **fields: Any) -> None:
         if self.concurrent_accounts:
             self._account_records.append((kind, fields))
@@ -487,7 +514,9 @@ class Runtime:
             self.account_executor.close()
         if self.review_task is not None:
             self.review_task.cancel()
-            await asyncio.gather(self.review_task, return_exceptions=True)
+            results = await asyncio.gather(self.review_task, return_exceptions=True)
+            if self.audit is not None:
+                self.audit.report_task_failures("strategic_review", "task_cleanup_failed", results)
             self.review_task = None
         for account in self.accounts.values():
             await account.close()
@@ -666,6 +695,12 @@ class Runtime:
                     "ai_review", review_id=review_id, model=model, effort="medium", **payload
                 )
                 response = await propose(settings, payload, model)
+                if self.audit is not None:
+                    self.audit.record(
+                        "strategic_review", "model_review_failed",
+                        {"account_id": self.account_prefix or "runtime", "request_id": model},
+                        state="resolved",
+                    )
                 after_cutoff = self.end_epoch is None or time.time() >= self.end_epoch
                 self.record(
                     "ai_decision",
@@ -682,6 +717,11 @@ class Runtime:
                 payload = {**payload, "sol_question": response["reason"]}
                 model = ASTRA
         except (SafetyError, OSError) as error:
+            if self.audit is not None:
+                self.audit.report_exception(
+                    "strategic_review", "model_review_failed", error,
+                    {"account_id": self.account_prefix or "runtime", "request_id": model},
+                )
             self.record(
                 "ai_review_failed",
                 model=model,
@@ -764,6 +804,11 @@ class Runtime:
                     self._commit(entry)
             except BaseException as error:
                 self.abort_accounts()
+                if self.audit is not None and not isinstance(error, asyncio.CancelledError):
+                    self.audit.report_exception(
+                        "ordered_dispatch", "runtime_event_failed", error,
+                        {"sequence": sequence, "account_id": self.account_prefix or "runtime"},
+                    )
                 if isinstance(error, (ValueError, TypeError, KeyError, RuntimeError, OverflowError)):
                     self.record(
                         "runtime_event_failed",
@@ -807,6 +852,11 @@ class Runtime:
         elif kind == "calendar":
             day, calendar = payload
             self.regular_window = us_regular_window(calendar, day, self.market)
+            if self.regular_window is None and self.audit is not None:
+                self.audit.record(
+                    "provider_adapter", "calendar_window_unavailable",
+                    {"market": self.market.code, "event_id": day}, severity="warning",
+                )
         elif kind == "feature":
             symbol, rows = payload
             if self.constrained:
@@ -841,9 +891,11 @@ class Runtime:
             self.features[symbol] = feature
             self.counts["features_valid" if self.features[symbol] else "features_missing"] += 1
         elif kind == "fx":
+            conversion_error = None
             try:
                 rate = float(payload["midRate"])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as error:
+                conversion_error = error
                 rate = 0
             pair_matches = (
                 payload.get("baseCurrency", "USD") == "USD"
@@ -851,7 +903,10 @@ class Runtime:
             )
             if not math.isfinite(rate) or rate <= 0 or not pair_matches:
                 self.counts["invalid_fx"] += 1
+                self._feed_incident("invalid_fx", sequence, error=conversion_error)
                 rate = 0
+            else:
+                self._resolve_feed_incidents(sequence)
             self.fx = (
                 rate,
                 received,
@@ -875,6 +930,7 @@ class Runtime:
             self.counts["book_events"] += 1
             if not isinstance(book, dict) or not isinstance(book.get("timestamp"), str):
                 self.counts["book_unavailable"] += 1
+                self._feed_incident("book_unavailable", sequence, symbol)
                 self.record(
                     "book_rejected",
                     reason="unavailable_timestamp",
@@ -884,21 +940,27 @@ class Runtime:
                 return
             try:
                 source_age = seconds(received) - seconds(book["timestamp"])
-            except (ValueError, OverflowError):
+            except (ValueError, OverflowError) as error:
                 self.counts["invalid_source_age"] += 1
+                self._feed_incident("invalid_source_age", sequence, symbol, error=error)
                 return
             if not 0 <= source_age <= 60:
                 self.counts["invalid_source_age"] += 1
+                self._feed_incident("invalid_source_age", sequence, symbol)
                 return
             at = self.processing_clock.stamp(entry, entry.get("at") or now(), self.record)
             if "wall_at" in entry:
                 self.counts["books_skipped_clock_regression"] += 1
+                self._feed_incident("books_skipped_clock_regression", sequence, symbol)
                 return
             if self.adaptive and self.end_epoch is not None and seconds(at) >= self.end_epoch:
                 self.counts["after_experiment_cutoff"] += 1
                 return
+            currency_mismatch = book.get("currency") != self.market.currency
+            if currency_mismatch:
+                self._feed_incident("book_currency_mismatch", sequence, symbol)
             if self.constrained:
-                if self.market is KR and book.get("currency") != KR.currency:
+                if self.market is KR and currency_mismatch:
                     self.counts["book_currency_mismatch"] += 1
                     return
                 window = self.regular_window
@@ -910,6 +972,7 @@ class Runtime:
                     return
                 if self.market is US and (not book["asks"] or not book["bids"]):
                     self.counts["missing_book_depth"] += 1
+                    self._feed_incident("missing_book_depth", sequence, symbol)
                     return
             old = self.books.get(symbol)
             if old and seconds(old["timestamp"]) > seconds(book["timestamp"]):
@@ -937,6 +1000,7 @@ class Runtime:
                 if reason is not None:
                     self.unactionable_books.add(symbol)
                     self.counts[reason] += 1
+                    self._feed_incident(reason, sequence, symbol)
                     self.record(
                         "book_unactionable",
                         reason=reason,
@@ -953,6 +1017,7 @@ class Runtime:
                 > min(float(row["price"]) for row in book["asks"])
             ):
                 self.counts["crossed_orderbook_rejected"] += 1
+                self._feed_incident("crossed_orderbook_rejected", sequence, symbol)
                 self.record(
                     "book_rejected",
                     reason="crossed_orderbook",
@@ -961,6 +1026,8 @@ class Runtime:
                     source_at=book["timestamp"],
                 )
                 return
+            if not currency_mismatch and symbol not in self.unactionable_books:
+                self._resolve_feed_incidents(sequence, symbol)
             self.books[symbol] = book
             f = self.features.get(symbol)
             if f is not None and not self.constrained:
@@ -1339,25 +1406,17 @@ def write_comparison(
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     expected = manifest.get("source_sha256", {})
-    sources: tuple[str, ...] = (
-        SOURCES if runtime.constrained or len(runtime.accounts) > 1 else LEGACY_SOURCES
-    )
-    if runtime.adaptive:
-        sources = ADAPTIVE_SOURCES
-    if runtime.market is KR:
-        sources += KR_SOURCES
-    expected_sources = set(sources)
+    expected_sources = set(SOURCES)
     source_unchanged = set(expected) == expected_sources and all(
         (ROOT / name).is_file()
-        and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected[name]
+        and file_digest(ROOT / name) == expected[name]
         for name in expected_sources
     )
     hashes = {}
     for name in ("manifest.json", "market.jsonl.gz", "events.jsonl"):
         path = output / name
         if path.is_file():
-            with path.open("rb") as stream:
-                hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+            hashes[name] = file_digest(path)
     runtime_status = runtime.status(stats.get("at") or stats.get("ended_at"))
     comparison = runtime_status.get("comparison", {})
     if len(runtime.accounts) == 1:
@@ -1603,11 +1662,6 @@ def journal_identity(
     slot_control: Path | None = None,
     campaign_seeds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    sources: tuple[str, ...] = ADAPTIVE_SOURCES
-    if market is KR:
-        sources += KR_SOURCES
-    if slot_control is not None:
-        sources += SLOT_SOURCES
     return {
         "profile": "broker-constrained",
         "experiment": "adaptive_exploration" if slot_control is None else "shared_feed_slots",
@@ -1618,9 +1672,9 @@ def journal_identity(
         "capital": float(capital),
         "end_epoch": end_epoch,
         "source_sha256": {
-            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in sources
+            path: file_digest(ROOT / path) for path in SOURCES
         },
-        "settings_sha256": hashlib.sha256((ROOT / "settings.toml").read_bytes()).hexdigest(),
+        "settings_sha256": file_digest(ROOT / "settings.toml"),
     }
 
 
@@ -1785,6 +1839,7 @@ async def _campaign(
     token = ""
     resync = asyncio.Event()
     monitor = ExitStack()
+    monitor.enter_context(audit.capture_runtime_failures("campaign_runner"))
     monitor.enter_context(audit.watching())
     try:
         if slots is not None:
@@ -1873,13 +1928,6 @@ async def _campaign(
         calendar = await asyncio.to_thread(adapter.read, client.calendar, market.code, calendar_day)
         if constrained:
             runtime.publish("calendar", (calendar_day, calendar))
-        sources: tuple[str, ...] = (
-            SOURCES if candidate_policy is not None or constrained else LEGACY_SOURCES
-        )
-        if adaptive:
-            sources = ADAPTIVE_SOURCES
-        if market is KR:
-            sources += KR_SOURCES
         stream_market = market.code.lower()
         private_json(
             output / "manifest.json",
@@ -1908,7 +1956,7 @@ async def _campaign(
                 "source_sha256": (
                     journal.identity["source_sha256"]
                     if journal is not None
-                    else {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in sources}
+                    else {p: file_digest(ROOT / p) for p in SOURCES}
                 ),
                 "selection": (
                     "Absolute change between consecutive fresh minute scans; "
@@ -1983,6 +2031,10 @@ async def _campaign(
                     )
 
             async def symbol_failure(symbol: str, error: ApiError) -> None:
+                audit.report_exception(
+                    "collector", "rest_symbol_failure", error,
+                    {"market": market.code, "symbol": symbol}, severity="warning",
+                )
                 record(
                     "rest_symbol_failure",
                     symbol=symbol,
@@ -2218,7 +2270,11 @@ async def _campaign(
                     + "\n"
                 )
                 raw.flush()
-                return ValueError(f"Invalid WebSocket frame: {code}")
+                error = ValueError(f"Invalid WebSocket frame: {code}")
+                audit.report_exception(
+                    "provider_adapter", code, error, {"market": market.code},
+                )
+                return error
 
             injected = False
             while time.monotonic() < deadline:
@@ -2237,6 +2293,10 @@ async def _campaign(
                     ) as ws:
                         stats["connections"] += 1
                         record("connected", connection=stats["connections"])
+                        for code in ("websocket_disconnected", "websocket_handshake_failed"):
+                            audit.record(
+                                "provider_adapter", code, {"market": market.code}, state="resolved",
+                            )
                         resync.set()
                         selected: list[str] = []
                         accepted: set[str] = set()
@@ -2340,6 +2400,11 @@ async def _campaign(
                                 raise rejected_frame(wire, received, "unknown_type")
                 except InvalidStatus as error:
                     status = error.response.status_code
+                    audit.report_exception(
+                        "provider_adapter", "websocket_handshake_failed", error,
+                        {"market": market.code, "http_status": status},
+                        severity="warning" if status in (429, 503) else "error",
+                    )
                     if not adaptive or status not in (429, 503):
                         raise
                     record("connection_failure", **error_details(error, token))
@@ -2352,6 +2417,10 @@ async def _campaign(
                         ),
                     ) from error
                 except (ConnectionClosed, OSError, TimeoutError) as error:
+                    audit.report_exception(
+                        "provider_adapter", "websocket_disconnected", error,
+                        {"market": market.code}, severity="warning",
+                    )
                     record("connection_failure", **error_details(error, token))
                 if time.monotonic() < deadline:
                     record("reconnect_backoff", seconds=2)
@@ -2404,7 +2473,11 @@ async def _campaign(
                 producer.cancel()
         if adaptive:
             await collector
-        await asyncio.gather(collector, streamer, return_exceptions=True)
+        for producer_result in await asyncio.gather(collector, streamer, return_exceptions=True):
+            if isinstance(producer_result, BaseException) and not isinstance(
+                producer_result, asyncio.CancelledError,
+            ):
+                raise producer_result
         if consumer.done():
             consumer.result()
         drain = asyncio.create_task(runtime.queue.join())
@@ -2486,17 +2559,24 @@ async def _campaign(
         at = now()
         stats.update(state="failed", at=at, **runtime.status(at), **error_details(error, token))
         record("failed", **error_details(error, token))
-        audit.record("campaign_runner", "campaign_failed", {"market": market.code}, error=error)
+        audit.report_exception(
+            "campaign_runner", "campaign_failed", error, {"market": market.code},
+        )
         raise SystemExit("Live validation failed; inspect sanitized status") from None
     finally:
         try:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if gateway is not None:
-                await gateway.close()
-            await runtime.close()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            audit.report_task_failures("campaign_runner", "task_cleanup_failed", results)
+            try:
+                if gateway is not None:
+                    with audit.cleanup("market_data_gateway", "cleanup_failed"):
+                        await gateway.close()
+            finally:
+                with audit.cleanup("campaign_runner", "account_cleanup_failed"):
+                    await runtime.close()
             if stats.get("state") not in ("complete", "failed", "interrupted"):
                 stats.update(state="interrupted", ended_at=now())
             elif stats.get("state") == "complete":
@@ -2519,7 +2599,7 @@ async def _campaign(
                 assert journal is not None
                 source_unchanged = all(
                     (ROOT / name).is_file()
-                    and hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected
+                    and file_digest(ROOT / name) == expected
                     for name, expected in journal.identity["source_sha256"].items()
                 )
                 stats["shared_feed"] = {
@@ -2545,7 +2625,11 @@ async def _campaign(
                 journal.complete()
             private_json(output / "status.json", stats)
         finally:
-            monitor.close()
+            try:
+                with audit.cleanup("campaign_runner", "file_cleanup_failed"):
+                    files.close()
+            finally:
+                monitor.close()
 
 
 def main() -> None:

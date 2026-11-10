@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from .audit import Audit, sanitize
-from .core import SafetyError, Settings, encode, now_utc, process_identity
+from .clock import now_utc
+from .core import SafetyError, Settings, process_identity
+from .jsonio import paper_json as encode
 from .store import Store
 from .usage import read_metadata, select_model
 

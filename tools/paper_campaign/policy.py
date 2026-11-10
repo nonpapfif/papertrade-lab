@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass
 from typing import Any
 
-from tools.paper_capacity import assess, strategies
-from tools.slot_control import encode
-from tools.us_adaptive_ai import ENTRY_OPTIONS
+from papertrade.jsonio import canonical_json as encode
+from tools.capacity_admission import assess
+from tools.capacity_admission import finite_number as numeric
+from tools.strategy_catalog import ENTRY_OPTIONS, strategies, valid_entry_options
 
 BASELINE = {"policy": "trend", "selection": "all", "allocation": "equal"}
 CAPITALS = {"KR": 1_000_000, "US": 1_000}
@@ -62,11 +62,7 @@ class Admission:
             raise ValueError("Capacity evidence has no reliable slots")
         configs: dict[str, dict[str, str]] = {}
         for config in candidates:
-            if (
-                not isinstance(config, dict)
-                or config.keys() != ENTRY_OPTIONS.keys()
-                or any(config[key] not in choices for key, choices in ENTRY_OPTIONS.items())
-            ):
+            if not valid_entry_options(config):
                 raise ValueError("Capacity report has an invalid strategy")
             slot_id = "-".join(config[key] for key in ENTRY_OPTIONS)
             if slot_id in configs:
@@ -128,14 +124,3 @@ def next_plan(
     ):
         raise ValueError("Review skipped eligible newcomer exposure")
     return chosen
-
-
-def numeric(value: Any) -> float | None:
-    if type(value) not in (int, float):
-        return None
-    try:
-        if not math.isfinite(value):
-            return None
-    except OverflowError:
-        return None
-    return float(value)

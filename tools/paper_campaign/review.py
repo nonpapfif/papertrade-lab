@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from papertrade.core import SafetyError, Settings
-from tools.autotest_jobs import ROOT, atomic_json, poll_job, start_job
-from tools.autotest_supervisor import read_json
+from papertrade.jsonio import atomic_json, read_json
+from tools.autotest_jobs import ROOT, poll_job, start_job
 from tools.kr_comparison_ai import ASTRA, request_review
 from tools.paper_campaign.policy import fingerprint
 from tools.runtime_audit import RuntimeAudit
@@ -150,7 +150,10 @@ class AstraReview:
         }
         atomic_json(path, result)
         if self.audit is not None:
-            self.audit.record("strategic_review", reason, {"request_id": identity}, error=error)
+            self.audit.record(
+                "strategic_review", reason, {"request_id": identity}, error=error,
+                severity="warning",
+            )
         return result
 
 
@@ -161,7 +164,10 @@ async def run_review(directory: Path, audit: RuntimeAudit | None = None) -> int:
             audit.operation("strategic_review", "model_failed", {"request_id": worker})
             if audit else nullcontext()
         )
-        with scope:
+        with (
+            audit.capture_runtime_failures("strategic_review") if audit else nullcontext(),
+            scope,
+        ):
             if audit is not None:
                 audit.heartbeat("strategic_review", worker_id=worker, status="waiting", pid=os.getpid())
             response = await request_review(

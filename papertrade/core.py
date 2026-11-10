@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import tomllib
 from dataclasses import dataclass
@@ -11,6 +10,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from .clock import now_utc as _now_utc
+from .jsonio import paper_json
+
+encode = paper_json
+now_utc = _now_utc
 
 SEOUL = ZoneInfo("Asia/Seoul")
 NEW_YORK = ZoneInfo("America/New_York")
@@ -39,10 +44,6 @@ def stamp(value: str) -> datetime:
     return result.astimezone(UTC)
 
 
-def now_utc() -> datetime:
-    return datetime.now(UTC)
-
-
 def process_identity(pid: int) -> str | None:
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "lstart="],
@@ -52,15 +53,6 @@ def process_identity(pid: int) -> str | None:
         timeout=5,
     )
     return result.stdout.strip() or None
-
-
-def encode(value: Any) -> str:
-    def default(item: Any) -> str:
-        if isinstance(item, (Decimal, datetime)):
-            return str(item) if isinstance(item, Decimal) else item.isoformat()
-        raise TypeError(type(item).__name__)
-
-    return json.dumps(value, default=default, ensure_ascii=False, separators=(",", ":"))
 
 
 @dataclass(frozen=True)

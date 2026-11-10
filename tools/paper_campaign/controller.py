@@ -8,8 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from tools.autotest_jobs import atomic_json
-from tools.autotest_supervisor import read_json
+from papertrade.jsonio import atomic_json, read_json
 from tools.paper_campaign.calendar import MarketCalendar, Window
 from tools.paper_campaign.evidence import (
     MAX_BOOK_GAP_SECONDS,
@@ -150,7 +149,15 @@ class Campaign:
         session_dir = directory / active["day"]
         if "evidence" not in active:
             try:
-                outcome = self.runner.poll(session_dir, active)
+                with (
+                    self.audit.operation(
+                        "campaign_runner", "session_poll_failed",
+                        {"market": market.code, "event_id": active["day"]}, timeout=30,
+                    ) if self.audit is not None else nullcontext()
+                ):
+                    outcome = self.runner.poll(session_dir, active)
+            except RuntimeAuditError:
+                raise
             except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error) as error:
                 self._block(path, state, session_dir, f"session_{type(error).__name__}")
                 return
@@ -163,6 +170,11 @@ class Campaign:
                 atomic_json(path, state)
                 return
             if outcome["state"] != "complete":
+                if self.audit is not None:
+                    self.audit.record(
+                        "campaign_runner", "session_unsuccessful",
+                        {"market": market.code, "event_id": active["day"]},
+                    )
                 self._block(path, state, session_dir, outcome["reason"])
                 return
             try:
@@ -237,6 +249,7 @@ class Campaign:
                 self.audit.record(
                     "campaign", "session_status_unavailable",
                     {"market": market.code, "event_id": active["day"]}, error=error,
+                    severity="warning",
                 )
             return
         if live is None:
@@ -617,7 +630,13 @@ class Campaign:
             "tests": ["tests.test_paper_campaign", "tests.test_async_live_validation"],
             "required": "Reconcile the worker exit and committed accounts before any restart.",
         }
-        atomic_json(path, handoff)
+        with (
+            self.audit.operation(
+                "engineering_handoff", "write_failed",
+                {"market": market, "request_id": identity}, timeout=10,
+            ) if self.audit is not None and self.audit.healthy else nullcontext()
+        ):
+            atomic_json(path, handoff)
         if self.audit is not None and self.audit.healthy:
             self.audit.record(
                 "engineering_handoff", "campaign_blocked",

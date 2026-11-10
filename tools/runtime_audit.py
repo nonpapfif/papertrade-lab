@@ -2,26 +2,75 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import traceback
+import warnings
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import closing, contextmanager
+from contextlib import AbstractContextManager, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock, Thread
-from typing import Literal
+from typing import Any, Literal, Protocol, cast
 
 from papertrade.audit import sanitize
 
 RuntimeStatus = Literal["active", "idle", "waiting"]
 IncidentState = Literal["open", "resolved"]
+IncidentSeverity = Literal["warning", "error"]
+
+
+class RuntimeAuditSink(Protocol):
+    def operation(
+        self,
+        component: str,
+        code: str,
+        context: Mapping[str, object] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> AbstractContextManager[None]: ...
+
+    def record(
+        self,
+        component: str,
+        code: str,
+        context: Mapping[str, object] | None = None,
+        *,
+        error: BaseException | None = None,
+        severity: IncidentSeverity = "error",
+        state: IncidentState = "open",
+    ) -> str: ...
+
+    def report_exception(
+        self,
+        component: str,
+        code: str,
+        error: BaseException,
+        context: Mapping[str, object] | None = None,
+        *,
+        severity: IncidentSeverity = "error",
+    ) -> None: ...
+
+    def report_task_failures(
+        self,
+        component: str,
+        code: str,
+        results: list[object] | tuple[object, ...],
+    ) -> None: ...
+
+
+_diagnostics = threading.local()
+_diagnostic_lock = Lock()
+_diagnostic_owners: dict[int, tuple[tuple[int, asyncio.Task[Any] | None], int]] = {}
 
 DISPATCH_TIMEOUT = 60.0
 DISPATCH_BACKLOG_TIMEOUT = 10.0
@@ -36,7 +85,16 @@ _IDENTITIES = (
     "market",
     "symbol",
 )
-_CONTEXT_FIELDS = (*_IDENTITIES, "profile_id", "http_status", "queue_depth", "sequence")
+_CONTEXT_FIELDS = (
+    *_IDENTITIES,
+    "profile_id",
+    "http_status",
+    "queue_depth",
+    "sequence",
+    "origin",
+    "line",
+    "event_type",
+)
 _HEALTH_CODES = ("worker_dead", "worker_missing", "progress_stalled", "backlog_overdue")
 
 _SCHEMA = """
@@ -51,7 +109,8 @@ CREATE TABLE IF NOT EXISTS runtime_incidents (
     occurrences INTEGER NOT NULL,
     context TEXT NOT NULL,
     exception_type TEXT,
-    trace TEXT
+    trace TEXT,
+    severity TEXT NOT NULL DEFAULT 'error' CHECK (severity IN ('warning', 'error'))
 );
 CREATE TABLE IF NOT EXISTS runtime_workers (
     run_id TEXT NOT NULL,
@@ -97,11 +156,27 @@ def _safe_context(context: Mapping[str, object] | None) -> dict[str, str | int]:
     safe: dict[str, str | int] = {}
     for key in _CONTEXT_FIELDS:
         value = context.get(key) if context is not None else None
-        if isinstance(value, str) and key not in ("http_status", "queue_depth", "sequence"):
+        if isinstance(value, str) and key not in ("http_status", "queue_depth", "sequence", "line"):
             safe[key] = _label(value)
         elif type(value) is int and -(2**63) <= value < 2**63:
             safe[key] = value
     return safe
+
+
+def _diagnostic_context(category: str, filename: str, lineno: int) -> dict[str, str | int]:
+    category, origin = _label(category), _label(Path(filename).name)
+    identity = hashlib.sha256(f"{category}:{origin}:{lineno}".encode()).hexdigest()[:24]
+    return {"event_id": identity, "event_type": category, "origin": origin, "line": lineno}
+
+
+@contextmanager
+def _forward_diagnostic() -> Iterator[None]:
+    forwarding = getattr(_diagnostics, "forwarding", False)
+    _diagnostics.forwarding = True
+    try:
+        yield
+    finally:
+        _diagnostics.forwarding = forwarding
 
 
 def _finite_number(value: object) -> bool:
@@ -175,6 +250,14 @@ class RuntimeAudit:
         with self._transaction("initialize", initialize=True) as db:
             for statement in _SCHEMA.strip().rstrip(";").split(";"):
                 db.execute(statement)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(runtime_incidents)")}
+            if "trace" not in columns:
+                db.execute("ALTER TABLE runtime_incidents ADD COLUMN trace TEXT")
+            if "severity" not in columns:
+                db.execute(
+                    "ALTER TABLE runtime_incidents ADD COLUMN severity TEXT NOT NULL"
+                    " DEFAULT 'error' CHECK (severity IN ('warning', 'error'))"
+                )
 
     @property
     def healthy(self) -> bool:
@@ -235,6 +318,7 @@ class RuntimeAudit:
         error: BaseException | None = None,
         *,
         aggregate: bool = True,
+        severity: IncidentSeverity = "error",
     ) -> str:
         identity = [context.get(key) for key in _IDENTITIES]
         key = hashlib.sha256(
@@ -258,13 +342,16 @@ class RuntimeAudit:
             db.execute(
                 """INSERT INTO runtime_incidents
                        (id,run_id,component,code,state,first_at,last_at,occurrences,
-                        context,exception_type,trace)
-                   VALUES (?,?,?,?,'open',?,?,1,?,?,?)
+                        context,exception_type,trace,severity)
+                   VALUES (?,?,?,?,'open',?,?,1,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET state='open', last_at=excluded.last_at,
                        occurrences=runtime_incidents.occurrences
                                    + (runtime_incidents.state='resolved' OR ?),
                        context=excluded.context, exception_type=excluded.exception_type,
-                       trace=excluded.trace""",
+                       trace=excluded.trace,
+                       severity=CASE
+                           WHEN runtime_incidents.state='open' AND runtime_incidents.severity='error'
+                           THEN 'error' ELSE excluded.severity END""",
                 (
                     key,
                     self.run_id,
@@ -275,6 +362,7 @@ class RuntimeAudit:
                     json.dumps(context),
                     _label(type(error).__name__) if error is not None else None,
                     trace,
+                    severity,
                     aggregate,
                 ),
             )
@@ -288,7 +376,10 @@ class RuntimeAudit:
         *,
         state: IncidentState = "open",
         error: BaseException | None = None,
+        severity: IncidentSeverity = "error",
     ) -> str:
+        if severity not in ("warning", "error"):
+            raise ValueError("Unknown audit severity")
         with self._transaction("record") as db:
             return self._record(
                 db,
@@ -298,7 +389,45 @@ class RuntimeAudit:
                 self._clock(),
                 state,
                 error,
+                severity=severity,
             )
+
+    def report_exception(
+        self,
+        component: str,
+        code: str,
+        error: BaseException,
+        context: Mapping[str, object] | None = None,
+        *,
+        severity: IncidentSeverity = "error",
+    ) -> None:
+        """Record an existing failure while preserving the caller's exception."""
+        try:
+            self.record(component, code, context, error=error, severity=severity)
+        except RuntimeAuditError:
+            error.add_note("The runtime audit could not persist this failure.")
+
+    def report_task_failures(
+        self,
+        component: str,
+        code: str,
+        results: list[object] | tuple[object, ...],
+    ) -> None:
+        for index, result in enumerate(results):
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                self.report_exception(component, code, result, {"job_id": index})
+
+    @contextmanager
+    def cleanup(self, component: str, code: str) -> Iterator[None]:
+        """Audit cleanup failures without displacing an exception already in flight."""
+        primary = sys.exception()
+        try:
+            yield
+        except Exception as error:
+            self.report_exception(component, code, error)
+            if primary is None:
+                raise
+            primary.add_note(f"Runtime cleanup failed: {_label(component)}/{_label(code)}.")
 
     @contextmanager
     def operation(
@@ -333,10 +462,8 @@ class RuntimeAudit:
             yield
         except BaseException as error:
             original_error = error
-            try:
-                self.record(component, code, context, error=error)
-            except RuntimeAuditError:
-                error.add_note("The runtime audit could not persist this failure.")
+            if not isinstance(error, asyncio.CancelledError):
+                self.report_exception(component, code, error, context)
             raise
         else:
             self.record(component, code, context, state="resolved")
@@ -351,6 +478,170 @@ class RuntimeAudit:
                 finally:
                     with self._operation_lock:
                         self._operation_lanes[identity].remove(lane)
+
+    @contextmanager
+    def capture_runtime_failures(self, component: str) -> Iterator[None]:
+        """Allow lexical nesting by one runtime owner per process."""
+        pid = os.getpid()
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        owner = (threading.get_ident(), task)
+        with _diagnostic_lock:
+            existing = _diagnostic_owners.get(pid)
+            if existing is not None and existing[0] != owner:
+                raise RuntimeError("A different task owns this process diagnostic scope")
+            depth = existing[1] + 1 if existing is not None else 1
+            _diagnostic_owners[pid] = (owner, depth)
+        # A new scope is a new operation even if it reuses a prior warning instance.
+        _diagnostics.last_warning_error = None
+        try:
+            with self._capture_runtime_failures(component), warnings.catch_warnings():
+                # Keep first-match precedence, including nonfatal filters before error filters.
+                filters = cast(list[tuple[Any, ...]], warnings.filters)
+                filters[:] = [
+                    entry if entry[0] == "error" else ("always", *entry[1:]) for entry in filters
+                ]
+                fallback: Literal["error", "always"] = (
+                    "error" if getattr(warnings, "defaultaction", None) == "error" else "always"
+                )
+                warnings.simplefilter(fallback, append=True)
+                try:
+                    yield
+                except Warning as error:
+                    if _diagnostics.last_warning_error is not error:
+                        _diagnostics.last_warning_error = error
+                        frames = traceback.extract_tb(error.__traceback__, limit=-1)
+                        context = (
+                            _diagnostic_context(
+                                type(error).__name__,
+                                frames[0].filename,
+                                frames[0].lineno or 0,
+                            )
+                            if frames
+                            else None
+                        )
+                        self.report_exception(component, "python_warning", error, context)
+                    raise
+        finally:
+            with _diagnostic_lock:
+                if depth == 1:
+                    del _diagnostic_owners[pid]
+                    del _diagnostics.last_warning_error
+                else:
+                    _diagnostic_owners[pid] = (owner, depth - 1)
+
+    @contextmanager
+    def _capture_runtime_failures(self, component: str) -> Iterator[None]:
+        pid = os.getpid()
+        previous_log_factory = logging.getLogRecordFactory()
+        previous_warning = warnings.showwarning
+        previous_thread = threading.excepthook
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        previous_async = loop.get_exception_handler() if loop is not None else None
+
+        def warning(
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            file: Any = None,
+            line: str | None = None,
+        ) -> None:
+            if os.getpid() == pid and warnings.showwarning is warning:
+                try:
+                    self.record(
+                        component,
+                        "python_warning",
+                        _diagnostic_context(category.__name__, filename, lineno),
+                        severity="warning",
+                    )
+                except RuntimeAuditError:
+                    pass
+            with _forward_diagnostic():
+                previous_warning(message, category, filename, lineno, file, line)
+
+        def thread_failed(args: threading.ExceptHookArgs) -> None:
+            if (
+                os.getpid() == pid
+                and threading.excepthook is thread_failed
+                and isinstance(args.exc_value, BaseException)
+                and not isinstance(args.exc_value, (SystemExit, asyncio.CancelledError))
+            ):
+                self.report_exception(component, "thread_unhandled", args.exc_value)
+            with _forward_diagnostic():
+                previous_thread(args)
+
+        def task_failed(active: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+            if os.getpid() == pid and active.get_exception_handler() is task_failed:
+                error = context.get("exception")
+                if isinstance(error, BaseException):
+                    if not isinstance(error, asyncio.CancelledError):
+                        self.report_exception(component, "async_unhandled", error)
+                else:
+                    try:
+                        self.record(component, "async_unhandled")
+                    except RuntimeAuditError:
+                        pass
+            with _forward_diagnostic():
+                if previous_async is None:
+                    active.default_exception_handler(context)
+                else:
+                    previous_async(active, context)
+
+        def log_record(*args: Any, **kwargs: Any) -> logging.LogRecord:
+            record = previous_log_factory(*args, **kwargs)
+            if (
+                os.getpid() == pid
+                and logging.getLogRecordFactory() is log_record
+                and record.levelno >= logging.WARNING
+                and not getattr(_diagnostics, "forwarding", False)
+            ):
+                severity: IncidentSeverity = (
+                    "error" if record.levelno >= logging.ERROR else "warning"
+                )
+                error = record.exc_info[1] if record.exc_info is not None else None
+                context = _diagnostic_context(record.name, record.pathname, record.lineno)
+                if error is not None:
+                    self.report_exception(
+                        component,
+                        "logging_diagnostic",
+                        error,
+                        context,
+                        severity=severity,
+                    )
+                else:
+                    try:
+                        self.record(
+                            component,
+                            "logging_diagnostic",
+                            context,
+                            severity=severity,
+                        )
+                    except RuntimeAuditError:
+                        pass
+            return record
+
+        logging.setLogRecordFactory(log_record)
+        warnings.showwarning = warning
+        threading.excepthook = thread_failed
+        if loop is not None:
+            loop.set_exception_handler(task_failed)
+        try:
+            yield
+        finally:
+            if logging.getLogRecordFactory() is log_record:
+                logging.setLogRecordFactory(previous_log_factory)
+            if warnings.showwarning is warning:
+                warnings.showwarning = previous_warning
+            if threading.excepthook is thread_failed:
+                threading.excepthook = previous_thread
+            if loop is not None and loop.get_exception_handler() is task_failed:
+                loop.set_exception_handler(previous_async)
 
     @contextmanager
     def watching(self, *, interval: float = 1.0) -> Iterator[None]:

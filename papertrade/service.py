@@ -16,11 +16,11 @@ from typing import Any
 
 from .ai import parse_codex_events
 from .audit import Audit
+from .clock import now_utc
 from .core import (
     SafetyError,
     Settings,
     market_date,
-    now_utc,
     probable_regular,
     process_identity,
     regular_session,

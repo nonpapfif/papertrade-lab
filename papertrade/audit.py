@@ -10,7 +10,9 @@ import sqlite3
 import traceback
 from typing import Any
 
-from .core import SafetyError, encode, now_utc
+from .clock import now_utc
+from .core import SafetyError
+from .jsonio import paper_json as encode
 
 PRIVATE_KEYS = {"authorization", "access_token", "client_secret", "client_id", "api_key", "cookie"}
 

@@ -17,8 +17,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from papertrade.api import private_json
+from papertrade.clock import utc_iso as now
 from papertrade.core import SafetyError, Settings
+from papertrade.jsonio import private_json
 from tools.live_feed import LiveFeed
 from tools.probe_toss_websocket import (
     ROOT,
@@ -27,7 +28,6 @@ from tools.probe_toss_websocket import (
     CachedTokenClient,
     declaration,
     error_details,
-    now,
     read_spec,
     record_source_delta,
 )

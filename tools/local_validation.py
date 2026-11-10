@@ -13,12 +13,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from tools.autotest_jobs import atomic_json
+from papertrade.jsonio import atomic_json, read_json
+from tools.source_identity import tree_digest
 
 
 def validate(repo: Path, output: Path, python: str) -> dict[str, Any]:
-    from tools.autotest_supervisor import tree_digest
-
     repo = repo.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     initial = tree_digest(repo)
@@ -84,8 +83,6 @@ def validate(repo: Path, output: Path, python: str) -> dict[str, Any]:
 
 
 def require_report(path: Path, digest: str) -> None:
-    from tools.autotest_supervisor import read_json
-
     report = read_json(path)
     if (
         report.get("state") != "passed"

@@ -13,13 +13,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from papertrade.clock import utc_iso as now
 from papertrade.core import Settings
-from tools.adaptive_journal import AdaptiveJournal, JournalError, encode
+from papertrade.jsonio import journal_json as encode
+from tools.adaptive_journal import AdaptiveJournal, JournalError
 from tools.async_layered_paper import ProcessingClock
-from tools.probe_toss_websocket import now
 from tools.runtime_audit import DISPATCH_BACKLOG_TIMEOUT, DISPATCH_TIMEOUT, RuntimeAudit
 from tools.slot_control import IDENTIFIER, SlotCommand, SlotControl
-from tools.us_adaptive_ai import ENTRY_OPTIONS
+from tools.strategy_catalog import ENTRY_OPTIONS
 
 if TYPE_CHECKING:
     from tools.layered_paper import Feature
@@ -446,23 +447,27 @@ class SharedFeedSlots:
                     self.journal.append(entry)
                 except JournalError as error:
                     if self.audit is not None:
-                        self.audit.record(
+                        self.audit.report_exception(
                             "journal",
                             "append_failed",
+                            error,
                             {"sequence": entry["sequence"]},
-                            error=error,
                         )
                     raise
         except BaseException as error:
             self._failed_cut = True
             for slot in self.slots.values():
                 slot.runtime.abort_accounts()
-            if self.audit is not None and self.audit.healthy:
-                self.audit.record(
+            if (
+                self.audit is not None
+                and self.audit.healthy
+                and not isinstance(error, asyncio.CancelledError)
+            ):
+                self.audit.report_exception(
                     "ordered_dispatch",
                     "cut_failed",
+                    error,
                     {"sequence": entry["sequence"]},
-                    error=error,
                 )
             raise
         self._committed_protection = None
@@ -476,6 +481,13 @@ class SharedFeedSlots:
                 if slot.stopped_sequence == self.consumed:
                     await slot.runtime.close()
             except Exception as error:  # noqa: BLE001 - Finish acknowledging the durable cut.
+                if self.audit is not None:
+                    self.audit.report_exception(
+                        "account_evaluation",
+                        "committed_cut_ack_failed",
+                        error,
+                        {"account_id": slot.runtime.account_prefix, "sequence": self.consumed},
+                    )
                 if ack_error is None:
                     ack_error = error
         if ack_error is not None:
@@ -484,7 +496,21 @@ class SharedFeedSlots:
         if command_result is not None:
             self.commands[command_result[0].id] = command_result
             if saved is None:
-                self.control.record(*command_result)
+                command, disposition, _ = command_result
+                context = {"account_id": command.slot_id, "request_id": command.id}
+                with (
+                    self.audit.operation("ordered_dispatch", "control_projection_failed", context)
+                    if self.audit is not None
+                    else nullcontext()
+                ):
+                    self.control.record(*command_result)
+                if self.audit is not None and disposition == "rejected":
+                    self.audit.record(
+                        "strategy_registry",
+                        "slot_command_rejected",
+                        context,
+                        severity="warning",
+                    )
                 self.queued_commands.discard(command_result[0].id)
                 self.record(
                     "slot_command",
@@ -736,7 +762,9 @@ class SharedFeedSlots:
                     tasks.append(runtime.review_task)
                     runtime.review_task.cancel()
                     runtime.review_task = None
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if self.audit is not None:
+                self.audit.report_task_failures("strategic_review", "task_cleanup_failed", results)
 
     async def close(self) -> None:
         for slot in self.slots.values():

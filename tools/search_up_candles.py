@@ -11,11 +11,14 @@ import math
 import os
 import sqlite3
 from collections import defaultdict, deque
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+from functools import partial
 from itertools import pairwise, product
 from pathlib import Path
 from typing import Any
 
+from papertrade.clock import utc_iso
+from papertrade.jsonio import recorded_json as encode
 from tools.replay_market_day import (
     GRID_BITS,
     GRID_COMMON,
@@ -31,10 +34,13 @@ from tools.replay_market_day import (
     GRID_VOLUMES,
     STEP,
     Worker,
-    encode,
-    hash_file,
     parse_at,
 )
+from tools.research_metadata import read_metadata as get_meta
+from tools.research_metadata import write_metadata
+from tools.source_identity import file_digest as hash_file
+
+set_meta = partial(write_metadata, encode=encode)
 
 GOALS = (0.0, 0.001, 0.003, 0.005, 0.01)
 SCHEMA = """
@@ -66,18 +72,8 @@ CREATE INDEX IF NOT EXISTS score_rank ON scores(market,goal,phase,cohort,f1 DESC
 """
 
 
-def get_meta(db: sqlite3.Connection, key: str, default: Any = None) -> Any:
-    row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-    return json.loads(row[0]) if row else default
-
-
-def set_meta(db: sqlite3.Connection, key: str, value: Any) -> None:
-    db.execute("INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) "
-               "DO UPDATE SET value=excluded.value", (key, encode(value)))
-
-
 def progress(db: sqlite3.Connection, folder: Path, stage: str, **fields: Any) -> None:
-    record = {"stage": stage, "updated_at": datetime.now(UTC).isoformat(),
+    record = {"stage": stage, "updated_at": utc_iso(),
               "pid": os.getpid(), "ai_calls": 0, **fields}
     with db:
         set_meta(db, "progress", record)
@@ -264,7 +260,7 @@ def extract(db: sqlite3.Connection, dataset: Path, folder: Path) -> None:
                                               actual, last["time"].isoformat(), identifier))
                 if pending:
                     db.execute("UPDATE frames SET evaluated_at=? WHERE id=?",
-                               (datetime.now(UTC).isoformat(), step - 1))
+                               (utc_iso(), step - 1))
             features = history.features(at, scopes)
             request = {"kind": "grid", "at": at.isoformat(), "rows": features}
             input_hash = hashlib.sha256(encode(request).encode()).hexdigest()
@@ -289,7 +285,7 @@ def extract(db: sqlite3.Connection, dataset: Path, folder: Path) -> None:
                     db.execute("INSERT INTO frames VALUES (?,?,?,?,?,?,?,?,NULL)", (
                         step, at.isoformat(), case_id, len(features), input_hash,
                         hashlib.sha256(payload).hexdigest(), gzip.compress(payload, mtime=0),
-                        datetime.now(UTC).isoformat(),
+                        utc_iso(),
                     ))
                 for ordinal, feature in enumerate(features):
                     pending.append((case_id, feature))

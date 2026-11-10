@@ -21,7 +21,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any, cast
 
-from tools.adaptive_journal import AdaptiveJournal, JournalError, _header, encode
+from papertrade.jsonio import journal_json as encode
+from tools.adaptive_journal import AdaptiveJournal, JournalError, _header
 from tools.async_layered_paper import AsyncLayeredPaper, seconds
 from tools.layered_paper import Feature, assign
 from tools.paper_market import KR

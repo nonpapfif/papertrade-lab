@@ -11,7 +11,9 @@ from typing import Any
 from .ai import Reviewer
 from .api import MarketClient
 from .audit import Audit
-from .core import ONE, ZERO, SafetyError, Settings, decimal, encode, now_utc
+from .clock import now_utc
+from .core import ONE, ZERO, SafetyError, Settings, decimal
+from .jsonio import paper_json as encode
 from .store import Store
 
 

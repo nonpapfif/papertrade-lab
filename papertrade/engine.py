@@ -10,6 +10,7 @@ from typing import Any
 from .ai import Reviewer
 from .api import ApiError, MarketClient
 from .audit import Audit
+from .clock import now_utc
 from .core import (
     NEW_YORK,
     ONE,
@@ -18,13 +19,12 @@ from .core import (
     Session,
     Settings,
     decimal,
-    encode,
     market_date,
-    now_utc,
     probable_regular,
     regular_session,
     stamp,
 )
+from .jsonio import paper_json as encode
 from .store import Store
 from .strategy import (
     aggregate,

@@ -626,7 +626,7 @@ class AutotestSupervisorTests(unittest.TestCase):
     def test_tree_digest_ignores_umask_but_detects_executable_changes(self) -> None:
         source = self.repo / "fixture.py"
         source.write_text("VALUE = 7\n")
-        with patch.object(supervisor, "command", return_value=source.name):
+        with patch("tools.source_identity.command", return_value=source.name):
             source.chmod(0o644)
             ordinary = real_tree_digest(self.repo)
             source.chmod(0o600)
