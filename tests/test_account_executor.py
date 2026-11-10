@@ -19,8 +19,9 @@ from tools.account_executor import (
     AccountProtocolError,
     AccountWorkerError,
 )
-from tools.async_layered_paper import AsyncLayeredPaper
+from tools.async_layered_paper import AsyncLayeredPaper, Intent
 from tools.paper_market import KR, US
+from tools.search_portfolios import Position
 
 
 class AccountExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -114,6 +115,47 @@ class AccountExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(min(a.cpu_ns, b.cpu_ns), 0)
         self.assertLess(max(a.started_ns, b.started_ns), min(a.finished_ns, b.finished_ns))
         self.assertNotEqual(runner.accounts["a"].reserved_cash, runner.accounts["b"].reserved_cash)
+
+    async def test_worker_timing_validates_each_clock_independently(self) -> None:
+        runner = self.executor(a=AsyncLayeredPaper(100))
+        exchange = runner._exchange
+        action = {"a": AccountAction("cancel", stamp(0))}
+
+        def with_timing(timing: tuple[Any, Any, Any], *args: Any) -> dict[str, Any]:
+            replies = exchange(*args)
+            started, finished, cpu = timing
+            replies["a"] = replace(
+                replies["a"], started_ns=started, finished_ns=finished, cpu_ns=cpu
+            )
+            return replies
+
+        for timing in (
+            (True, 120, 10),
+            (100, 120.0, 10),
+            (100, 120, False),
+            (100, 120, "10"),
+            (100, 120, -1),
+            (120, 100, 10),
+        ):
+            with (
+                self.subTest(timing=timing),
+                patch.object(runner, "_exchange", side_effect=partial(with_timing, timing)),
+                self.assertRaisesRegex(AccountProtocolError, "Malformed or unordered"),
+            ):
+                await runner.apply(1, action)
+            self.assertEqual(runner._committed, {"a": (0, 0)})
+
+        for sequence, timing in enumerate(
+            ((100, 11_767, 12_000), (100, 100, 0), (100, 120, 0)), 1
+        ):
+            with (
+                self.subTest(timing=timing),
+                patch.object(runner, "_exchange", side_effect=partial(with_timing, timing)),
+            ):
+                result = (await runner.apply(sequence, action))["a"]
+            self.assertEqual((result.started_ns, result.finished_ns, result.cpu_ns), timing)
+            runner.commit()
+        self.assertEqual(runner._committed, {"a": (3, 3)})
 
     async def test_cut_order_and_malformed_result_cannot_stage_mirrors(self) -> None:
         account = AsyncLayeredPaper(100)
@@ -330,3 +372,79 @@ class AccountExecutorTests(unittest.IsolatedAsyncioTestCase):
         result = await runner.apply(2, actions)
         self.assertTrue(result["a"].accepted_book)
         runner.commit()
+
+    async def test_all_result_kinds_validate_financial_values_and_symbol_types(self) -> None:
+        account = AsyncLayeredPaper(100, policy="trend")
+        runner = self.executor(a=account)
+        exchange = runner._exchange
+
+        def corrupt(section: str, field: str, value: Any, *args: Any) -> dict[str, Any]:
+            replies = exchange(*args)
+            result = replies["a"]
+            if section == "reply":
+                replies["a"] = replace(result, **{field: value})
+            elif section == "patch":
+                replies["a"] = replace(result, patch=replace(result.patch, **{field: value}))
+            else:
+                fields = {**getattr(result.patch, section), field: value}
+                replies["a"] = replace(result, patch=replace(result.patch, **{section: fields}))
+            return replies
+
+        first = AccountAction("book", event())
+        for field in ("sequence", "command_sequence"):
+            with (
+                self.subTest(field=field),
+                patch.object(runner, "_exchange", side_effect=partial(corrupt, "reply", field, True)),
+                self.assertRaises(AccountProtocolError),
+            ):
+                await runner.apply(1, {"a": first})
+        await runner.apply(1, {"a": first})
+        runner.commit()
+        prior = account.summary(), account.pending.copy()
+        advance = AccountAction("advance", stamp(1))
+        cancel = AccountAction("cancel", stamp(1))
+        intent = account.pending[0]
+
+        def pending_quote(level: dict[str, Any]) -> dict[int, Intent]:
+            return {0: replace(intent, initial={**intent.initial, "asks": [level]})}
+
+        for action, section, field, value in (
+            (advance, "book", "equity", float("inf")),
+            (advance, "book", "cash", True),
+            (advance, "book", "fee_totals", []),
+            (advance, "book", "fee_totals", {"total_usd": 0.0}),
+            (advance, "book", "fee_totals", {**account.book.fee_totals, "total_usd": "0"}),
+            (advance, "book", "position_net", {0: None}),
+            (advance, "account", "pending", {False: account.pending[0]}),
+            (advance, "account", "pending", {0: {"reserved": 100}}),
+            (advance, "account", "pending", {0: replace(account.pending[0], reserved=float("nan"))}),
+            (advance, "account", "pending", pending_quote({"price": "not numeric", "volume": "1"})),
+            (advance, "account", "pending", pending_quote({"price": "10", "volume": True})),
+            (advance, "account", "pending", pending_quote({"price": "10", "volume": []})),
+            (advance, "account", "pending", pending_quote({"price": "10"})),
+            (advance, "book", "positions", {0: Position(1, float("inf"), 0)}),
+            (advance, "book", "entry_fees", {0.0: 0}),
+            (advance, "book", "depth_used", {(False, "BUY"): 1}),
+            (advance, "context", "requested", {False}),
+            (advance, "context", "tax_realized_krw", {"fixture": float("nan")}),
+            (cancel, "book", "realized", "0"),
+            (cancel, "account_history", "outcomes", ["invalid outcome"]),
+            (first, "patch", "symbol", False),
+            (first, "symbol_values", "prices", float("-inf")),
+        ):
+            with self.subTest(kind=action.kind, field=field, value=value):
+                with (
+                    patch.object(
+                        runner, "_exchange", side_effect=partial(corrupt, section, field, value)
+                    ),
+                    self.assertRaises(AccountProtocolError),
+                ):
+                    await runner.apply(2, {"a": action})
+                self.assertEqual(runner._committed, {"a": (1, 1)})
+                self.assertEqual(runner.pids, {})
+                self.assertEqual((account.summary(), account.pending), prior)
+        for sequence, action in enumerate((first, advance, cancel), 2):
+            results = await runner.apply(sequence, {"a": action})
+            self.assertFalse(results["a"].accepted_book)
+            runner.commit()
+        self.assertFalse(account.pending)

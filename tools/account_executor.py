@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from tools.async_layered_paper import AsyncLayeredPaper, Intent
+from tools.layered_paper import Feature
 from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
+from tools.search_portfolios import Position
 
 MODULE = "account_evaluation"
 EXECUTE = "execute"
@@ -41,6 +43,20 @@ ACCOUNT_EXCLUDED = {
     "entry_policy_version",
 }
 BOOK_EXCLUDED = {*BOOK_HISTORY, "context", "position_net_usd"}
+BOOK_AMOUNTS = (
+    "cash", "equity", "realized", "initial_equity", "peak", "drawdown", "gross_peak",
+    "debt_peak", "turnover", "closed_net",
+)
+EVIDENCE_AMOUNTS = {
+    "cash", "equity", "entry_cost", "entry_price", "evaluated_quantity", "fee_krw",
+    "fee_usd", "filled_quantity", "open_positions", "price", "quantity",
+    "quantity_normalized", "requested_quantity", "target_net_proceeds",
+    "target_price", "unfilled_quantity",
+}
+OPTIONAL_EVIDENCE_AMOUNTS = {
+    "entry_cost_basis_krw", "gross_realized_pnl", "observed_fx_krw_per_usd", "realized_pnl",
+    "strength",
+}
 
 
 class AccountWorkerError(RuntimeError):
@@ -49,6 +65,74 @@ class AccountWorkerError(RuntimeError):
 
 class AccountProtocolError(AccountWorkerError):
     """An account command or result crossed the wrong observation boundary."""
+
+
+def _finite_amount(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _amounts(values: Any) -> bool:
+    return isinstance(values, dict) and all(_finite_amount(value) for value in values.values())
+
+
+def _symbol_map(values: Any) -> bool:
+    return isinstance(values, dict) and all(type(symbol) is int for symbol in values)
+
+
+def _feature_valid(feature: Any, symbol: int) -> bool:
+    return (
+        isinstance(feature, Feature)
+        and type(feature.symbol) is int
+        and feature.symbol == symbol
+        and all(
+            _finite_amount(value) for value in (
+                feature.price, feature.r5, feature.r15, feature.prior_high, feature.mean,
+                feature.efficiency,
+            )
+        )
+    )
+
+
+def _stored_quote_valid(quote: Any) -> bool:
+    if not isinstance(quote, dict):
+        return False
+    for side in ("asks", "bids"):
+        levels = quote.get(side)
+        if not isinstance(levels, (list, tuple)) or not levels:
+            return False
+        for level in levels:
+            if not isinstance(level, dict) or not all(
+                type(value) in (int, float, str)
+                and math.isfinite(float(cast(int | float | str, value)))
+                for value in (level.get("price"), level.get("volume"))
+            ):
+                return False
+    return True
+
+
+def _intent_valid(intent: Any) -> bool:
+    return (
+        isinstance(intent, Intent)
+        and type(intent.symbol) is int
+        and type(intent.quantity) is int
+        and _finite_amount(intent.limit)
+        and _finite_amount(intent.reserved)
+        and _feature_valid(intent.feature, intent.symbol)
+        and _stored_quote_valid(intent.initial)
+    )
+
+
+def _evidence_valid(row: Any) -> bool:
+    return (
+        isinstance(row, dict)
+        and all(type(row[key]) is int for key in row.keys() & {"symbol", "symbol_id"})
+        and all(_finite_amount(row[key]) for key in row.keys() & EVIDENCE_AMOUNTS)
+        and all(
+            row[key] is None or _finite_amount(row[key])
+            for key in row.keys() & OPTIONAL_EVIDENCE_AMOUNTS
+        )
+        and ("fee_components" not in row or _amounts(row["fee_components"]))
+    )
 
 
 @dataclass(frozen=True)
@@ -114,7 +198,13 @@ class _Patch:
     ) -> None:
         payload = action.payload
         if (
-            set(self.account) != set(vars(account)) - ACCOUNT_EXCLUDED
+            not all(
+                isinstance(values, dict) for values in (
+                    self.account, self.book, self.context, self.symbol_values,
+                    self.account_history, self.book_history,
+                )
+            )
+            or set(self.account) != set(vars(account)) - ACCOUNT_EXCLUDED
             or set(self.book) != _book_fields(account)
             or set(self.context) != set(vars(account.context)) - {"market"}
             or set(self.account_history) != set(ACCOUNT_HISTORY)
@@ -122,17 +212,87 @@ class _Patch:
             or not all(isinstance(value, list) for value in self.account_history.values())
             or not all(isinstance(value, list) for value in self.book_history.values())
             or set(self.symbol_values) - set(SYMBOL_FIELDS)
+            or (self.symbol is not None and type(self.symbol) is not int)
             or self.symbol != (payload["symbol"] if isinstance(payload, dict) else None)
             or self.event_id != (payload["id"] if isinstance(payload, dict) else None)
             or type(self.processed) is not bool
-            or not math.isfinite(self.book["cash"])
-            or not math.isfinite(self.book["realized"])
-            or not isinstance(self.account["pending"], dict)
-            or not isinstance(self.book["positions"], dict)
-            or not all(isinstance(row, Intent) for row in self.account_history["intents"])
-            or not all(isinstance(row, dict) for row in self.account_history["outcomes"])
         ):
             raise AccountProtocolError("Malformed account state patch")
+        self._check_values(account)
+
+    def _check_values(self, account: AsyncLayeredPaper) -> None:
+        pending, owners = self.account["pending"], self.account["owners"]
+        positions = self.book["positions"]
+        fees = self.book["fee_totals"]
+        depth, requested = self.book["depth_used"], self.context["requested"]
+        frame, last_enqueued = self.context["frame"], self.account["_last_enqueued"]
+        if (
+            not all(
+                _symbol_map(values) for values in (
+                    pending, owners, self.account["owner_policy_versions"], positions,
+                    *(self.book[key] for key in (
+                        "cooldowns", "entry_fees", "entry_cost_krw", "position_net", "entry_requested",
+                    )),
+                )
+            )
+            or not all(_finite_amount(self.book[key]) for key in BOOK_AMOUNTS)
+            or not (_finite_amount(last_enqueued) or last_enqueued == -math.inf)
+            or not _amounts(fees)
+            or fees.keys() != account.book.fee_totals.keys()
+            or not all(
+                _amounts(values) for values in (
+                    self.book["entry_fees"], self.book["position_net"],
+                    self.account["realized_by_strategy"], self.context["schedule"],
+                    self.context["tax_realized_krw"],
+                )
+            )
+            or not all(
+                basis is None or _finite_amount(basis) for basis in self.book["entry_cost_krw"].values()
+            )
+            or not isinstance(depth, dict)
+            or not all(
+                isinstance(key, tuple) and len(key) == 2 and type(key[0]) is int
+                and type(quantity) is int
+                for key, quantity in depth.items()
+            )
+            or not isinstance(requested, set)
+            or not all(type(symbol) is int for symbol in requested)
+            or not isinstance(frame, dict)
+            or not all(
+                _symbol_map(frame[key]) for key in frame.keys() & {
+                    "decision_orderbooks", "order_limits", "orderbooks", "confirmation_received_at",
+                }
+            )
+            or ("order_limits" in frame and not _amounts(frame["order_limits"]))
+            or not all(
+                isinstance(position, Position)
+                and type(position.tick) is int
+                and all(_finite_amount(value) for value in (
+                    position.quantity, position.entry, position.peak_return,
+                ))
+                for position in positions.values()
+            )
+            or not all(_intent_valid(intent) and intent.symbol == s for s, intent in pending.items())
+            or not all(
+                isinstance(owner, tuple) and len(owner) == 2 and _feature_valid(owner[1], symbol)
+                for symbol, owner in owners.items()
+            )
+            or not all(
+                _finite_amount(self.symbol_values[key])
+                for key in self.symbol_values.keys() & {"prices", "_source_times", "_receipts"}
+            )
+            or not isinstance(self.symbol_values.get("_books", {}), dict)
+            or not all(_intent_valid(intent) for intent in self.account_history["intents"])
+            or not all(
+                _evidence_valid(row)
+                for history in (
+                    self.account_history["outcomes"], self.account_history["decisions"],
+                    *self.book_history.values(),
+                )
+                for row in history
+            )
+        ):
+            raise AccountProtocolError("Malformed financial values or symbols in account state patch")
 
     def accepted_mark(
         self, action: AccountAction, previous: dict[str, Any] | None
@@ -146,7 +306,7 @@ class _Patch:
         midpoint = self.symbol_values["prices"]
         equity, realized, fees = (self.book[key] for key in ("equity", "realized", "fee_totals"))
         if not isinstance(fees, dict) or any(
-            type(value) not in (int, float) or not math.isfinite(value)
+            not _finite_amount(value)
             for value in (midpoint, equity, realized, *fees.values())
         ):
             raise AccountProtocolError("Invalid accepted account valuation")
@@ -547,6 +707,13 @@ class AccountExecutor:
             )
         if (
             not isinstance(result, AccountResult)
+            or any(
+                type(value) is not int
+                for value in (
+                    result.sequence, result.command_sequence, result.pid,
+                    result.started_ns, result.finished_ns, result.cpu_ns,
+                )
+            )
             or (result.account_id, result.sequence, result.command_sequence)
             != (
                 command.account_id,
@@ -554,9 +721,12 @@ class AccountExecutor:
                 command.command_sequence,
             )
             or result.pid != self._workers[name].process.pid
-            or not 0 < result.cpu_ns <= result.finished_ns - result.started_ns
+            # CPU and elapsed time use separate clocks with different resolution.
+            or result.cpu_ns < 0
+            or result.finished_ns < result.started_ns
             or not isinstance(result.patch, _Patch)
             or not isinstance(result.protected_symbols, frozenset)
+            or not all(type(symbol) is int for symbol in result.protected_symbols)
         ):
             raise AccountProtocolError(f"Malformed or unordered account result: {name}")
         try:
@@ -570,10 +740,7 @@ class AccountExecutor:
             symbol = result.patch.symbol
             previous = account._books.get(symbol) if symbol is not None else None
             expected_mark = result.patch.accepted_mark(command.action, previous)
-            if (
-                expected_mark is not None
-                and expected_mark["fees"].keys() != account.book.fee_totals.keys()
-            ) or not _same_mark(result.accepted_mark, expected_mark):
+            if not _same_mark(result.accepted_mark, expected_mark):
                 raise AccountProtocolError(f"Account mark mismatch: {name}")
         except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as error:
             raise AccountProtocolError(f"Malformed account result: {name}") from error

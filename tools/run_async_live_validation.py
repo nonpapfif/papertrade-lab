@@ -457,6 +457,18 @@ class Runtime:
         for kind, fields in records:
             self.record(kind, **fields)
 
+    def _acknowledge_cut(self, sequence: int, *, durable: bool) -> None:
+        try:
+            with self.audit.publication_guard() if self.audit is not None else nullcontext():
+                self.acknowledge_accounts()
+        except BaseException as error:
+            if durable:
+                self._failed_cut = True
+                error.add_note(f"Journal cut {sequence} is durable and requires replay.")
+            else:
+                self.abort_accounts()
+            raise
+
     def abort_accounts(self) -> None:
         if self.account_executor is not None:
             self.account_executor.abort()
@@ -820,7 +832,7 @@ class Runtime:
                     )
                 raise
             else:
-                self.acknowledge_accounts()
+                self._acknowledge_cut(sequence, durable=self.journal is not None)
                 if self.audit is not None:
                     self.audit.heartbeat("ordered_dispatch", progress=sequence, pid=os.getpid())
                     if self.journal is not None:
@@ -1245,18 +1257,19 @@ class Runtime:
                 "journal", status="active", timeout=10, progress=entry["sequence"], pid=os.getpid(),
             )
             self.assert_accounts_committable()
-        self.journal.append(
-            {
-                **entry,
-                **({"account_results": self.account_evidence()} if self.concurrent_accounts else {}),
-                "checkpoint": self._checkpoint(),
-                "reviewed_fills": self.reviewed_fills,
-                "reviewed_families": sorted(self.reviewed_families),
-                "allocation_blocked": self.allocation_blocked,
-            }
-        )
+        record = {
+            **entry,
+            **({"account_results": self.account_evidence()} if self.concurrent_accounts else {}),
+            "checkpoint": self._checkpoint(),
+            "reviewed_fills": self.reviewed_fills,
+            "reviewed_families": sorted(self.reviewed_families),
+            "allocation_blocked": self.allocation_blocked,
+        }
+        with self.audit.publication_guard() if self.audit is not None else nullcontext():
+            self.journal.append(record)
 
     async def restore(self, journal: AdaptiveJournal) -> None:
+        self.assert_accounts_committable()
         original_record = self.record
         self.record = lambda *_args, **_kwargs: None
         try:
@@ -1295,7 +1308,7 @@ class Runtime:
                 self.reviewed_fills = saved["reviewed_fills"]
                 self.reviewed_families = set(saved["reviewed_families"])
                 self.allocation_blocked = saved["allocation_blocked"]
-                self.acknowledge_accounts()
+                self._acknowledge_cut(entry["sequence"], durable=True)
         except BaseException:
             self.abort_accounts()
             raise
@@ -1312,6 +1325,7 @@ class Runtime:
         self.desired = subscription_set(self.candidates, self.protected())
 
     async def mark_advance(self, kind: str, at: str) -> None:
+        self.assert_accounts_committable()
         last = self.account.last_at
         entry = {
             "kind": kind,
@@ -1328,7 +1342,7 @@ class Runtime:
         except BaseException:
             self.abort_accounts()
             raise
-        self.acknowledge_accounts()
+        self._acknowledge_cut(self.sequence, durable=self.journal is not None)
         if self.audit is not None and self.journal is not None:
             self.audit.heartbeat("journal", progress=self.sequence, pid=os.getpid())
         self.record(kind, sequence=self.sequence, previous_at=last, at=at)

@@ -1,5 +1,6 @@
 """Verify that one shared journal commit controls all process-backed accounts."""
 
+import copy
 import sqlite3
 import tempfile
 import time
@@ -10,7 +11,7 @@ from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import patch
 
 from tests.fixtures.warning_account import WarningAccount
@@ -471,6 +472,105 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.evidence()["records"], before["records"] + 1)
         for account in resumed.slots["source"].runtime.accounts.values():
             self.assertEqual(len(account.book.trades), 1)
+
+    async def assert_invalid_patch_leaves_replayable_cut(
+        self, variant: Literal["clock_fee", "clock_quote", "book_symbol", "book_history"]
+    ) -> None:
+        clock = variant in ("clock_fee", "clock_quote")
+        slots = self.slots(self.journal)
+        await self.seed(slots, "source")
+        if clock:
+            await self.book(slots, 1)
+        else:
+            await self.feed(slots, "clock", None)
+        runtime = slots.slots["source"].runtime
+        executor = runtime.account_executor
+        assert executor is not None
+        committed = executor._committed.copy()
+        before, checkpoint = self.journal.evidence(), runtime._checkpoint()
+        exchange = executor._exchange
+
+        def corrupt(*args: Any) -> dict[str, Any]:
+            replies = exchange(*args)
+            result = replies["candidate"]
+            if variant == "clock_fee":
+                self.assertIsNone(result.accepted_mark)
+                fees = {**result.patch.book["fee_totals"], "total_usd": float("nan")}
+                book = {**result.patch.book, "fee_totals": fees}
+                replies["candidate"] = replace(result, patch=replace(result.patch, book=book))
+            elif variant == "clock_quote":
+                self.assertIsNone(result.accepted_mark)
+                pending = result.patch.account["pending"].copy()
+                intent = pending[0]
+                initial = copy.deepcopy(intent.initial)
+                initial["asks"][0]["price"] = float("nan")
+                pending[0] = replace(intent, initial=initial)
+                account = {**result.patch.account, "pending": pending}
+                replies["candidate"] = replace(result, patch=replace(result.patch, account=account))
+            elif variant == "book_symbol":
+                self.assertIsNotNone(result.accepted_mark)
+                self.assertEqual(result.protected_symbols, frozenset({0}))
+                replies["candidate"] = replace(result, protected_symbols=frozenset({False}))
+            else:
+                self.assertIsNotNone(result.accepted_mark)
+                (intent,) = result.patch.account_history["intents"]
+                initial = copy.deepcopy(intent.initial)
+                initial["bids"][0]["volume"] = "inf"
+                history = {
+                    **result.patch.account_history,
+                    "intents": [replace(intent, initial=initial)],
+                }
+                replies["candidate"] = replace(
+                    result, patch=replace(result.patch, account_history=history)
+                )
+            return replies
+
+        with (
+            patch.object(executor, "_exchange", side_effect=corrupt),
+            patch("tools.account_executor._Patch.apply", autospec=True) as apply_patch,
+            self.assertRaises(AccountProtocolError),
+        ):
+            if clock:
+                await self.feed(slots, "clock", None, 3)
+            else:
+                await self.book(slots, 1)
+        apply_patch.assert_not_called()
+        self.assertEqual(self.journal.evidence(), before)
+        self.assertEqual(slots.consumed, before["records"])
+        self.assertEqual(runtime._checkpoint(), checkpoint)
+        self.assertEqual(executor._committed, committed)
+        self.assertEqual(executor.pids, {})
+        with closing(sqlite3.connect(self.audit.path)) as db:
+            incidents = db.execute("""
+                SELECT state FROM runtime_incidents WHERE code = 'result_rejected'
+            """).fetchall()
+        self.assertEqual(incidents, [("open",), ("open",)])
+        await slots.close()
+
+        resumed = self.slots(self.journal)
+        await resumed.restore()
+        self.assertEqual(resumed.slots["source"].runtime._checkpoint(), checkpoint)
+        self.assertEqual(self.journal.evidence(), before)
+        if clock:
+            await self.feed(resumed, "clock", None, 3)
+        else:
+            await self.book(resumed, 1)
+        await self.book(resumed, 3)
+        self.assertEqual(self.journal.evidence()["records"], before["records"] + 2)
+        for account in resumed.slots["source"].runtime.accounts.values():
+            self.assertEqual(len(account.book.trades), 1)
+
+    async def test_markless_clock_with_nonfinite_fee_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("clock_fee")
+
+    async def test_markless_clock_with_nonfinite_pending_quote_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("clock_quote")
+
+    async def test_book_with_boolean_protection_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("book_symbol")
+
+    async def test_nonfinite_new_intent_history_quote_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("book_history")
 
     async def test_worker_killed_after_durable_commit_before_ack_then_exact_fork(self) -> None:
         initial = self.slots(self.journal)
