@@ -474,13 +474,21 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(account.book.trades), 1)
 
     async def assert_invalid_patch_leaves_replayable_cut(
-        self, variant: Literal["clock_fee", "clock_quote", "book_symbol", "book_history"]
+        self,
+        variant: Literal[
+            "clock_fee", "clock_quote", "book_symbol", "book_history",
+            "clock_version", "clock_side", "owner_version", "history_version",
+        ],
+        invalid_value: Any = None,
     ) -> None:
-        clock = variant in ("clock_fee", "clock_quote")
+        clock = variant.startswith("clock_") or variant == "owner_version"
+        clock_at = 4 if variant == "owner_version" else 3
         slots = self.slots(self.journal)
         await self.seed(slots, "source")
         if clock:
             await self.book(slots, 1)
+            if variant == "owner_version":
+                await self.book(slots, 3)
         else:
             await self.feed(slots, "clock", None)
         runtime = slots.slots["source"].runtime
@@ -507,6 +515,19 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 pending[0] = replace(intent, initial=initial)
                 account = {**result.patch.account, "pending": pending}
                 replies["candidate"] = replace(result, patch=replace(result.patch, account=account))
+            elif variant in ("clock_version", "clock_side"):
+                self.assertIsNone(result.accepted_mark)
+                pending = result.patch.account["pending"].copy()
+                field = "policy_version" if variant == "clock_version" else "side"
+                pending[0] = replace(pending[0], **{field: invalid_value})
+                account = {**result.patch.account, "pending": pending}
+                replies["candidate"] = replace(result, patch=replace(result.patch, account=account))
+            elif variant == "owner_version":
+                self.assertIsNone(result.accepted_mark)
+                versions = result.patch.account["owner_policy_versions"]
+                self.assertEqual(versions, {0: 0})
+                account = {**result.patch.account, "owner_policy_versions": {0: invalid_value}}
+                replies["candidate"] = replace(result, patch=replace(result.patch, account=account))
             elif variant == "book_symbol":
                 self.assertIsNotNone(result.accepted_mark)
                 self.assertEqual(result.protected_symbols, frozenset({0}))
@@ -514,11 +535,15 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.assertIsNotNone(result.accepted_mark)
                 (intent,) = result.patch.account_history["intents"]
-                initial = copy.deepcopy(intent.initial)
-                initial["bids"][0]["volume"] = "inf"
+                if variant == "history_version":
+                    intent = replace(intent, policy_version=invalid_value)
+                else:
+                    initial = copy.deepcopy(intent.initial)
+                    initial["bids"][0]["volume"] = "inf"
+                    intent = replace(intent, initial=initial)
                 history = {
                     **result.patch.account_history,
-                    "intents": [replace(intent, initial=initial)],
+                    "intents": [intent],
                 }
                 replies["candidate"] = replace(
                     result, patch=replace(result.patch, account_history=history)
@@ -531,7 +556,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(AccountProtocolError),
         ):
             if clock:
-                await self.feed(slots, "clock", None, 3)
+                await self.feed(slots, "clock", None, clock_at)
             else:
                 await self.book(slots, 1)
         apply_patch.assert_not_called()
@@ -552,11 +577,13 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.slots["source"].runtime._checkpoint(), checkpoint)
         self.assertEqual(self.journal.evidence(), before)
         if clock:
-            await self.feed(resumed, "clock", None, 3)
+            await self.feed(resumed, "clock", None, clock_at)
         else:
             await self.book(resumed, 1)
-        await self.book(resumed, 3)
-        self.assertEqual(self.journal.evidence()["records"], before["records"] + 2)
+        if variant != "owner_version":
+            await self.book(resumed, 3)
+        added = 1 if variant == "owner_version" else 2
+        self.assertEqual(self.journal.evidence()["records"], before["records"] + added)
         for account in resumed.slots["source"].runtime.accounts.values():
             self.assertEqual(len(account.book.trades), 1)
 
@@ -571,6 +598,18 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nonfinite_new_intent_history_quote_cannot_poison_journal(self) -> None:
         await self.assert_invalid_patch_leaves_replayable_cut("book_history")
+
+    async def test_invalid_pending_version_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("clock_version", float("nan"))
+
+    async def test_invalid_pending_side_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("clock_side", "INVALID")
+
+    async def test_invalid_owner_version_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("owner_version", float("nan"))
+
+    async def test_invalid_new_intent_version_cannot_poison_journal(self) -> None:
+        await self.assert_invalid_patch_leaves_replayable_cut("history_version", True)
 
     async def test_worker_killed_after_durable_commit_before_ack_then_exact_fork(self) -> None:
         initial = self.slots(self.journal)

@@ -110,11 +110,18 @@ def _stored_quote_valid(quote: Any) -> bool:
     return True
 
 
+def _policy_version_valid(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
 def _intent_valid(intent: Any) -> bool:
     return (
         isinstance(intent, Intent)
         and type(intent.symbol) is int
         and type(intent.quantity) is int
+        and type(intent.side) is str
+        and intent.side in ("BUY", "SELL")
+        and _policy_version_valid(intent.policy_version)
         and _finite_amount(intent.limit)
         and _finite_amount(intent.reserved)
         and _feature_valid(intent.feature, intent.symbol)
@@ -222,6 +229,7 @@ class _Patch:
 
     def _check_values(self, account: AsyncLayeredPaper) -> None:
         pending, owners = self.account["pending"], self.account["owners"]
+        versions = self.account["owner_policy_versions"]
         positions = self.book["positions"]
         fees = self.book["fee_totals"]
         depth, requested = self.book["depth_used"], self.context["requested"]
@@ -229,12 +237,13 @@ class _Patch:
         if (
             not all(
                 _symbol_map(values) for values in (
-                    pending, owners, self.account["owner_policy_versions"], positions,
+                    pending, owners, versions, positions,
                     *(self.book[key] for key in (
                         "cooldowns", "entry_fees", "entry_cost_krw", "position_net", "entry_requested",
                     )),
                 )
             )
+            or not all(_policy_version_valid(version) for version in versions.values())
             or not all(_finite_amount(self.book[key]) for key in BOOK_AMOUNTS)
             or not (_finite_amount(last_enqueued) or last_enqueued == -math.inf)
             or not _amounts(fees)
