@@ -13,11 +13,11 @@ from unittest.mock import MagicMock, patch
 )
 class LocalProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, malformed: bool) -> dict:
-        from websockets.asyncio.server import serve
+        from websockets.asyncio.server import ServerConnection, serve
 
         from tools.probe_toss_websocket import run
 
-        async def handler(ws):
+        async def handler(ws: ServerConnection) -> None:
             async for raw in ws:
                 if raw == "PING":
                     await ws.send(json.dumps({"type": "pong"}))
@@ -51,7 +51,7 @@ class LocalProtocolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "probe"
             async with serve(handler, "127.0.0.1", 0) as server:
-                port = server.sockets[0].getsockname()[1]
+                port = next(iter(server.sockets)).getsockname()[1]
                 with (
                     patch("tools.probe_toss_websocket.URL", f"ws://127.0.0.1:{port}"),
                     patch("tools.probe_toss_websocket.CachedTokenClient", return_value=client),

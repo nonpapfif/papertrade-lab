@@ -532,10 +532,10 @@ class ComparisonTests(RuntimeTests):
             websocket_asyncio = ModuleType("websockets.asyncio")
             websocket_client = ModuleType("websockets.asyncio.client")
             websocket_exceptions = ModuleType("websockets.exceptions")
-            websocket_client.connect = AsyncMock()
-            websocket_exceptions.ConnectionClosed = type("ConnectionClosed", (Exception,), {})
-            websocket_exceptions.InvalidStatus = type("InvalidStatus", (Exception,), {})
-            websocket_exceptions.WebSocketException = type("WebSocketException", (Exception,), {})
+            vars(websocket_client)["connect"] = AsyncMock()
+            vars(websocket_exceptions)["ConnectionClosed"] = type("ConnectionClosed", (Exception,), {})
+            vars(websocket_exceptions)["InvalidStatus"] = type("InvalidStatus", (Exception,), {})
+            vars(websocket_exceptions)["WebSocketException"] = type("WebSocketException", (Exception,), {})
             with (
                 patch.dict(
                     "sys.modules",

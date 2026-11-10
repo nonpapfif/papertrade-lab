@@ -5,18 +5,26 @@ import copy
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from tools.async_layered_paper import NET_TARGET_BLOCKED, AsyncLayeredPaper
 from tools.layered_paper import REBOUND_NET_TARGET, Feature
 from tools.paper_market import KR, US
 
 
-def stamp(seconds):
+def stamp(seconds: float) -> str:
     return (datetime(2026, 11, 3, 15, tzinfo=UTC) + timedelta(seconds=seconds)).isoformat()
 
 
-def event(symbol=0, at=0, *, volume=100, price=10, event_id=None, **kwargs):
+def event(
+    symbol: int = 0,
+    at: float = 0,
+    *,
+    volume: float = 100,
+    price: float = 10,
+    event_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
     f = Feature(symbol, price, stamp(0), stamp(0), 0.01, 0.02, 9, 9, 0.8)
     return {
         "id": event_id or f"{symbol}:{at}",
@@ -37,12 +45,12 @@ def event(symbol=0, at=0, *, volume=100, price=10, event_id=None, **kwargs):
 
 
 class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
-    async def account(self, capital=100, **kwargs):
+    async def account(self, capital: float = 100, **kwargs: Any) -> AsyncLayeredPaper:
         a = AsyncLayeredPaper(capital, **kwargs)
         self.addAsyncCleanup(a.close)
         return a
 
-    async def test_held_quote_health_uses_provider_age_and_preserves_missing_marks(self):
+    async def test_held_quote_health_uses_provider_age_and_preserves_missing_marks(self) -> None:
         account = await self.account()
         self.assertTrue(account.quote_health(stamp(0))["comparison_eligible"])
         await account.submit(event())
@@ -63,7 +71,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(source_at=source_at):
                 account._books[0]["timestamp"] = source_at
-                account.times[0] = source_at
+                cast(dict[int, str | None], account.times)[0] = source_at
                 summary = account.summary()
                 self.assertEqual(summary["comparison_exclusions"][0]["reason"], reason)
                 self.assertFalse(summary["account"]["comparison_eligible"])
@@ -80,7 +88,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(summary["account"]["oldest_open_quote_at"])
         self.assertEqual(summary["positions"]["0"]["quantity"], account.book.positions[0].quantity)
 
-    async def test_net_target_requires_strictly_positive_proceeds_in_both_markets(self):
+    async def test_net_target_requires_strictly_positive_proceeds_in_both_markets(self) -> None:
         for market, ask, capital, fees, targets in (
             (US, 9, 9, {}, (9.009, 9.01, 9.011)),
             (
@@ -114,7 +122,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
                         if target == targets[1]:
                             self.assertEqual(decision["target_net_proceeds"], decision["entry_cost"])
 
-    async def test_net_target_rechecks_partial_depth_at_actual_price_and_retains_owner(self):
+    async def test_net_target_rechecks_partial_depth_at_actual_price_and_retains_owner(self) -> None:
         initial = event(price=4)
         initial["feature"] = replace(initial["feature"], r15=-0.02, mean=4.006)
         account = await self.account(8, policy=REBOUND_NET_TARGET)
@@ -154,7 +162,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy.outcomes[-1]["status"], "partial")
         self.assertNotIn(REBOUND_NET_TARGET, legacy.realized_by_strategy)
 
-    async def test_other_symbol_decides_and_fills_before_delayed_quote(self):
+    async def test_other_symbol_decides_and_fills_before_delayed_quote(self) -> None:
         a = await self.account(200)
         await a.submit(event(0, 0, candidate_count=2))
         await asyncio.wait_for(a.submit(event(1, 1)), timeout=1)
@@ -166,7 +174,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(0, a.book.positions)
         self.assertGreaterEqual(a.book.cash, 0)
 
-    async def test_concurrent_requests_never_double_reserve_cash(self):
+    async def test_concurrent_requests_never_double_reserve_cash(self) -> None:
         a = await self.account(100)
         await asyncio.gather(*(a.submit(event(s, 0)) for s in range(20)))
         self.assertLessEqual(a.reserved_cash, a.book.cash)
@@ -177,7 +185,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(a.book.cash, 0)
         self.assertEqual(a.reserved_cash, 0)
 
-    async def test_future_changes_cannot_change_submitted_intents_or_reservations(self):
+    async def test_future_changes_cannot_change_submitted_intents_or_reservations(self) -> None:
         snapshots = []
         for future_volume, future_price in [(100, 10), (1, 10), (100, 11), (0, 10)]:
             a = await self.account(200, allocation="priority")
@@ -192,7 +200,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(a.book.cash, 0)
         self.assertTrue(all(s == snapshots[0] for s in snapshots))
 
-    async def test_partial_fill_releases_unused_reservation_without_backdating(self):
+    async def test_partial_fill_releases_unused_reservation_without_backdating(self) -> None:
         a = await self.account()
         await a.submit(event())
         await a.submit(event(at=2, volume=1))
@@ -202,7 +210,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.intents[-1].decision_at, stamp(3))
         self.assertEqual(a.intents[-1].quantity, 8)
 
-    async def test_duplicate_and_reconnected_snapshot_cannot_double_fill(self):
+    async def test_duplicate_and_reconnected_snapshot_cannot_double_fill(self) -> None:
         a = await self.account()
         initial, confirmed = event(), event(at=2)
         await a.submit(initial)
@@ -216,14 +224,14 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.book.order_attempts, before)
         self.assertEqual(len(a.intents), 1)
 
-    async def test_symbol_fifo_with_concurrent_queued_events(self):
+    async def test_symbol_fifo_with_concurrent_queued_events(self) -> None:
         a = await self.account(200)
         events = [event(0, 0), event(1, 0.1), event(0, 2), event(1, 3)]
         await asyncio.gather(*(a.submit(e) for e in events))
         self.assertEqual(a.last_at, stamp(3))
         self.assertEqual(a.book.opened, 1)
 
-    async def test_timeout_releases_cash_without_new_quote(self):
+    async def test_timeout_releases_cash_without_new_quote(self) -> None:
         a = await self.account()
         await a.submit(event())
         await a.advance(stamp(31))
@@ -231,7 +239,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.book.cash, 100)
         self.assertEqual(a.outcomes[-1]["status"], "expired")
 
-    async def test_missing_future_quote_keeps_original_request(self):
+    async def test_missing_future_quote_keeps_original_request(self) -> None:
         a = await self.account()
         await a.submit(event())
         original = copy.deepcopy(a.intents)
@@ -240,7 +248,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(a.pending), 1)
         self.assertEqual(a.book.opened, 0)
 
-    async def test_partial_exit_retains_owner_and_does_not_free_unfilled_proceeds(self):
+    async def test_partial_exit_retains_owner_and_does_not_free_unfilled_proceeds(self) -> None:
         a = await self.account()
         await a.submit(event())
         await a.submit(event(at=2))
@@ -256,7 +264,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(a.book.cash - cash, 8)
         self.assertAlmostEqual(sum(a.realized_by_strategy.values()), a.book.realized)
 
-    async def test_invalid_event_failure_is_visible_and_worker_can_continue(self):
+    async def test_invalid_event_failure_is_visible_and_worker_can_continue(self) -> None:
         a = await self.account()
         e = event()
         e["book"]["asks"][0]["price"] = "nan"
@@ -312,7 +320,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["mark_age_seconds"], 62)
         self.assertEqual(a.summary()["positions"]["0"]["mark_age_seconds"], 63)
 
-    async def test_stale_and_future_quotes_cannot_create_intents(self):
+    async def test_stale_and_future_quotes_cannot_create_intents(self) -> None:
         a = await self.account()
         e = event()
         e["book"]["timestamp"] = stamp(1)
@@ -322,7 +330,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         await a.submit(e)
         self.assertEqual(a.intents, [])
 
-    async def test_changed_book_with_same_source_timestamp_is_not_discarded(self):
+    async def test_changed_book_with_same_source_timestamp_is_not_discarded(self) -> None:
         a = await self.account()
         await a.submit(event(eligible=False))
         changed = event(at=0.1, price=9.9)
@@ -331,7 +339,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(a.intents), 1)
         self.assertEqual(a.intents[0].limit, 9.9)
 
-    async def test_new_exit_feature_is_processed_with_duplicate_quote(self):
+    async def test_new_exit_feature_is_processed_with_duplicate_quote(self) -> None:
         a = await self.account()
         await a.submit(event())
         await a.submit(event(at=2))
@@ -350,7 +358,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(0, a.pending)
         self.assertEqual(a.book.opened, 1)
 
-    async def test_us_buy_limit_is_normalized_without_changing_quote(self):
+    async def test_us_buy_limit_is_normalized_without_changing_quote(self) -> None:
         a = await self.account(100)
         at_or_above_one = event(price=1.001)
         at_or_above_one["book"]["bids"][0]["price"] = "1.0"
@@ -372,7 +380,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unavailable.intents, [])
         self.assertEqual(float(unavailable._books[0]["asks"][0]["price"]), 0.00001)
 
-    async def test_unfunded_sell_leaves_account_unchanged_and_records_attempt(self):
+    async def test_unfunded_sell_leaves_account_unchanged_and_records_attempt(self) -> None:
         a = await self.account(1.006)
         penny = event(price=0.005, volume=1)
         penny["book"]["bids"][0]["price"] = "0.005"
@@ -406,7 +414,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(a.outcomes[-1]["status"], "unfilled")
         self.assertEqual(a.outcomes[-1]["blocked_reason"], "insufficient_cash_after_sell_costs")
 
-    async def test_full_replay_prefix_is_independent_of_future_and_missing_confirmation(self):
+    async def test_full_replay_prefix_is_independent_of_future_and_missing_confirmation(self) -> None:
         from tools.replay_layered_stream import replay_case
 
         base = event()
@@ -419,11 +427,11 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
             "cadence": 0,
             "depth": 1.0,
         }
-        history = {0: [(0.0, base["feature"])]}
+        history: dict[int, list[tuple[float, Feature | None]]] = {0: [(0.0, base["feature"])]}
         fx = [{"received_at": stamp(0), "result": {"midRate": 1400}}]
         from tools.async_layered_paper import seconds
 
-        async def run(rows):
+        async def run(rows: dict[int, list[dict[str, Any]]]) -> AsyncLayeredPaper:
             return await replay_case(
                 100,
                 config,
@@ -448,7 +456,7 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prefix.book.opened, 0)
         self.assertEqual(full.book.opened, 1)
 
-    async def test_zero_depth_top_level_cannot_underreserve_cash(self):
+    async def test_zero_depth_top_level_cannot_underreserve_cash(self) -> None:
         a = await self.account()
         e = event()
         e["book"]["asks"].insert(0, {"price": "9.99", "volume": "0"})

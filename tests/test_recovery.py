@@ -13,9 +13,9 @@ import threading
 import time
 import urllib.error
 from datetime import timedelta
+from decimal import Decimal
+from email.message import Message
 from unittest.mock import MagicMock, PropertyMock, patch
-
-from test_framework import AT, BaseCase, book, candidate
 
 from papertrade.ai import Reviewer, validate_decisions
 from papertrade.api import ApiError, MarketClient
@@ -25,12 +25,13 @@ from papertrade.engine import Engine
 from papertrade.service import generate_services, market_once, recover, review_once, risk_once
 from papertrade.store import Store
 from papertrade.strategy import Bar, aggregate, signal
+from tests.test_framework import AT, BaseCase, book, candidate
 
 
 class RecoveryTests(BaseCase):
     def test_minute_market_check_collects_quotes_without_ai_or_paper_execution(self) -> None:
         engine = self.engine()
-        engine.client.calls = 0
+        self.client_mock.calls = 0
         day = {
             "today": {
                 "date": self.session().date,
@@ -47,7 +48,7 @@ class RecoveryTests(BaseCase):
         ):
             market_once(engine)
         shortlist.assert_called_once_with("US", AT, decimal(1), refresh=True)
-        engine.reviewer.review.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
         self.assertEqual(self.store.positions(), [])
         event = json.loads(
             self.store.db.execute("SELECT data FROM events WHERE kind='market_check'").fetchone()[0]
@@ -62,15 +63,15 @@ class RecoveryTests(BaseCase):
         ):
             market_once(engine)
         shortlist.assert_not_called()
-        engine.reviewer.review.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
 
     def test_detail_scanner_reuses_the_fresh_minute_universe_snapshot(self) -> None:
         engine = self.engine()
         self.store.put_cache("universe_snapshot:US", [{"symbol": "TEST"}], AT)
         rows = engine.shortlist("US", AT + timedelta(seconds=30), decimal(1))
         self.assertEqual(rows, [{"symbol": "TEST"}])
-        engine.client.prices.assert_not_called()
-        engine.client.ranking.assert_not_called()
+        self.client_mock.prices.assert_not_called()
+        self.client_mock.ranking.assert_not_called()
 
     def test_successful_retry_without_a_signal_still_resolves_the_api_failure(self) -> None:
         engine = self.engine()
@@ -101,7 +102,7 @@ class RecoveryTests(BaseCase):
 
     def test_approval_freshness_is_checked_again_after_market_data_wait(self) -> None:
         engine = self.engine()
-        engine.client.book.return_value = book(AT + timedelta(minutes=5, seconds=1))
+        self.client_mock.book.return_value = book(AT + timedelta(minutes=5, seconds=1))
         observed = {**candidate(), "observed_at": AT.isoformat()}
         with (
             patch.object(engine, "action_anchor", return_value={"factor": "1"}),
@@ -139,7 +140,7 @@ class RecoveryTests(BaseCase):
         self.store.put_candles("TEST", old)
         self.store.put_cache("history_day:TEST", "2026-10-30", AT - timedelta(days=3))
         engine = self.engine()
-        engine.client.candles.return_value = {
+        self.client_mock.candles.return_value = {
             "candles": [
                 {
                     **row,
@@ -201,12 +202,12 @@ class RecoveryTests(BaseCase):
             for index in range(30)
         ]
         engine = self.engine()
-        engine.client.candles.return_value = {"candles": raw, "nextBefore": None}
+        self.client_mock.candles.return_value = {"candles": raw, "nextBefore": None}
         bars = engine.history("TEST", [session], AT)
         self.assertEqual(len(bars), 1)
         self.assertEqual(bars[0].at, session.start)
         self.assertEqual(bars[0].volume, 30)
-        self.assertEqual(stamp(engine.client.candles.call_args.args[1]), AT)
+        self.assertEqual(stamp(self.client_mock.candles.call_args.args[1]), AT)
         self.assertEqual(
             self.store.candles("TEST", session.start, AT)[0]["source_timestamp"],
             raw[0]["timestamp"],
@@ -233,11 +234,12 @@ class RecoveryTests(BaseCase):
         return Session("US", "2026-11-02", AT - timedelta(hours=2), AT + timedelta(hours=4))
 
     def engine(self) -> Engine:
-        client = MagicMock()
-        client.warnings.return_value = []
-        client.stocks.return_value = [{"status": "ACTIVE"}]
-        client.book.return_value = book(bid="90", ask="90.1")
-        return Engine(self.settings, self.store, client, MagicMock())
+        self.client_mock = MagicMock()
+        self.reviewer_mock = MagicMock()
+        self.client_mock.warnings.return_value = []
+        self.client_mock.stocks.return_value = [{"status": "ACTIVE"}]
+        self.client_mock.book.return_value = book(bid="90", ask="90.1")
+        return Engine(self.settings, self.store, self.client_mock, self.reviewer_mock)
 
     def owned(self, symbol: str = "TEST") -> dict:
         position = self.position()
@@ -249,7 +251,7 @@ class RecoveryTests(BaseCase):
         self.owned("BAD")
         self.owned("GOOD")
         engine = self.engine()
-        engine.client.warnings.side_effect = [ApiError("temporary"), []]
+        self.client_mock.warnings.side_effect = [ApiError("temporary"), []]
         with patch("papertrade.engine.now_utc", return_value=AT):
             engine.inspect_positions("US", self.session(), AT)
         self.assertEqual([row["symbol"] for row in self.store.positions()], ["BAD"])
@@ -267,7 +269,7 @@ class RecoveryTests(BaseCase):
             AT - timedelta(minutes=1),
         )
         engine.inspect_positions("US", session, AT)
-        engine.client.book.assert_not_called()
+        self.client_mock.book.assert_not_called()
         self.assertEqual(len(self.store.positions()), 1)
 
     def test_exit_and_mark_use_complete_visible_depth(self) -> None:
@@ -275,7 +277,7 @@ class RecoveryTests(BaseCase):
         engine = self.engine()
         depth = book(bid="106", ask="106.1")
         depth["bids"] = [{"price": "106", "volume": "1"}, {"price": "80", "volume": "1"}]
-        engine.client.book.return_value = depth
+        self.client_mock.book.return_value = depth
         with patch("papertrade.engine.now_utc", return_value=AT):
             engine.inspect_positions("US", self.session(), AT)
         trade = self.store.summary(AT)["trades"][0]
@@ -301,17 +303,17 @@ class RecoveryTests(BaseCase):
             AT,
         )
         engine = self.engine()
-        engine.client.get.return_value = {
+        self.client_mock.get.return_value = {
             "midRate": "1410",
             "validUntil": (AT + timedelta(minutes=1)).isoformat(),
         }
         with patch("papertrade.engine.now_utc", return_value=AT + timedelta(seconds=2)):
             self.assertEqual(engine.fx("KR", AT + timedelta(seconds=2)), 1410)
-        engine.client.get.assert_called_once()
+        self.client_mock.get.assert_called_once()
 
     def test_fx_delay_cannot_hide_a_stale_entry_book(self) -> None:
         engine = self.engine()
-        engine.client.book.return_value = book()
+        self.client_mock.book.return_value = book()
         with (
             patch.object(engine, "action_anchor", return_value={"factor": "1"}),
             patch.object(engine, "fx", return_value=decimal(1)),
@@ -340,7 +342,7 @@ class RecoveryTests(BaseCase):
         self.store.put_candles("TEST", [row for i, row in enumerate(rows) if i != 2])
         self.store.put_cache("history_day:TEST", session.date, AT)
         engine = self.engine()
-        engine.client.candles.return_value = {
+        self.client_mock.candles.return_value = {
             "candles": [
                 {**row, "timestamp": (stamp(row["timestamp"]) + timedelta(minutes=1)).isoformat()}
                 for row in rows
@@ -351,7 +353,7 @@ class RecoveryTests(BaseCase):
         self.assertEqual(len(bars), 2)
         self.assertEqual(len(self.store.candles("TEST", session.start, AT)), 60)
         self.assertLess(
-            stamp(engine.client.candles.call_args.args[1]), session.start + timedelta(minutes=4)
+            stamp(self.client_mock.candles.call_args.args[1]), session.start + timedelta(minutes=4)
         )
 
     def test_noncontiguous_signal_window_is_rejected(self) -> None:
@@ -403,6 +405,7 @@ class RecoveryTests(BaseCase):
     def test_pending_and_interrupted_usage_is_unknown_not_zero(self) -> None:
         call = self.store.reserve_ai("test", AT)
         self.assertTrue(self.store.summary(AT)["ai_usage_unknown"])
+        assert call is not None
         self.store.finish_ai(call, "interrupted", None, {})
         row = self.store.summary(AT)["ai_calls"][0]
         self.assertIsNone(row["input_tokens"])
@@ -502,7 +505,7 @@ class RecoveryTests(BaseCase):
         thread.start()
         original = self.store.equity
 
-        def equity():
+        def equity() -> Decimal:
             value = original()
             ready.set()
             self.assertTrue(done.wait(3))
@@ -539,13 +542,13 @@ class RecoveryTests(BaseCase):
         ):
             risk_once(engine)
         self.assertEqual(self.store.positions(), [])
-        engine.reviewer.review.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
 
     def test_all_fresh_candidates_reach_one_comparative_review_without_a_count_cap(self) -> None:
         for number in range(9):
             self.store.enqueue({**candidate(), "symbol": f"S{number}", "signal_key": f"s{number}"})
         engine = self.engine()
-        engine.reviewer.review.return_value = {}
+        self.reviewer_mock.review.return_value = {}
         day = {
             "today": {
                 "date": "2026-11-02",
@@ -561,8 +564,8 @@ class RecoveryTests(BaseCase):
             patch.object(engine, "calendar", return_value=day),
         ):
             review_once(engine, "owner")
-        self.assertEqual(len(engine.reviewer.review.call_args.args[0]), 9)
-        self.assertEqual(engine.reviewer.review.call_count, 1)
+        self.assertEqual(len(self.reviewer_mock.review.call_args.args[0]), 9)
+        self.assertEqual(self.reviewer_mock.review.call_count, 1)
 
     def test_services_start_at_login_and_restart_without_a_global_ai_lock(self) -> None:
         import plistlib
@@ -588,7 +591,7 @@ class RecoveryTests(BaseCase):
             },
         )
         engine = self.engine()
-        engine.client.daily.return_value = {
+        self.client_mock.daily.return_value = {
             "candles": [{"timestamp": position["action_anchor"]["timestamp"], "closePrice": "50"}]
         }
         self.assertFalse(engine.check_actions(position, self.session()))
@@ -625,11 +628,14 @@ class RecoveryTests(BaseCase):
             patch("papertrade.api.time.sleep"),
         ):
             client.opener = MagicMock()
+            headers = Message()
+            headers["retry-after"] = "4"
+            headers["x-ratelimit-limit"] = "1"
             client.opener.open.side_effect = urllib.error.HTTPError(
                 "fixture",
                 429,
                 "limit",
-                {"retry-after": "4", "x-ratelimit-limit": "1"},
+                headers,
                 io.BytesIO(b'{"error":{"code":"too-many-requests","requestId":"req-test"}}'),
             )
             with self.assertRaises(ApiError):
@@ -678,7 +684,7 @@ class RecoveryTests(BaseCase):
         response.status = 200
         client.opener = MagicMock()
         client.opener.open.side_effect = [
-            urllib.error.HTTPError("fixture", 401, "unauthorized", {}, io.BytesIO(b"{}")),
+            urllib.error.HTTPError("fixture", 401, "unauthorized", Message(), io.BytesIO(b"{}")),
             MagicMock(__enter__=MagicMock(return_value=response)),
         ]
         with (
@@ -696,6 +702,7 @@ class RecoveryTests(BaseCase):
 
     def test_stream_records_usage_heartbeat_and_final_message_without_timeout(self) -> None:
         call = self.store.reserve_ai("stream", AT)
+        assert call is not None
         program = 'import sys,json;sys.stdin.read();print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"{}"}}));print(json.dumps({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}))'
         process = subprocess.Popen(
             [sys.executable, "-c", program],
@@ -707,6 +714,7 @@ class RecoveryTests(BaseCase):
         usage, message, actions = Reviewer(self.settings, self.store).stream(
             process, "x" * 200000, call
         )
+        assert usage is not None
         self.assertEqual(usage["input_tokens"], 10)
         self.assertEqual(message, "{}")
         self.assertEqual(actions, [])

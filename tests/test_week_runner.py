@@ -11,6 +11,7 @@ import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from tools.run_week_experiment import (
@@ -35,7 +36,7 @@ from tools.search_portfolios import configurations, signals
 
 class WeekRunnerTests(unittest.TestCase):
     def test_whole_account_audit_rejects_fractional_fills_and_unfunded_cash(self) -> None:
-        hypothesis = {
+        hypothesis: dict[str, Any] = {
             "accounting": "continuous_account",
             "daily": [{}],
             "summary": {"initial_equity": 50},
@@ -444,7 +445,7 @@ class WeekRunnerTests(unittest.TestCase):
                     )
                 )
                 paths[day] = dataset, base, base
-            manifest = {
+            manifest: dict[str, Any] = {
                 "deadline": None,
                 "long_only": True,
                 "symbols": [["KR", "A"]],

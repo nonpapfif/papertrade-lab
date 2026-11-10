@@ -157,6 +157,7 @@ class LossRuntime(Runtime):
         *,
         saved: dict[str, Any] | None = None,
         replaying: bool = False,
+        feature_cut: dict[tuple[Any, ...], Feature | None] | None = None,
     ) -> None:
         if not replaying and self.review_settings is not None:
             raise JournalError("Offline replay cannot run live reviews")
@@ -170,7 +171,9 @@ class LossRuntime(Runtime):
             }
         before = {name: len(account.book.trades) for name, account in self.accounts.items()}
         self.observation = None
-        await super()._consume_event(entry, queue_delay, saved=saved, replaying=replaying)
+        await super()._consume_event(
+            entry, queue_delay, saved=saved, replaying=replaying, feature_cut=feature_cut
+        )
         if entry["kind"] == "policy_review":
             for name, variants in self.experiments.items():
                 baseline = self.accounts[name]

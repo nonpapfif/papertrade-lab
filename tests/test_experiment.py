@@ -5,13 +5,13 @@ from __future__ import annotations
 import copy
 import json
 from datetime import timedelta
+from typing import Any
 from unittest.mock import MagicMock
-
-from test_framework import AT, ROOT, BaseCase, book, candidate
 
 from papertrade.core import Session, Settings, decimal
 from papertrade.engine import Engine
 from papertrade.strategy import Bar, aggregate, entry_plan, signal
+from tests.test_framework import AT, ROOT, BaseCase, book, candidate
 
 
 class ExperimentTests(BaseCase):
@@ -52,8 +52,9 @@ class ExperimentTests(BaseCase):
         bars[-1] = Bar(
             bars[-1].at, decimal(99), decimal(102), decimal(99), decimal(101), decimal(110)
         )
-        diagnostic = {}
+        diagnostic: dict[str, Any] = {}
         result = signal("TEST", "US", bars, decimal(0), AT, self.settings, diagnostics=diagnostic)
+        assert result is not None
         self.assertEqual(result["strategy_profile"], "momentum-experiment-v2")
         self.assertEqual(result["bar_minutes"], 5)
         self.assertEqual(diagnostic["stage"], "passed")

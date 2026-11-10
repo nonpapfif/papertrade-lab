@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 from tools.layered_paper import REBOUND_NET_TARGET, Feature, LayeredPaper, assign, holding_valid
+from tools.paper_market import KR, US
 from tools.toss_order_contract import whole_share_limit
 
 NET_TARGET_BLOCKED = "nonpositive_rebound_net_target"
@@ -110,19 +111,23 @@ class AsyncLayeredPaper(LayeredPaper):
 
     def fork(self) -> AsyncLayeredPaper:
         """Copy account state at a completed observation with independent workers."""
+        return copy.deepcopy(self)
+
+    def __getstate__(self) -> dict[str, Any]:
         if self._submitted != self._completed or self._lock.locked():
-            raise RuntimeError("Account fork requires a completed observation")
-        lock = asyncio.Lock()
-        return copy.deepcopy(
-            self,
-            {
-                id(self._lock): lock,
-                id(self._turn): asyncio.Condition(lock),
-                id(self._queues): {},
-                id(self._workers): {},
-                id(self.context.market): self.context.market,
-            },
-        )
+            raise RuntimeError("Account serialization requires a completed observation")
+        return {
+            key: value for key, value in vars(self).items()
+            if key not in ("_lock", "_turn", "_queues", "_workers")
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        vars(self).update(state)
+        self._lock = asyncio.Lock()
+        self._turn = asyncio.Condition(self._lock)
+        self._queues = {}
+        self._workers = {}
+        self.context.market = KR if self.context.market.code == "KR" else US
 
     @property
     def available_cash(self) -> float:

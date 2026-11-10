@@ -142,7 +142,7 @@ class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
             run.shared_watch = {"A", "B"}
             candidate = run.accounts["candidate"]
             at = stamp(0)
-            features = {
+            features: dict[str, Feature | None] = {
                 name: Feature(index, 10, at, at, 0.01, 0.02, 10, 9, 0.8)
                 for index, name in enumerate(("A", "B"))
             }

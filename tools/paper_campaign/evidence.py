@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextlib import nullcontext, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from tools.adaptive_journal import AdaptiveJournal
 from tools.paper_campaign.policy import numeric
+from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
 
 
 def account_eligible(account: dict[str, Any]) -> bool:
@@ -174,8 +177,32 @@ MAX_BOOK_GAP_SECONDS = 180
 BOOK_COVERAGE_SECONDS = 60
 
 
-def observed_coverage(path: Path, chain: str, start: float, end: float) -> dict[str, Any]:
+def observed_coverage(
+    path: Path,
+    chain: str,
+    start: float,
+    end: float,
+    *,
+    audit: RuntimeAudit | None = None,
+    context: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
     """Measure intervals containing accepted books across every worker attempt."""
+    scope = audit.operation("evidence", "coverage_failed", context) if audit else nullcontext()
+    worker_id = str(context.get("market", "main")) if context else "main"
+    with scope:
+        if audit is not None:
+            audit.heartbeat("evidence", worker_id=worker_id, status="active", timeout=120)
+        try:
+            return _observed_coverage(path, chain, start, end)
+        finally:
+            if audit is not None and audit.healthy:
+                with suppress(RuntimeAuditError):
+                    audit.heartbeat("evidence", worker_id=worker_id)
+
+
+def _observed_coverage(path: Path, chain: str, start: float, end: float) -> dict[str, Any]:
+    if end <= start:
+        raise ValueError("Coverage requires a positive interval")
     previous = start
     covered_until = start
     observed = 0

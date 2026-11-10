@@ -5,6 +5,7 @@ import pickle
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
+from typing import Any
 
 from tests.test_combined_hedge import frame
 from tools.layered_paper import Feature, LayeredPaper, assign, feature_from_bars, holding_valid
@@ -16,7 +17,7 @@ def feature(minute: int = 0, symbol: int = 0) -> Feature:
 
 
 class LayerTests(unittest.TestCase):
-    def bars(self, missing=()):
+    def bars(self, missing: tuple[int, ...] = ()) -> tuple[datetime, list[dict[str, Any]]]:
         at = datetime.fromisoformat(frame()["decision_at"])
         rows = [
             {
@@ -34,7 +35,7 @@ class LayerTests(unittest.TestCase):
         at, rows = self.bars(missing=(1, 2, 7, 8, 12))
         original = copy.deepcopy(rows)
         f = feature_from_bars(0, rows, at.isoformat())
-        self.assertIsNotNone(f)
+        assert f is not None
         self.assertAlmostEqual(f.r5, 10.15 / 10.10 - 1)
         self.assertAlmostEqual(f.r15, 10.15 / 10 - 1)
         self.assertEqual(f.observations, 11)
@@ -45,6 +46,7 @@ class LayerTests(unittest.TestCase):
     def test_missing_reference_uses_only_an_earlier_nearby_observation(self) -> None:
         at, rows = self.bars(missing=(10,))
         f = feature_from_bars(0, rows, at.isoformat())
+        assert f is not None
         self.assertAlmostEqual(f.r5, 10.15 / 10.09 - 1)
         self.assertEqual(f.reference5_age_seconds, 60)
         self.assertEqual(f.reference15_age_seconds, 0)
@@ -56,6 +58,7 @@ class LayerTests(unittest.TestCase):
     def test_dense_features_keep_existing_numerical_values(self) -> None:
         at, rows = self.bars()
         f = feature_from_bars(0, rows, at.isoformat())
+        assert f is not None
         self.assertAlmostEqual(f.r5, 10.15 / 10.10 - 1)
         self.assertAlmostEqual(f.mean, sum(10 + i / 100 for i in range(15)) / 15)
         self.assertEqual(f.missing_minutes, 0)

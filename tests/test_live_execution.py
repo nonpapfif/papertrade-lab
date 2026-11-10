@@ -242,7 +242,9 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(target.closed, 0)
         self.assertEqual(target.wins, 0)
         self.assertAlmostEqual(target.entry_fees[0], 0.05)
-        self.assertAlmostEqual(target.entry_cost_krw[0], 75075)
+        entry_cost_krw = target.entry_cost_krw[0]
+        assert entry_cost_krw is not None
+        self.assertAlmostEqual(entry_cost_krw, 75075)
         self.assertFalse(target.trades[-1]["position_closed"])
         summary = target.summary(
             {0: 11}, {0: target.context.frame["at"]}, target.context.frame["at"]

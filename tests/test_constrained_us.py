@@ -131,9 +131,9 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account.owners[0][0], "trend")
         self.assertAlmostEqual(account.book.cash, 14.99)
         self.assertEqual(account.reserved_cash, 0)
-        self.assertEqual(
-            self.runtime.configurations["incumbent"]["fee_schedule"]["commission_exemption_usd"], 0
-        )
+        fee_schedule = self.runtime.configurations["incumbent"]["fee_schedule"]
+        assert isinstance(fee_schedule, dict)
+        self.assertEqual(fee_schedule["commission_exemption_usd"], 0)
 
         # The owner is still reviewed after leaving candidate selection.
         sell_at = self.close_at - timedelta(seconds=12)
@@ -161,10 +161,11 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
     async def test_unavailable_orderbook_timestamp_is_skipped_and_consumer_continues(self) -> None:
         at = self.close_at - timedelta(seconds=20)
         await self.prime(at)
-        for book in (
+        books: list[dict[str, Any]] = [
             {"timestamp": None, "currency": "USD", "asks": [], "bids": []},
             {"currency": "USD", "asks": [{"price": "5", "volume": "2"}], "bids": []},
-        ):
+        ]
+        for book in books:
             await self.publish(at, "book", ("A", book))
         self.assertFalse(self.consumer.done())
         self.assertNotIn("A", self.runtime.books)
@@ -201,7 +202,9 @@ class ConstrainedUsTests(unittest.IsolatedAsyncioTestCase):
             assert changed_config is not None
             self.assertFalse(changed_config["configuration_unchanged"])
             self.assertFalse(changed_config["complete"])
-            runtime.account.policy = runtime.configurations["incumbent"]["policy"]
+            policy = runtime.configurations["incumbent"]["policy"]
+            assert isinstance(policy, str)
+            runtime.account.policy = policy
             (output / SOURCES[0]).write_text("changed\n")
             with patch("tools.run_async_live_validation.ROOT", output):
                 changed = write_comparison(output, {"state": "complete"}, runtime)

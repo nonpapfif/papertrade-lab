@@ -6,14 +6,13 @@ import json
 from decimal import Decimal
 from typing import Any
 
-from test_framework import AT, BaseCase
-
+from tests.test_framework import AT, BaseCase
 from tools.review_round import review
 
 
 class RoundReviewTests(BaseCase):
     def snapshot(self) -> dict[str, Any]:
-        result = {
+        result: dict[str, Any] = {
             table: [dict(row) for row in self.store.db.execute(f"SELECT * FROM {table}")]
             for table in ("trades", "ai_calls", "positions", "cash", "events")
         }

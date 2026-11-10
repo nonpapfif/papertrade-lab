@@ -51,7 +51,7 @@ class DownloadTests(unittest.TestCase):
         self.client = FakeClient(self.settings)
         self.downloader = Downloader(self.settings, self.root, "2026-10-30", client=self.client)
         self.addCleanup(lambda: self.downloader.close())
-        self.scope = {
+        self.scope: dict[str, Any] = {
             "start": "2026-10-30T13:00:00+00:00", "end": "2026-10-30T13:03:00+00:00",
             "sessions": [{"start": "2026-10-30T13:00:00+00:00",
                           "end": "2026-10-30T13:02:00+00:00"}],

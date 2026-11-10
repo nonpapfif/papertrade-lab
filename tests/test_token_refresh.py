@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from email.message import Message
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import Mock, PropertyMock, patch
@@ -56,7 +57,7 @@ class TokenRefreshTests(unittest.TestCase):
             },
         )
 
-    def client(self) -> tuple[GatedClient, RateGate, list[dict[str, Any]]]:
+    def client(self) -> tuple[GatedClient, RateGate, list[dict[str, Any]], Mock]:
         gate = RateGate(10)
         records: list[dict[str, Any]] = []
 
@@ -65,8 +66,9 @@ class TokenRefreshTests(unittest.TestCase):
             gate.observe(record)
 
         client = GatedClient(self.settings, gate, audit)
-        client.opener = Mock()
-        return client, gate, records
+        opener = Mock()
+        client.opener = opener
+        return client, gate, records, opener
 
     @staticmethod
     def rejected(code: str, status: int = 401) -> urllib.error.HTTPError:
@@ -74,7 +76,7 @@ class TokenRefreshTests(unittest.TestCase):
             "https://fixture.invalid",
             status,
             "Rejected",
-            {},
+            Message(),
             io.BytesIO(json.dumps({"error": {"code": code}}).encode()),
         )
 
@@ -104,7 +106,7 @@ class TokenRefreshTests(unittest.TestCase):
 
     def test_token_rotated_while_waiting_is_read_after_dispatch_reservation(self) -> None:
         self.cache("old")
-        client, gate, _ = self.client()
+        client, gate, _, opener = self.client()
         client.token, client.expires_at = "old", time.time() + 3600
 
         def reserved(group: str) -> None:
@@ -115,14 +117,14 @@ class TokenRefreshTests(unittest.TestCase):
             self.assertEqual(request.get_header("Authorization"), "Bearer new")
             return Response(b'{"result":{"candles":[]}}')
 
-        client.opener.open.side_effect = opened
+        opener.open.side_effect = opened
         with patch.object(gate, "reserve", side_effect=reserved):
             self.assertEqual(client.get("/api/v1/candles", symbol="TEST"), {"candles": []})
-        self.assertEqual(client.opener.open.call_count, 1)
+        self.assertEqual(opener.open.call_count, 1)
 
     def test_inflight_old_token_recovers_from_cache_without_deleting_replacement(self) -> None:
         self.cache("old")
-        client, gate, records = self.client()
+        client, gate, records, opener = self.client()
         seen = []
 
         def opened(request: Any, timeout: float) -> Response:
@@ -133,7 +135,7 @@ class TokenRefreshTests(unittest.TestCase):
                 raise self.rejected("token-revoked")
             return Response(b'{"result":{"candles":[]}}')
 
-        client.opener.open.side_effect = opened
+        opener.open.side_effect = opened
         self.assertEqual(client.get("/api/v1/candles", symbol="TEST"), {"candles": []})
         self.assertEqual(seen, ["Bearer old", "Bearer new"])
         self.assertEqual([r["status"] for r in records], [401, 200])
@@ -142,8 +144,8 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertEqual(cached["access_token"], "new")
 
     def test_failed_authentication_retry_blocks_every_worker(self) -> None:
-        client, gate, records = self.client()
-        client.opener.open.side_effect = [
+        client, gate, records, opener = self.client()
+        opener.open.side_effect = [
             self.rejected("token-revoked"),
             self.rejected("token-revoked"),
         ]
@@ -155,7 +157,7 @@ class TokenRefreshTests(unittest.TestCase):
             client.get("/api/v1/candles", symbol="TEST")
         self.assertEqual(failure.exception.status, 401)
         self.assertEqual([r["attempt"] for r in records], [1, 2])
-        self.assertEqual(client.opener.open.call_count, 2)
+        self.assertEqual(opener.open.call_count, 2)
         for group in ("MARKET_DATA_CHART", "AUTH", "MARKET_INFO"):
             with self.assertRaises(Blocked):
                 gate.reserve(group)
@@ -163,15 +165,15 @@ class TokenRefreshTests(unittest.TestCase):
     def test_other_access_rejections_still_stop_without_extra_http_requests(self) -> None:
         for code, status in (("login-user-not-found", 401), ("forbidden", 403)):
             with self.subTest(code=code):
-                client, gate, _ = self.client()
-                client.opener.open.side_effect = self.rejected(code, status)
+                client, gate, _, opener = self.client()
+                opener.open.side_effect = self.rejected(code, status)
                 with (
                     patch.object(client, "access_token", return_value="fixture"),
                     patch.object(client, "_invalidate_token"),
                     self.assertRaises((ApiError, Blocked)),
                 ):
                     client.get("/api/v1/candles", symbol="TEST")
-                self.assertEqual(client.opener.open.call_count, 1)
+                self.assertEqual(opener.open.call_count, 1)
                 self.assertIsNotNone(gate.blocked)
 
 

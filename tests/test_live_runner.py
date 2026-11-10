@@ -8,10 +8,12 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from typing import Any, Self
 from unittest.mock import Mock, patch
 
+from tools.live_feed import SnapshotHistory
 from tools.run_live_parallel import Journal, advance_frame, live_design, make_frame, run
 from tools.search_portfolios import configurations, signals
 
@@ -24,8 +26,8 @@ class LiveRunnerTests(unittest.TestCase):
 
         class FrozenDateTime(datetime):
             @classmethod
-            def now(cls, tz: object = None) -> datetime:
-                return datetime.fromtimestamp(clock[0], UTC)
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(clock[0], UTC)
 
         def sleep(seconds: float) -> None:
             clock[0] += seconds
@@ -66,6 +68,7 @@ class LiveRunnerTests(unittest.TestCase):
                     journal = Journal(output)
                     state = journal.load()
                     journal.db.close()
+                    assert state is not None
                     self.assertEqual(state["evaluations"], 0)
                     self.assertEqual(state["snapshots"], 5)
                     for engine in state["engines"].values():
@@ -116,6 +119,7 @@ class LiveRunnerTests(unittest.TestCase):
             first_frame = json.loads(gzip.decompress(frames[0][1]))
             self.assertIsNotNone(first_frame["long_features"][0][1][0])
             final = journal.load()
+            assert final is not None
             self.assertTrue(all(e.states[0]["book"].opened == 1 for e in final["engines"].values()))
             journal.db.close()
             with self.assertRaisesRegex(ValueError, "Resume trading start"):
@@ -123,7 +127,7 @@ class LiveRunnerTests(unittest.TestCase):
 
     def test_delayed_execution_expires_prices_without_relabeling_their_observation(self) -> None:
         at = "2026-11-02T15:00:00+00:00"
-        frame = {
+        frame: dict[str, Any] = {
             "quotes": {0: 10, 1: 20},
             "source_times": {0: at, 1: "2026-11-02T14:59:00+00:00"},
             "price_observed_at": at,
@@ -166,7 +170,7 @@ class LiveRunnerTests(unittest.TestCase):
             journal.db.close()
 
     def test_live_frame_keeps_rank_rotation_inputs_and_source_provenance(self) -> None:
-        class History:
+        class History(SnapshotHistory):
             def features(self, at: str) -> list[dict]:
                 return [
                     {
@@ -202,8 +206,8 @@ class LiveRunnerTests(unittest.TestCase):
 
         class FrozenDateTime(datetime):
             @classmethod
-            def now(cls, tz: object = None) -> datetime:
-                return datetime.fromtimestamp(Clock.value, tz=UTC)
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(Clock.value, tz=UTC)
 
         class Feed:
             instance = None
@@ -291,7 +295,9 @@ class LiveRunnerTests(unittest.TestCase):
             self.assertEqual(status["accounts"], 3)
             self.assertEqual(status["ai_calls"], 0)
             self.assertGreater(status["evaluations"], 1)
-            self.assertLess(Feed.instance.snapshots, 16)
+            instance = Feed.instance
+            assert instance is not None
+            self.assertLess(instance.snapshots, 16)
             with (output / "comparison.csv").open() as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(len(rows), 3)
@@ -302,6 +308,7 @@ class LiveRunnerTests(unittest.TestCase):
             self.assertTrue(all(float(r["cash"]) >= 0 for r in rows))
             journal = Journal(output)
             state = journal.load()
+            assert state is not None
             self.assertTrue(state["complete"])
             self.assertEqual(state["combined"].book.initial_equity, 100)
             self.assertEqual(state["last_slot"], state["engines"]["quotes"].last_tick)

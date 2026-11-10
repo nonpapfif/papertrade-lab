@@ -490,7 +490,7 @@ class WeekHypothesisTests(unittest.TestCase):
             )
 
     def test_shared_day_boundary_matches_cold_standalone_without_retrading_carry(self) -> None:
-        policies = [
+        policies: list[dict[str, Any]] = [
             {
                 "id": "cold",
                 "mode": "rolling",
@@ -539,7 +539,7 @@ class WeekHypothesisTests(unittest.TestCase):
         )
 
     def test_future_price_changes_cannot_change_earlier_choices_or_trades(self) -> None:
-        policies = [
+        policies: list[dict[str, Any]] = [
             {"id": "daily", "mode": "daily"},
             {"id": "recent", "mode": "rolling", "window": 3},
         ]
@@ -639,7 +639,7 @@ class WeekHypothesisTests(unittest.TestCase):
         self.assertEqual({trade["day"] for trade in result["trades"]}, {"2026-10-26", "2026-10-27"})
 
     def test_family_filter_and_stable_random_seeds(self) -> None:
-        policies = [
+        policies: list[dict[str, Any]] = [
             {"id": "family", "mode": "daily", "families": ["reversal"]},
             {"id": "random", "mode": "random", "seed": 17},
         ]
