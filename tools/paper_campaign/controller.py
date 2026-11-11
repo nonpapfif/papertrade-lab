@@ -130,9 +130,18 @@ class Campaign:
             or state.get("not_before") != approved_start
         ):
             raise ValueError("Campaign source, capacity evidence or evaluation policy changed")
-        if state.get("blocked"):
-            return
         active = state["active"]
+        if blocked := state.get("blocked"):
+            if (
+                active is None
+                or active.get("repair_resumed")
+                or blocked.get("reason") != "finite_schedule_failed"
+                or not self.runner.recover(directory / active["day"], blocked)
+            ):
+                return
+            active["repair_resumed"] = True
+            del state["blocked"]
+            atomic_json(path, state)
         if active is None:
             if earliest is not None and now < earliest:
                 return
@@ -595,20 +604,39 @@ class Campaign:
             }
         )
         state["active"] = None
+        if active.get("repair_resumed"):
+            grant = read_json(output / "engineering-recovery" / "restart.json")
+            state["blocked"] = self._handoff(
+                output / "post-repair", "capacity_requires_repaired_source",
+                market.code, active["day"], source=grant,
+            )
         atomic_json(path, state)
 
     def _block(self, path: Path, state: dict[str, Any], output: Path, reason: str) -> None:
         active = state["active"]
-        handoff = self._handoff(output, reason, path.parent.name, active["day"])
+        source = None
+        if active.get("repair_resumed"):
+            source = read_json(output / "engineering-recovery" / "restart.json")
+            reason = "resumed_" + reason
+        handoff = self._handoff(
+            output / "post-repair" if source else output,
+            reason, path.parent.name, active["day"], source=source,
+        )
         state["blocked"] = handoff
         atomic_json(path, state)
 
-    def _handoff(self, output: Path, reason: str, market: str, day: str) -> dict[str, Any]:
+    def _handoff(
+        self, output: Path, reason: str, market: str, day: str, *,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         path = output / "engineering_handoff.json"
+        commit = source["source_commit"] if source else self.runner.source_commit
+        digest = source["source_digest"] if source else self.runner.source_digest
+        session = output.parent if source else output
         identity = fingerprint({
             "market": market, "session": day, "reason": reason,
-            "source_commit": self.runner.source_commit,
-            "source_digest": self.runner.source_digest,
+            "source_commit": commit,
+            "source_digest": digest,
         })
         if path.exists():
             saved = read_json(path)
@@ -618,17 +646,24 @@ class Campaign:
             "state": "blocked",
             "task_id": identity,
             "reason": reason,
-            "source_commit": self.runner.source_commit,
-            "source_digest": self.runner.source_digest,
+            "source_commit": commit,
+            "source_digest": digest,
             "market": market,
             "session": day,
             "evidence": {
-                "scheduler": str(output / "scheduler"),
-                "schedule": str(output / "schedule" / "status.json"),
-                "journal": str(output / "schedule" / "journal.sqlite3"),
+                "scheduler": str(
+                    session / "engineering-recovery" / "resumed-scheduler"
+                    if source else session / "scheduler"
+                ),
+                "schedule": str(session / "schedule" / "status.json"),
+                "journal": str(session / "schedule" / "journal.sqlite3"),
             },
             "tests": ["tests.test_paper_campaign", "tests.test_async_live_validation"],
-            "required": "Reconcile the worker exit and committed accounts before any restart.",
+            "required": (
+                "Measure capacity at the repaired source and approve campaign source migration."
+                if reason == "capacity_requires_repaired_source"
+                else "Reconcile the worker exit and committed accounts before any restart."
+            ),
         }
         with (
             self.audit.operation(

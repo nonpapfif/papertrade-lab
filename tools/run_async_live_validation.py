@@ -18,7 +18,6 @@ from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -48,13 +47,13 @@ from tools.live_feed import MAX_AGE_SECONDS, LiveFeed
 from tools.market_data_adapter import MarketDataAdapter
 from tools.market_data_gateway import MarketDataGateway
 from tools.market_data_repository import DataRecord, DataRequest, MarketDataRepository
+from tools.market_stream import receive_market_stream
+from tools.paper_campaign.recovery import require_approved_restart
 from tools.paper_market import KR, US, PaperMarket
 from tools.probe_toss_websocket import (
     KR_SYMBOL,
     ROOT,
-    URL,
     CachedTokenClient,
-    declaration,
     error_details,
     read_spec,
 )
@@ -78,6 +77,7 @@ SOURCES = (
     "papertrade/usage.py",
     "tools/account_executor.py",
     "tools/adaptive_journal.py",
+    "tools/autotest_jobs.py",
     "tools/async_layered_paper.py",
     "tools/kr_broker_profile.py",
     "tools/kr_comparison_ai.py",
@@ -87,6 +87,8 @@ SOURCES = (
     "tools/market_data_adapter.py",
     "tools/market_data_gateway.py",
     "tools/market_data_repository.py",
+    "tools/market_stream.py",
+    "tools/paper_campaign/recovery.py",
     "tools/paper_market.py",
     "tools/probe_toss_websocket.py",
     "tools/replay_market_day.py",
@@ -97,6 +99,7 @@ SOURCES = (
     "tools/slot_control.py",
     "tools/source_identity.py",
     "tools/strategy_catalog.py",
+    "tools/supervisor_scopes.py",
     "tools/toss_order_contract.py",
     "tools/us_adaptive_ai.py",
     "tools/week_hypotheses.py",
@@ -437,10 +440,12 @@ class Runtime:
                 assert isinstance(payload, str)
                 await account.cancel_pending(payload)
 
-    async def cancel_accounts(self, sequence: int, at: str) -> None:
-        await self._apply_accounts(
-            sequence, {name: AccountAction("cancel", at) for name in self.accounts},
-        )
+    async def prepare_shared_stop(self, sequence: int, at: str, *, cancel_pending: bool) -> None:
+        self.last_account_results = {}
+        if cancel_pending:
+            await self._apply_accounts(
+                sequence, {name: AccountAction("cancel", at) for name in self.accounts},
+            )
 
     def assert_accounts_committable(self) -> None:
         if self._failed_cut:
@@ -521,6 +526,11 @@ class Runtime:
             }
             for name, result in self.last_account_results.items()
         }
+
+    def account_process_results(self, sequence: int) -> tuple[AccountResult, ...]:
+        return tuple(
+            result for result in self.last_account_results.values() if result.sequence == sequence
+        )
 
     async def close(self) -> None:
         if self.account_executor is not None:
@@ -847,6 +857,56 @@ class Runtime:
             finally:
                 self.processing_times.append(time.monotonic() - started)
                 self.queue.task_done()
+
+    async def seed_shared_inputs(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            await self._consume_event(copy.deepcopy(event), 0)
+
+    async def apply_shared_cut(
+        self,
+        entry: dict[str, Any],
+        delay: float,
+        *,
+        watch: set[str],
+        recorded: dict[str, Any] | None,
+        feature_cut: dict[tuple[Any, ...], Feature | None],
+        include_book_acceptance: bool,
+    ) -> dict[str, Any]:
+        self.shared_watch = watch
+        self.sequence = entry["sequence"]
+        book_count = self.book_delivered["incumbent"]
+        outcome_count = sum(len(account.outcomes) for account in self.accounts.values())
+        await self._consume_event(
+            entry,
+            delay,
+            replaying=recorded is not None,
+            feature_cut=feature_cut if self.concurrent_accounts else None,
+        )
+        if recorded is not None:
+            self.reviewed_fills = recorded["reviewed_fills"]
+            self.reviewed_families = set(recorded["reviewed_families"])
+            self.allocation_blocked = recorded["allocation_blocked"]
+        book_delivered = self.book_delivered["incumbent"] > book_count
+        output: dict[str, Any] = {
+            "progress": (
+                book_delivered
+                or sum(len(account.outcomes) for account in self.accounts.values()) > outcome_count
+                or bool(entry.get("applied"))
+            ),
+            "reviewed_fills": self.reviewed_fills,
+            "reviewed_families": sorted(self.reviewed_families),
+            "allocation_blocked": self.allocation_blocked,
+        }
+        if include_book_acceptance and entry["kind"] == "book":
+            result = self.last_account_results.get("incumbent")
+            output["accepted_book"] = (
+                result is not None and result.accepted_book
+                if self.concurrent_accounts
+                else book_delivered
+            )
+        if self.concurrent_accounts:
+            output["account_results"] = self.account_evidence()
+        return output
 
     async def _consume_event(
         self,
@@ -1220,7 +1280,7 @@ class Runtime:
             self._record_delivery(name, observation)
         return expired
 
-    def _checkpoint(self) -> str:
+    def checkpoint(self) -> str:
         return digest(
             encode(
                 {
@@ -1268,13 +1328,12 @@ class Runtime:
         record = {
             **entry,
             **({"account_results": self.account_evidence()} if self.concurrent_accounts else {}),
-            "checkpoint": self._checkpoint(),
+            "checkpoint": self.checkpoint(),
             "reviewed_fills": self.reviewed_fills,
             "reviewed_families": sorted(self.reviewed_families),
             "allocation_blocked": self.allocation_blocked,
         }
-        with self.audit.publication_guard() if self.audit is not None else nullcontext():
-            self.journal.append(record)
+        self.journal.append_account_cut(record, audit=self.audit)
 
     async def restore(self, journal: AdaptiveJournal) -> None:
         self.assert_accounts_committable()
@@ -1306,7 +1365,7 @@ class Runtime:
                     await self._consume_event(entry, 0, saved=saved)
                 if (
                     encode(entry) != encode({key: saved[key] for key in entry})
-                    or saved["checkpoint"] != self._checkpoint()
+                    or saved["checkpoint"] != self.checkpoint()
                     or (
                         self.concurrent_accounts
                         and encode(saved["account_results"]) != encode(self.account_evidence())
@@ -1696,25 +1755,6 @@ async def fetch_rest_book(
         publish("book", (symbol, book))
 
 
-def websocket_retry_at(headers: list[str], now_epoch: float) -> float:
-    retry_at = now_epoch + 2
-    for header in headers:
-        value = header.strip()
-        try:
-            if value.isascii() and value.isdecimal():
-                candidate = now_epoch + float(value)
-            else:
-                stamp = parsedate_to_datetime(value)
-                if stamp.utcoffset() is None:
-                    continue
-                candidate = stamp.timestamp()
-        except (ValueError, TypeError, OSError, OverflowError):
-            continue
-        if math.isfinite(candidate):
-            retry_at = max(retry_at, candidate)
-    return retry_at
-
-
 def journal_identity(
     capital: float,
     end_epoch: float,
@@ -1753,6 +1793,7 @@ async def campaign(
     resume: bool = False,
     market: PaperMarket = US,
     campaign_seeds: dict[str, Any] | None = None,
+    repair_anchor: dict[str, Any] | None = None,
 ) -> None:
     if market is KR and profile != "broker-constrained":
         raise ValueError("KR requires the broker-constrained profile")
@@ -1762,6 +1803,8 @@ async def campaign(
         if slot_control is None:
             raise ValueError("Campaign seeds require a shared-slot journal")
         validate_session_seeds(campaign_seeds)
+    if repair_anchor is not None and (not resume or slot_control is None):
+        raise ValueError("A repair requires an existing shared-slot journal")
     if resume and journal_path is None:
         raise ValueError("Recovery requires an existing journal")
     if journal_path is None:
@@ -1787,7 +1830,7 @@ async def campaign(
     )
     with ExitStack() as contexts:
         journal = contexts.enter_context(
-            AdaptiveJournal.open(journal_path, identity, resume=resume)
+            AdaptiveJournal.open(journal_path, identity, resume=resume, repair_anchor=repair_anchor)
         )
         control = contexts.enter_context(SlotControl.open(slot_control)) if slot_control else None
         await _campaign(
@@ -1829,8 +1872,7 @@ async def _campaign(
         or time.time() >= end_epoch
     ):
         raise ValueError("Adaptive campaign requires a constrained profile and future cutoff")
-    from websockets.asyncio.client import connect
-    from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
+    from websockets.exceptions import WebSocketException
 
     os.umask(0o077)
     output.mkdir(parents=True, exist_ok=False)
@@ -1989,7 +2031,6 @@ async def _campaign(
         calendar = await asyncio.to_thread(adapter.read, client.calendar, market.code, calendar_day)
         if constrained:
             runtime.publish("calendar", (calendar_day, calendar))
-        stream_market = market.code.lower()
         private_json(
             output / "manifest.json",
             {
@@ -2324,186 +2365,24 @@ async def _campaign(
                 if audit.healthy:
                     audit.heartbeat("collector", status="idle", pid=os.getpid(), durable=False)
 
-        async def stream() -> None:
-            def rejected_frame(frame: str | bytes, received: str, code: str) -> ValueError:
-                data = (
-                    frame.encode("utf-8", errors="surrogatepass")
-                    if isinstance(frame, str)
-                    else frame
-                )
-                raw.write(
-                    json.dumps(
-                        {
-                            "kind": "websocket_frame_failure",
-                            "received_at": received,
-                            "frame_type": "text" if isinstance(frame, str) else "binary",
-                            "byte_length": len(data),
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                            "code": code,
-                        }
-                    )
-                    + "\n"
-                )
-                raw.flush()
-                error = ValueError(f"Invalid WebSocket frame: {code}")
-                audit.report_exception(
-                    "provider_adapter", code, error, {"market": market.code},
-                )
-                return error
-
-            injected = False
-            while time.monotonic() < deadline:
-                if not runtime.desired:
-                    await asyncio.sleep(0.1)
-                    continue
-                try:
-                    async with connect(
-                        URL,
-                        additional_headers={"Authorization": "Bearer " + token},
-                        proxy=None,
-                        ping_interval=20,
-                        ping_timeout=20,
-                        open_timeout=15,
-                        close_timeout=5,
-                    ) as ws:
-                        stats["connections"] += 1
-                        record("connected", connection=stats["connections"])
-                        for code in ("websocket_disconnected", "websocket_handshake_failed"):
-                            audit.record(
-                                "provider_adapter", code, {"market": market.code}, state="resolved",
-                            )
-                        resync.set()
-                        selected: list[str] = []
-                        accepted: set[str] = set()
-                        expected: set[str] = set()
-                        ack_pending = False
-                        declaration_at = 0.0
-                        next_ping = 0.0
-                        ping_at: float | None = None
-                        while time.monotonic() < deadline:
-                            tick = time.monotonic()
-                            if not runtime.desired:
-                                await ws.close(code=1000, reason="No candidates or holdings")
-                                break
-                            if not adaptive and not injected and tick - started >= duration / 2:
-                                injected = True
-                                stats["faults"].append(
-                                    {"kind": "controlled_disconnect", "at": now()}
-                                )
-                                await ws.close(code=1000, reason="Controlled integration test")
-                                record("controlled_disconnect")
-                                break
-                            if (
-                                runtime.desired != selected
-                                and not ack_pending
-                                and tick - declaration_at >= 1
-                            ):
-                                selected = list(runtime.desired)
-                                expected = {
-                                    f"{c}:{stream_market}:{s}"
-                                    for c in ("trade", "orderbook")
-                                    for s in selected
-                                }
-                                await ws.send(json.dumps(declaration(stream_market, selected)))
-                                declaration_at, ack_pending = tick, True
-                            if ack_pending and tick - declaration_at > 20:
-                                raise TimeoutError("Subscription acknowledgement timeout")
-                            if ping_at is not None and tick - ping_at > 20:
-                                raise TimeoutError("Application pong timeout")
-                            if tick >= next_ping:
-                                await ws.send("PING")
-                                ping_at, next_ping = tick, tick + 60
-                            try:
-                                wire = await asyncio.wait_for(ws.recv(), 0.25)
-                            except TimeoutError:
-                                continue
-                            received = now()
-                            try:
-                                message = json.loads(wire)
-                            except (ValueError, RecursionError):
-                                raise rejected_frame(wire, received, "invalid_json") from None
-                            if not isinstance(message, dict):
-                                raise rejected_frame(wire, received, "non_object")
-                            kind = message.get("type")
-                            if kind == "subscriptions":
-                                subscribed = message.get("subscribed", [])
-                                if not isinstance(subscribed, list) or any(
-                                    not isinstance(topic, str) for topic in subscribed
-                                ):
-                                    raise rejected_frame(wire, received, "invalid_subscription")
-                                actual = set(subscribed)
-                                if actual != expected or message.get("rejected"):
-                                    raise rejected_frame(wire, received, "subscription_mismatch")
-                                accepted, ack_pending = actual, False
-                                stats["acks"].append(
-                                    {
-                                        "at": now(),
-                                        "connection": stats["connections"],
-                                        "symbols": selected,
-                                        "protected": sorted(runtime.protected()),
-                                    }
-                                )
-                                record("subscription_ack", symbols=selected)
-                            elif kind == "pong":
-                                ping_at = None
-                            elif kind == "message":
-                                topic = message.get("topic")
-                                if not isinstance(topic, str) or topic not in accepted | expected:
-                                    raise rejected_frame(wire, received, "unexpected_topic")
-                                frame: dict[str, Any] = {"received_at": received, "frame": message}
-                                stats["market_messages"] = stats.get("market_messages", 0) + 1
-                                if topic.startswith(f"orderbook:{stream_market}:"):
-                                    symbol = topic.rsplit(":", 1)[1]
-                                    data = message.get("data")
-                                    if not isinstance(data, dict):
-                                        raise rejected_frame(wire, received, "invalid_orderbook_data")
-                                    try:
-                                        observation = shared_gateway.ingest_book(
-                                            market.code, symbol, data,
-                                            received_time=received,
-                                        )
-                                    except ApiError as error:
-                                        record("stream_symbol_failure", symbol=symbol, code=error.code)
-                                    else:
-                                        frame["published_sequence"] = observation.published_sequence
-                                        frame["source_identity"] = observation.source_identity
-                                        runtime.publish(
-                                            "book", (symbol, observation.payload), received=received
-                                        )
-                                raw.write(json.dumps(frame) + "\n")
-                            else:
-                                raise rejected_frame(wire, received, "unknown_type")
-                except InvalidStatus as error:
-                    status = error.response.status_code
-                    audit.report_exception(
-                        "provider_adapter", "websocket_handshake_failed", error,
-                        {"market": market.code, "http_status": status},
-                        severity="warning" if status in (429, 503) else "error",
-                    )
-                    if not adaptive or status not in (429, 503):
-                        raise
-                    record("connection_failure", **error_details(error, token))
-                    raise ApiError(
-                        "WebSocket handshake temporarily unavailable",
-                        status=status,
-                        code="cooldown",
-                        retry_at=websocket_retry_at(
-                            error.response.headers.get_all("Retry-After"), time.time()
-                        ),
-                    ) from error
-                except (ConnectionClosed, OSError, TimeoutError) as error:
-                    audit.report_exception(
-                        "provider_adapter", "websocket_disconnected", error,
-                        {"market": market.code}, severity="warning",
-                    )
-                    record("connection_failure", **error_details(error, token))
-                if time.monotonic() < deadline:
-                    record("reconnect_backoff", seconds=2)
-                    await asyncio.sleep(2)
-
         consumer = asyncio.create_task(runtime.consume())
         collector = asyncio.create_task(collect_until_cutoff() if adaptive else collect())
-        streamer = asyncio.create_task(stream())
+        streamer = asyncio.create_task(receive_market_stream(
+            runtime,
+            shared_gateway,
+            market=market.code,
+            token=token,
+            deadline=deadline,
+            started=started,
+            duration=duration,
+            adaptive=adaptive,
+            raw=raw,
+            stats=stats,
+            record=record,
+            resync=resync,
+            audit=audit,
+            clock=now,
+        ))
         tasks = [consumer, collector, streamer]
         while time.monotonic() < deadline:
             if slots is not None:
@@ -2623,6 +2502,8 @@ async def _campaign(
         ValueError,
         KeyError,
         TypeError,
+        AttributeError,
+        IndexError,
         OverflowError,
         RuntimeError,
         SafetyError,
@@ -2717,6 +2598,7 @@ def main() -> None:
     parser.add_argument("--market", choices=MARKETS, default="US")
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
+    parser.add_argument("--repair-approval", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--journal", type=Path, help="Durable journal for an adaptive campaign")
     parser.add_argument(
         "--slot-control", type=Path, help="Enable shared slots with this command spool"
@@ -2782,6 +2664,7 @@ def main() -> None:
                 adaptive=args.adaptive,
                 end_epoch=end_epoch,
                 journal_path=args.journal.resolve() if args.journal else None,
+                repair_anchor=repair_anchor,
                 slot_control=args.slot_control.resolve() if args.slot_control else None,
                 resume=args.resume,
                 market=MARKETS[args.market],
@@ -2791,6 +2674,14 @@ def main() -> None:
             if args.adaptive:
                 loop.remove_signal_handler(signal.SIGTERM)
 
+    repair_anchor = None
+    if args.repair_approval is not None:
+        if not args.resume or args.journal is None:
+            parser.error("A published repair requires an existing journal and --resume")
+        _, failure = require_approved_restart(
+            ROOT, args.journal.resolve().parent, args.repair_approval
+        )
+        repair_anchor = failure["anchor"]
     try:
         asyncio.run(run())
     except asyncio.CancelledError:

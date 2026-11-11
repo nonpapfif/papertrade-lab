@@ -3,6 +3,7 @@
 import asyncio
 import gzip
 import hashlib
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from papertrade.api import ApiError, MarketClient
 from tools.market_data_adapter import MarketDataAdapter
 from tools.market_data_gateway import DataResult, MarketDataGateway
 from tools.market_data_repository import DataRequest, MarketDataRepository
+from tools.market_stream import receive_market_stream
 from tools.run_async_live_validation import (
     Runtime,
     campaign,
@@ -329,14 +331,32 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
             runtime.desired = ["A"]
             await asyncio.Future()
 
+        malformed = b'{"secret-fixture"'
+        unsubscribed = json.dumps({"type": "message", "topic": "orderbook:us:secret-fixture"})
+        bad_book = json.dumps({"type": "message", "topic": "orderbook:us:A", "data": []})
+        acknowledgement = json.dumps({
+            "type": "subscriptions", "subscribed": ["trade:us:A", "orderbook:us:A"],
+        })
+        invalid_ack = '{"type":"subscriptions","subscribed":[42]}'
+        mismatched_ack = '{"type":"subscriptions","subscribed":["trade:us:A"]}'
+        accepted = json.dumps({
+            "type": "message", "topic": "orderbook:us:A", "data": self.book(START),
+        })
         fixtures = (
-            (b'{"secret-fixture"', "invalid_json"),
-            ('["secret-fixture"]', "non_object"),
-            ('{"type": "secret-fixture"}', "unknown_type"),
+            ((malformed,), ((malformed, "invalid_json"),), False),
+            (('["secret-fixture"]',), (('["secret-fixture"]', "non_object"),), False),
+            (('{"type": "secret-fixture"}',),
+             (('{"type": "secret-fixture"}', "unknown_type"),), False),
+            ((invalid_ack,), ((invalid_ack, "invalid_subscription"),), False),
+            ((mismatched_ack,), ((mismatched_ack, "subscription_mismatch"),), False),
+            ((acknowledgement, unsubscribed, accepted, malformed),
+             ((unsubscribed, "unexpected_topic"), (malformed, "invalid_json")), True),
+            ((acknowledgement, bad_book, accepted, malformed),
+             ((bad_book, "invalid_orderbook_data"), (malformed, "invalid_json")), True),
         )
-        for wire, code in fixtures:
+        for frames, rejected, valid_book_expected in fixtures:
             with (
-                self.subTest(code=code),
+                self.subTest(code=rejected[0][1]),
                 tempfile.TemporaryDirectory() as directory,
                 patch.dict("sys.modules", modules),
                 patch("tools.run_async_live_validation.Settings.load", return_value=settings),
@@ -346,32 +366,89 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(Runtime, "consume", new=select),
             ):
                 connect.reset_mock()
-                ws.recv = AsyncMock(return_value=wire)
+                ws.send.reset_mock()
+                ws.recv = AsyncMock(side_effect=frames)
                 output = Path(directory) / "run"
                 with self.assertRaisesRegex(SystemExit, "Live validation failed"):
                     await campaign(output, 30, 100)
                 connect.assert_called_once()
-                ws.recv.assert_awaited_once()
+                self.assertEqual(ws.recv.await_count, len(frames))
+                self.assertEqual(ws.send.await_count, 2)
+                subscription, ping = (call.args[0] for call in ws.send.await_args_list)
+                self.assertEqual(json.loads(subscription), [
+                    {"type": "trade:us", "codes": ["A"]},
+                    {"type": "orderbook:us", "codes": ["A"]},
+                ])
+                self.assertEqual(ping, "PING")
+                status = json.loads((output / "status.json").read_text())
+                self.assertEqual(status["connections"], 1)
+                self.assertEqual(len(status["acks"]), int(valid_book_expected))
+                self.assertEqual(
+                    status.get("market_messages", 0),
+                    int(valid_book_expected) + int(rejected[0][1] == "invalid_orderbook_data"),
+                )
                 with gzip.open(output / "market.jsonl.gz", "rt") as stream:
                     raw = stream.read()
                 self.assertNotIn("secret-fixture", raw)
                 self.assertNotIn("fixture-token", raw)
-                observed = [
-                    row
-                    for line in raw.splitlines()
-                    if (row := json.loads(line)).get("kind") == "websocket_frame_failure"
-                ]
-                data = wire.encode("utf-8") if isinstance(wire, str) else wire
-                self.assertEqual(
-                    observed,
-                    [
-                        {
-                            "kind": "websocket_frame_failure",
-                            "received_at": START.isoformat(),
-                            "frame_type": "text" if isinstance(wire, str) else "binary",
-                            "byte_length": len(data),
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                            "code": code,
-                        }
-                    ],
-                )
+                rows = [json.loads(line) for line in raw.splitlines()]
+                observed = [row for row in rows if row.get("kind") == "websocket_frame_failure"]
+                expected = []
+                for wire, code in rejected:
+                    data = wire.encode("utf-8") if isinstance(wire, str) else wire
+                    expected.append({
+                        "kind": "websocket_frame_failure",
+                        "received_at": START.isoformat(),
+                        "frame_type": "text" if isinstance(wire, str) else "binary",
+                        "byte_length": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "code": code,
+                    })
+                self.assertEqual(observed, expected)
+                published = [row for row in rows if "published_sequence" in row]
+                self.assertEqual(len(published), int(valid_book_expected))
+                if valid_book_expected:
+                    self.assertEqual(published[0]["frame"]["topic"], "orderbook:us:A")
+
+
+    @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
+    async def test_local_stream_processing_errors_do_not_reconnect(self) -> None:
+        wire = json.dumps({
+            "type": "message", "topic": "orderbook:us:A", "data": self.book(START),
+        })
+        for operation in ("ingest_book", "publish", "write"):
+            with self.subTest(operation=operation):
+                error = OSError("fixture local failure")
+                gateway = Mock(wraps=self.gateway)
+                target = Mock(desired=["A"])
+                raw = Mock(wraps=StringIO())
+                record = Mock()
+                audit = Mock()
+                ws = Mock(send=AsyncMock(), recv=AsyncMock(return_value=wire))
+                connection = AsyncMock()
+                connection.__aenter__.return_value = ws
+                local_operation = {
+                    "ingest_book": gateway.ingest_book,
+                    "publish": target.publish,
+                    "write": raw.write,
+                }[operation]
+                local_operation.side_effect = error
+                with (
+                    patch("websockets.asyncio.client.connect", return_value=connection) as connect,
+                    self.assertRaises(OSError) as raised,
+                ):
+                    await asyncio.wait_for(
+                        receive_market_stream(
+                            target, gateway, market="US", token="fixture-token",
+                            deadline=asyncio.get_running_loop().time() + 10,
+                            started=asyncio.get_running_loop().time(), duration=10,
+                            adaptive=True, raw=raw, stats={"connections": 0}, record=record,
+                            resync=asyncio.Event(), audit=audit, clock=START.isoformat,
+                        ),
+                        timeout=1,
+                    )
+                self.assertIs(raised.exception, error)
+                connect.assert_called_once()
+                connection.__aexit__.assert_awaited_once()
+                record.assert_called_once_with("connected", connection=1)
+                audit.report_exception.assert_not_called()

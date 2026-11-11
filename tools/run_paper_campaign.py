@@ -19,6 +19,7 @@ from tools.autotest_jobs import ROOT
 from tools.paper_campaign.calendar import MarketCalendar
 from tools.paper_campaign.controller import Campaign
 from tools.paper_campaign.policy import Admission
+from tools.paper_campaign.recovery import SessionRecovery
 from tools.paper_campaign.review import AstraReview, run_review
 from tools.paper_campaign.runner import SessionRunner
 from tools.paper_market import KR, US
@@ -35,6 +36,8 @@ def main() -> int:
     parser.add_argument("--source-digest")
     parser.add_argument("--not-before-kr", type=datetime.fromisoformat)
     parser.add_argument("--not-before-us", type=datetime.fromisoformat)
+    parser.add_argument("--repair-repo", type=Path)
+    parser.add_argument("--repair-codex", type=Path)
     parser.add_argument("--once", action="store_true", help="Reconcile one pass and exit")
     parser.add_argument("--review", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--audit-path", type=Path, help=argparse.SUPPRESS)
@@ -52,6 +55,9 @@ def main() -> int:
         or not re.fullmatch(r"[0-9a-f]{64}", args.source_digest or "")
     ):
         parser.error("Campaign requires output, capacity, approved source commit and digest")
+    if bool(args.repair_repo) != bool(args.repair_codex):
+        parser.error("Automatic session repair requires both --repair-repo and --repair-codex")
+    repair = SessionRecovery(args.repair_repo, args.repair_codex) if args.repair_repo else None
     settings = Settings.load(ROOT)
     output = args.output.resolve()
     if not output.is_relative_to(settings.state_dir.resolve()):
@@ -83,7 +89,7 @@ def main() -> int:
         campaign = Campaign(
             output,
             MarketCalendar(MarketClient(settings), output / "calendar", audit),
-            SessionRunner(args.source_commit, args.source_digest),
+            SessionRunner(args.source_commit, args.source_digest, repair),
             AstraReview(audit),
             admissions,
             not_before,

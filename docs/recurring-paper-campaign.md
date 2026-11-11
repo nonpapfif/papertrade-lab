@@ -191,3 +191,34 @@ increases with history. This must be monitored before treating indefinite operat
 The initial strategy catalog does not autonomously execute AI-generated strategy code or
 implement a new combined hedge portfolio. Such proposals require the engineering test/review
 workflow and fresh capacity evidence before live paper admission.
+
+### Repair a failed running session
+
+To opt into unattended engineering repair, add `--repair-repo` with an absolute path to a
+clean Papertrade Lab checkout on `master` and `--repair-codex` with the absolute Codex
+executable path. Keep this Git checkout separate from the frozen campaign worktree. The service
+environment needs authenticated Git and GitHub CLI, Sol and Astra medium, Ruff, mypy and the
+project's Python dependencies.
+
+The campaign archives the failed scheduler, the identified worker exit and the active journal
+anchor in the session's `engineering-recovery` directory. Auth failures, normal stops, journal
+errors, uncertain process identity and expired windows do not start a repair. The existing
+same-source transient recovery policy still applies first.
+
+The existing engineering supervisor uses Astra for diagnosis and review and Sol for the repair.
+It runs the offline unittest targets, Ruff and mypy against the same source it publishes.
+Python verifies the PR's exact reviewed head and required checks. It syncs `master` after merge
+and pins a detached checkout only if its tree equals the reviewed tree. An uncertain GitHub
+mutation stops for reconciliation before another mutation is allowed.
+
+The repaired scheduler can attempt one continuation before the original cutoff. It reuses
+the original slot commands, settings, capital and journal. The original header and historical
+hashes remain intact. The worker replays and compares the recorded account effects before it
+consumes live input. The campaign clears the session block only after a newly accepted book is
+committed after the original journal anchor. An engineering pass, a restarted process and a
+recovery marker alone are insufficient. A further failure is preserved separately.
+
+A recovered session can still close and retain its journal and account lineage. Admission of
+the next session for that market stops until capacity is measured at the repaired source and
+the campaign source migration is approved. This avoids repeating the old defect or treating
+capacity measured at the old source as a measurement of the repair.

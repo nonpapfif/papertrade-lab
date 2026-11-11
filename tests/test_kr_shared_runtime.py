@@ -196,7 +196,7 @@ class KrRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ):
                 await recovered.restore(journal)
-                self.assertEqual(run._checkpoint(), recovered._checkpoint())
+                self.assertEqual(run.checkpoint(), recovered.checkpoint())
                 report = recovered.account.summary()["account"]
                 self.assertIsNone(report["bid_liquidation_equity_estimate_krw"])
 

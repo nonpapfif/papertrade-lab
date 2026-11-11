@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
@@ -155,14 +155,21 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.seed(first, "first", "second")
         await self.book(first, 1)
         before = self.journal.evidence()
-        checksums = {name: slot.runtime._checkpoint() for name, slot in first.slots.items()}
-        with (
-            patch.object(
-                self.journal, "append", side_effect=JournalError("synthetic commit failure")
-            ),
-            self.assertRaises(JournalError),
-        ):
-            await self.book(first, 3)
+        checksums = {name: slot.runtime.checkpoint() for name, slot in first.slots.items()}
+        with ExitStack() as mocks:
+            acknowledgements = [
+                mocks.enter_context(patch.object(slot.runtime, "acknowledge_accounts"))
+                for slot in first.slots.values()
+            ]
+            mocks.enter_context(
+                patch.object(
+                    self.journal, "append", side_effect=JournalError("synthetic commit failure")
+                )
+            )
+            with self.assertRaises(JournalError):
+                await self.book(first, 3)
+            for acknowledge in acknowledgements:
+                acknowledge.assert_not_called()
         self.assertEqual(self.journal.evidence(), before)
         self.assertEqual(first.consumed, before["records"])
         for slot in first.slots.values():
@@ -170,7 +177,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(account.book.trades)
                 self.assertTrue(account.pending)
         self.assertEqual(
-            {name: slot.runtime._checkpoint() for name, slot in first.slots.items()},
+            {name: slot.runtime.checkpoint() for name, slot in first.slots.items()},
             checksums,
         )
         await first.close()
@@ -184,6 +191,30 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(account.outcomes), 1)
                 self.assertGreater(account.book.fee_totals["total_usd"], 0)
         self.assertEqual(self.journal.evidence()["records"], before["records"] + 1)
+
+    async def test_invalid_book_is_rejected_without_poisoning_the_next_cut(self) -> None:
+        slots = self.slots(self.journal)
+        await self.seed(slots, "source", "comparison")
+        await self.book(slots, 1)
+        checkpoints = {name: slot.runtime.checkpoint() for name, slot in slots.slots.items()}
+        await self.feed(slots, "book", ("A", {"timestamp": None}), 2)
+        rejected = list(self.journal.events())[-1]
+        self.assertEqual(rejected["checkpoints"], checkpoints)
+        for output in rejected["outputs"].values():
+            self.assertFalse(output["progress"])
+            self.assertEqual(output["account_results"], {})
+        await self.book(slots, 3)
+        after = self.journal.evidence()
+        checkpoints = {name: slot.runtime.checkpoint() for name, slot in slots.slots.items()}
+        await slots.close()
+
+        resumed = self.slots(self.journal)
+        await resumed.restore()
+        self.assertEqual(self.journal.evidence(), after)
+        for name, slot in resumed.slots.items():
+            self.assertEqual(slot.runtime.checkpoint(), checkpoints[name])
+            for account in slot.runtime.accounts.values():
+                self.assertEqual(len(account.book.trades), 1)
 
     async def test_steady_dispatch_does_not_write_audit_from_parent_or_workers(self) -> None:
         slots = self.slots(self.journal)
@@ -254,7 +285,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.book(slots, 1)
         before = self.journal.evidence()
         runtime = slots.slots["source"].runtime
-        checkpoint = runtime._checkpoint()
+        checkpoint = runtime.checkpoint()
         with closing(sqlite3.connect(self.audit.path)) as db, db:
             db.execute("""
                 CREATE TRIGGER reject_prepared_cut_incident
@@ -279,7 +310,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await self.book(slots, 3)
         self.assertFalse(self.audit.healthy)
         self.assertEqual(self.journal.evidence(), before)
-        self.assertEqual(runtime._checkpoint(), checkpoint)
+        self.assertEqual(runtime.checkpoint(), checkpoint)
         self.assertTrue(runtime.account.pending)
         self.assertFalse(runtime.account.book.trades)
         self.assertTrue(self.audit.path.with_suffix(".sqlite3.emergency.jsonl").exists())
@@ -315,7 +346,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         runtime.accounts["candidate"].__class__ = WarningAccount
         await self.book(slots, 1)
         before = self.journal.evidence()
-        checkpoint = runtime._checkpoint()
+        checkpoint = runtime.checkpoint()
         executor = runtime.account_executor
         assert executor is not None
         committed = executor._committed.copy()
@@ -334,7 +365,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slots.consumed, before["records"])
         self.assertEqual(executor._committed, committed)
         self.assertEqual(executor.pids, {})
-        self.assertEqual(runtime._checkpoint(), checkpoint)
+        self.assertEqual(runtime.checkpoint(), checkpoint)
         for account in runtime.accounts.values():
             self.assertTrue(account.pending)
             self.assertFalse(account.book.trades)
@@ -350,7 +381,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         resumed = self.slots(self.journal)
         await resumed.restore()
         self.assertEqual(resumed.consumed, before["records"])
-        self.assertEqual(resumed.slots["source"].runtime._checkpoint(), checkpoint)
+        self.assertEqual(resumed.slots["source"].runtime.checkpoint(), checkpoint)
         self.assertEqual(self.journal.evidence(), before)
         await self.book(resumed, 3)
         for account in resumed.slots["source"].runtime.accounts.values():
@@ -390,7 +421,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.book(slots, 1)
         runtime = slots.slots["source"].runtime
         before = self.journal.evidence()
-        checkpoint = runtime._checkpoint()
+        checkpoint = runtime.checkpoint()
         self.reject_thread_diagnostic()
         at_guard, fault_done = Event(), Event()
         guard = self.audit.publication_guard
@@ -424,7 +455,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(self.journal.evidence(), before)
         self.assertEqual(slots.consumed, before["records"])
-        self.assertEqual(runtime._checkpoint(), checkpoint)
+        self.assertEqual(runtime.checkpoint(), checkpoint)
 
     async def test_audit_failure_after_durable_append_blocks_ack_and_replays_once(self) -> None:
         slots = self.slots(self.journal)
@@ -488,7 +519,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slots.consumed, after["records"])
         self.assertEqual(executor._committed, committed)
         self.assertIn("is durable and requires replay", " ".join(raised.exception.__notes__))
-        checkpoint = runtime._checkpoint()
+        checkpoint = runtime.checkpoint()
         with self.assertRaisesRegex(JournalError, "fresh journal replay"):
             await self.book(slots, 4)
         await slots.close()
@@ -498,7 +529,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.audit = RuntimeAudit(self.audit.path, self.audit.run_id)
         resumed = self.slots(self.journal)
         await resumed.restore()
-        self.assertEqual(resumed.slots["source"].runtime._checkpoint(), checkpoint)
+        self.assertEqual(resumed.slots["source"].runtime.checkpoint(), checkpoint)
         self.assertEqual(self.journal.evidence(), after)
         await self.book(resumed, 4)
         for account in resumed.slots["source"].runtime.accounts.values():
@@ -513,7 +544,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         assert executor is not None
         committed = executor._committed.copy()
         before = self.journal.evidence()
-        checkpoint = runtime._checkpoint()
+        checkpoint = runtime.checkpoint()
         exchange = executor._exchange
 
         def corrupt(*args: Any) -> dict[str, Any]:
@@ -533,7 +564,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slots.consumed, before["records"])
         self.assertEqual(executor._committed, committed)
         self.assertEqual(executor.pids, {})
-        self.assertEqual(runtime._checkpoint(), checkpoint)
+        self.assertEqual(runtime.checkpoint(), checkpoint)
         with closing(sqlite3.connect(self.audit.path)) as db:
             rows = db.execute("""
                 SELECT state FROM runtime_incidents WHERE code = 'result_rejected'
@@ -543,7 +574,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         resumed = self.slots(self.journal)
         await resumed.restore()
-        self.assertEqual(resumed.slots["source"].runtime._checkpoint(), checkpoint)
+        self.assertEqual(resumed.slots["source"].runtime.checkpoint(), checkpoint)
         self.assertEqual(self.journal.evidence(), before)
         await self.book(resumed, 3)
         self.assertEqual(self.journal.evidence()["records"], before["records"] + 1)
@@ -572,7 +603,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         executor = runtime.account_executor
         assert executor is not None
         committed = executor._committed.copy()
-        before, checkpoint = self.journal.evidence(), runtime._checkpoint()
+        before, checkpoint = self.journal.evidence(), runtime.checkpoint()
         exchange = executor._exchange
 
         def corrupt(*args: Any) -> dict[str, Any]:
@@ -639,7 +670,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         apply_patch.assert_not_called()
         self.assertEqual(self.journal.evidence(), before)
         self.assertEqual(slots.consumed, before["records"])
-        self.assertEqual(runtime._checkpoint(), checkpoint)
+        self.assertEqual(runtime.checkpoint(), checkpoint)
         self.assertEqual(executor._committed, committed)
         self.assertEqual(executor.pids, {})
         with closing(sqlite3.connect(self.audit.path)) as db:
@@ -651,7 +682,7 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         resumed = self.slots(self.journal)
         await resumed.restore()
-        self.assertEqual(resumed.slots["source"].runtime._checkpoint(), checkpoint)
+        self.assertEqual(resumed.slots["source"].runtime.checkpoint(), checkpoint)
         self.assertEqual(self.journal.evidence(), before)
         if clock:
             await self.feed(resumed, "clock", None, clock_at)
@@ -753,6 +784,6 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await recovered.restore()
         for name, slot in initial.slots.items():
             actual = recovered.slots[name].runtime
-            self.assertEqual(actual._checkpoint(), slot.runtime._checkpoint())
+            self.assertEqual(actual.checkpoint(), slot.runtime.checkpoint())
             for account_name, expected in slot.runtime.accounts.items():
                 self.assertEqual(actual.accounts[account_name].summary(), expected.summary())

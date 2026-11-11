@@ -229,7 +229,7 @@ class DirectRuntimePublicationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(marker=marker):
                 async with self.direct_run() as (run, journal, audit):
                     await inputs(run, 0, 4)
-                    before, checkpoint = journal.evidence(), run._checkpoint()
+                    before, checkpoint = journal.evidence(), run.checkpoint()
                     executor = run.account_executor
                     assert executor is not None
                     committed = executor._committed.copy()
@@ -244,7 +244,7 @@ class DirectRuntimePublicationTests(unittest.IsolatedAsyncioTestCase):
                             await inputs(run, 4, 5)
                     append.assert_not_called()
                     self.assertEqual(journal.evidence(), before)
-                    self.assertEqual(run._checkpoint(), checkpoint)
+                    self.assertEqual(run.checkpoint(), checkpoint)
                     self.assertEqual(executor._committed, committed)
                     self.assertEqual(executor.pids, {})
                     with self.assertRaisesRegex(JournalError, "fresh journal replay"):
@@ -283,7 +283,7 @@ class DirectRuntimePublicationTests(unittest.IsolatedAsyncioTestCase):
                     await run.close()
                     recovered = self.runtime_with_audit(RuntimeAudit(audit.path, audit.run_id))
                     await recovered.restore(journal)
-                    self.assertEqual(recovered._checkpoint(), checkpoint)
+                    self.assertEqual(recovered.checkpoint(), checkpoint)
                     self.assertEqual(journal.evidence(), after)
                     for account in recovered.accounts.values():
                         self.assertEqual(len(account.book.trades), 1)
@@ -292,7 +292,7 @@ class DirectRuntimePublicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_audit_failure_before_replay_ack_leaves_saved_cut_recoverable(self) -> None:
         async with self.direct_run() as (run, journal, audit):
             await inputs(run, 0, 5)
-            before, checkpoint = journal.evidence(), run._checkpoint()
+            before, checkpoint = journal.evidence(), run.checkpoint()
             await run.close()
             replay = self.runtime_with_audit(audit)
             with (
@@ -314,7 +314,7 @@ class DirectRuntimePublicationTests(unittest.IsolatedAsyncioTestCase):
 
             recovered = self.runtime_with_audit(RuntimeAudit(audit.path, audit.run_id))
             await recovered.restore(journal)
-            self.assertEqual(recovered._checkpoint(), checkpoint)
+            self.assertEqual(recovered.checkpoint(), checkpoint)
             self.assertEqual(journal.evidence(), before)
             for account in recovered.accounts.values():
                 self.assertEqual(len(account.book.trades), 1)
@@ -404,7 +404,7 @@ class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
                 )
             with AdaptiveJournal.open(path, IDENTITY, resume=True) as journal:
                 await recovered.restore(journal)
-                self.assertEqual(recovered._checkpoint(), run._checkpoint())
+                self.assertEqual(recovered.checkpoint(), run.checkpoint())
                 await recovered.mark_advance("recovery_gap", stamp(2))
                 self.assertEqual(recovered.account.last_at, stamp(3))
                 self.assertEqual(list(journal.events())[-1]["wall_at"], stamp(2))
@@ -438,7 +438,7 @@ class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
                         ):
                             await recovered.restore(journal)
                         await inputs(clean, 0, through)
-                        self.assertEqual(clean._checkpoint(), recovered._checkpoint())
+                        self.assertEqual(clean.checkpoint(), recovered.checkpoint())
                         a, b = recovered.accounts.values()
                         if through == 4:
                             self.assertEqual(a.pending, b.pending)
@@ -464,13 +464,13 @@ class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
                         )
                         await inputs(clean, through, 7)
                         await inputs(recovered, through, 7)
-                        self.assertEqual(clean._checkpoint(), recovered._checkpoint())
+                        self.assertEqual(clean.checkpoint(), recovered.checkpoint())
                         self.assertEqual(clean.policy_history, recovered.policy_history)
                         self.assertEqual(clean.ids, recovered.ids)
                         self.assertEqual(clean.sequence, recovered.sequence)
                     with AdaptiveJournal.open(path, IDENTITY, resume=True) as journal:
                         await repeated.restore(journal)
-                        self.assertEqual(repeated._checkpoint(), recovered._checkpoint())
+                        self.assertEqual(repeated.checkpoint(), recovered.checkpoint())
                         self.assertEqual(
                             repeated.status()["comparison"], recovered.status()["comparison"]
                         )
