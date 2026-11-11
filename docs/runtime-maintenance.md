@@ -82,6 +82,12 @@ must stop until a new validated recovery can establish usable storage. A process
 OS cannot record its own last instruction; the independent observer detects the missing process.
 Intentionally disabled logging calls produce no log record to capture.
 
+Completed work can persist adjacent idle heartbeats and incident recoveries in one synchronous
+audit transaction. A recovery with no matching open incident in the shared database does not
+take the SQLite writer lock. Active health markers, account result checks, economic appends and
+acknowledgements keep their existing boundaries. There is no time window or pending audit buffer
+to drain on shutdown.
+
 ## Regression gates
 
 `python -m tools.check_architecture` checks production import cycles, including lazy imports,

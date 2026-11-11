@@ -344,12 +344,18 @@ class RuntimeAudit:
 
     @contextmanager
     def _transaction(
-        self, action: str, *, initialize: bool = False
+        self, action: str, *, initialize: bool = False, write: bool = True
     ) -> Iterator[sqlite3.Connection]:
-        # Acquire the publication lock before opening either SQLite write transaction.
+        # A read failure must also be visible before publication.
         with self._publication_lock:
             try:
-                with closing(sqlite3.connect(self.path, timeout=self._busy_timeout)) as db, db:
+                path = self.path if write else self.path.absolute().as_uri() + "?mode=ro"
+                with (
+                    closing(
+                        sqlite3.connect(path, timeout=self._busy_timeout, uri=not write)
+                    ) as db,
+                    db,
+                ):
                     db.row_factory = sqlite3.Row
                     if (
                         initialize
@@ -357,7 +363,8 @@ class RuntimeAudit:
                         and db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal"
                     ):
                         raise sqlite3.OperationalError("Could not enable WAL for runtime audit")
-                    db.execute("BEGIN IMMEDIATE")
+                    if write:
+                        db.execute("BEGIN IMMEDIATE")
                     yield db
             except (sqlite3.Error, OSError) as error:
                 self._storage_failed.set()
@@ -366,6 +373,12 @@ class RuntimeAudit:
                 return
         self._emergency(action, failure)
         raise RuntimeAuditError(f"Runtime audit storage failed during {action}") from None
+
+    def _incident_id(self, component: str, code: str, context: dict[str, str | int]) -> str:
+        identity = [context.get(key) for key in _IDENTITIES]
+        return hashlib.sha256(
+            json.dumps([self.run_id, component, code, identity]).encode()
+        ).hexdigest()[:24]
 
     def _record(
         self,
@@ -380,10 +393,7 @@ class RuntimeAudit:
         aggregate: bool = True,
         severity: IncidentSeverity = "error",
     ) -> str:
-        identity = [context.get(key) for key in _IDENTITIES]
-        key = hashlib.sha256(
-            json.dumps([self.run_id, component, code, identity]).encode()
-        ).hexdigest()[:24]
+        key = self._incident_id(component, code, context)
         if state == "resolved":
             db.execute(
                 """UPDATE runtime_incidents SET state='resolved', last_at=?
@@ -440,12 +450,22 @@ class RuntimeAudit:
     ) -> str:
         if severity not in ("warning", "error"):
             raise ValueError("Unknown audit severity")
+        component, code, safe_context = _label(component), _label(code), _safe_context(context)
+        if state == "resolved":
+            key = self._incident_id(component, code, safe_context)
+            # A successful observation need not compete for the writer lock when there
+            # is nothing to resolve. Query the shared file, not a process-local cache.
+            with self._transaction("read_recovery", write=False) as db:
+                if db.execute(
+                    "SELECT 1 FROM runtime_incidents WHERE id=? AND state='open'", (key,)
+                ).fetchone() is None:
+                    return key
         with self._transaction("record") as db:
             return self._record(
                 db,
-                _label(component),
-                _label(code),
-                _safe_context(context),
+                component,
+                code,
+                safe_context,
                 self._clock(),
                 state,
                 error,
@@ -510,6 +530,7 @@ class RuntimeAudit:
             suffix = hashlib.sha256(label.encode()).hexdigest()[:8]
             worker_id = f"{label[:48]}-{suffix}-{os.getpid()}-{id(self):x}-{lane}"
         original_error = None
+        succeeded = False
         try:
             if timeout is not None:
                 self.heartbeat(
@@ -526,11 +547,17 @@ class RuntimeAudit:
                 self.report_exception(component, code, error, context)
             raise
         else:
-            self.record(component, code, context, state="resolved")
+            if timeout is None:
+                self.record(component, code, context, state="resolved")
+            succeeded = True
         finally:
             if timeout is not None:
                 try:
-                    self.heartbeat(component, worker_id=worker_id, status="idle")
+                    self.idle_workers(
+                        (component,),
+                        worker_id=worker_id,
+                        recoveries=((component, code, context),) if succeeded else (),
+                    )
                 except RuntimeAuditError:
                     if original_error is None:
                         raise
@@ -838,9 +865,47 @@ class RuntimeAudit:
             for value in (timeout, progress_timeout, oldest_pending_at, backlog_timeout)
         )
         with self._transaction("heartbeat") as db:
+            self._write_heartbeat(
+                db, component, worker_id, self._clock(), status, timeout, progress,
+                progress_timeout, oldest_pending_at, backlog_timeout, pid,
+            )
+
+    def idle_workers(
+        self,
+        components: tuple[str, ...],
+        *,
+        worker_id: str = "main",
+        progress: int | None = None,
+        pid: int | None = None,
+        recoveries: tuple[tuple[str, str, Mapping[str, object] | None], ...] = (),
+    ) -> None:
+        """Persist completion and any incident recovery at one synchronous boundary."""
+        _validate_worker_state("idle", None, progress, None, None, None, pid)
+        with self._transaction("idle_workers") as db:
             at = self._clock()
-            db.execute(
-                """INSERT INTO runtime_workers
+            for component, code, context in recoveries:
+                self._record(db, _label(component), _label(code), _safe_context(context), at, "resolved")
+            for component in components:
+                self._write_heartbeat(
+                    db, component, worker_id, at, "idle", None, progress, None, None, None, pid,
+                )
+
+    def _write_heartbeat(
+        self,
+        db: sqlite3.Connection,
+        component: str,
+        worker_id: str,
+        at: float,
+        status: RuntimeStatus,
+        timeout: float | None,
+        progress: int | None,
+        progress_timeout: float | None,
+        oldest_pending_at: float | None,
+        backlog_timeout: float | None,
+        pid: int | None,
+    ) -> None:
+        db.execute(
+            """INSERT INTO runtime_workers
                        (run_id,component,worker_id,status,heartbeat_at,timeout,
                         progress,progress_at,progress_timeout,oldest_pending_at,backlog_timeout,pid)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
@@ -854,21 +919,21 @@ class RuntimeAudit:
                        progress_timeout=excluded.progress_timeout,
                        oldest_pending_at=excluded.oldest_pending_at,
                        backlog_timeout=excluded.backlog_timeout, pid=excluded.pid""",
-                (
-                    self.run_id,
-                    _label(component),
-                    _label(worker_id),
-                    status,
-                    at,
-                    timeout,
-                    progress,
-                    at,
-                    progress_timeout,
-                    oldest_pending_at,
-                    backlog_timeout,
-                    pid,
-                ),
-            )
+            (
+                self.run_id,
+                _label(component),
+                _label(worker_id),
+                status,
+                at,
+                timeout,
+                progress,
+                at,
+                progress_timeout,
+                oldest_pending_at,
+                backlog_timeout,
+                pid,
+            ),
+        )
 
     def scan_health(self) -> tuple[RuntimeHealthIssue, ...]:
         """Persist watchdog findings and resolve prior findings when the condition clears."""

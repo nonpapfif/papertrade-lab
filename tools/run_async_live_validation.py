@@ -834,9 +834,12 @@ class Runtime:
             else:
                 self._acknowledge_cut(sequence, durable=self.journal is not None)
                 if self.audit is not None:
-                    self.audit.heartbeat("ordered_dispatch", progress=sequence, pid=os.getpid())
-                    if self.journal is not None:
-                        self.audit.heartbeat("journal", progress=sequence, pid=os.getpid())
+                    self.audit.idle_workers(
+                        ("ordered_dispatch", "journal")
+                        if self.journal is not None else ("ordered_dispatch",),
+                        progress=sequence,
+                        pid=os.getpid(),
+                    )
                 self.launch_review()
             finally:
                 self.processing_times.append(time.monotonic() - started)
