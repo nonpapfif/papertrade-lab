@@ -1,5 +1,6 @@
 """Verify that one shared journal commit controls all process-backed accounts."""
 
+import asyncio
 import copy
 import sqlite3
 import tempfile
@@ -26,7 +27,7 @@ from tools.account_executor import (
 from tools.adaptive_journal import AdaptiveJournal, JournalError
 from tools.layered_paper import feature_from_bars
 from tools.run_async_live_validation import subscription_set
-from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
+from tools.runtime_audit import RuntimeAudit, RuntimeAuditError, RuntimeHealthIssue
 from tools.shared_feed_slots import SharedFeedSlots
 from tools.slot_control import SlotCommand, SlotControl
 
@@ -184,6 +185,69 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreater(account.book.fee_totals["total_usd"], 0)
         self.assertEqual(self.journal.evidence()["records"], before["records"] + 1)
 
+    async def test_steady_dispatch_does_not_write_audit_from_parent_or_workers(self) -> None:
+        slots = self.slots(self.journal)
+        await self.seed(slots, "source")
+        await self.book(slots, 1)
+        before = self.journal.evidence()
+        with closing(sqlite3.connect(self.audit.path)) as db, db:
+            db.execute("""
+                CREATE TRIGGER reject_steady_worker_write
+                BEFORE INSERT ON runtime_workers
+                BEGIN SELECT RAISE(ABORT, 'steady cut wrote worker state'); END
+            """)
+        try:
+            with patch.object(
+                self.audit, "_transaction", wraps=self.audit._transaction,
+            ) as transaction:
+                await self.book(slots, 3)
+                transaction.assert_not_called()
+            self.assertEqual(self.journal.evidence()["records"], before["records"] + 1)
+            runtime = slots.slots["source"].runtime
+            for account in runtime.accounts.values():
+                self.assertEqual(len(account.book.trades), 1)
+        finally:
+            with closing(sqlite3.connect(self.audit.path)) as db, db:
+                db.execute("DROP TRIGGER reject_steady_worker_write")
+
+    async def test_backlog_incident_stays_open_until_the_oldest_pending_cut_clears(self) -> None:
+        slots = self.slots(self.journal)
+        first, second, release_first, release_second = (asyncio.Event() for _ in range(4))
+
+        async def apply(entry: dict[str, Any], _delay: float) -> None:
+            if entry["sequence"] == 1:
+                first.set()
+                await release_first.wait()
+            else:
+                second.set()
+                await release_second.wait()
+
+        with patch.object(slots, "_apply", side_effect=apply):
+            slots.publish("clock", None)
+            slots.publish("clock", None)
+            task = asyncio.create_task(slots.consume())
+            try:
+                await asyncio.wait_for(first.wait(), timeout=1)
+                issue = RuntimeHealthIssue("ordered_dispatch", "queue", "backlog_overdue")
+                with patch.object(self.audit, "_clock", return_value=time.time() + 11):
+                    self.assertIn(issue, self.audit.scan_health())
+                    release_first.set()
+                    await asyncio.wait_for(second.wait(), timeout=1)
+                    self.assertIn(issue, self.audit.scan_health())
+                    release_second.set()
+                    await asyncio.wait_for(slots.queue.join(), timeout=1)
+                    self.assertNotIn(issue, self.audit.scan_health())
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        with closing(sqlite3.connect(self.audit.path)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT state, occurrences FROM runtime_incidents WHERE code='backlog_overdue'"
+                ).fetchall(),
+                [("resolved", 1)],
+            )
+
     async def test_audit_storage_failure_blocks_prepared_economic_commit(self) -> None:
         slots = self.slots(self.journal)
         await self.seed(slots, "source")
@@ -193,12 +257,25 @@ class AccountRecoveryTests(unittest.IsolatedAsyncioTestCase):
         checkpoint = runtime._checkpoint()
         with closing(sqlite3.connect(self.audit.path)) as db, db:
             db.execute("""
-                CREATE TRIGGER reject_journal_heartbeat
-                BEFORE INSERT ON runtime_workers
-                WHEN NEW.component = 'journal' AND NEW.status = 'active'
+                CREATE TRIGGER reject_prepared_cut_incident
+                BEFORE INSERT ON runtime_incidents
+                WHEN NEW.code = 'synthetic_prepared_cut_warning'
                 BEGIN SELECT RAISE(ABORT, 'fixture audit write failure'); END
             """)
-        with self.assertRaises(RuntimeAuditError):
+        prepare = slots._prepare_cut
+
+        async def fail_warning_write(*args: Any, **kwargs: Any) -> Any:
+            result = await prepare(*args, **kwargs)
+            error = RuntimeError("synthetic warning after account preparation")
+            self.audit.report_exception(
+                "ordered_dispatch", "synthetic_prepared_cut_warning", error, severity="warning",
+            )
+            return result
+
+        with (
+            patch.object(slots, "_prepare_cut", side_effect=fail_warning_write),
+            self.assertRaisesRegex(AccountWorkerError, "audit storage is unhealthy"),
+        ):
             await self.book(slots, 3)
         self.assertFalse(self.audit.healthy)
         self.assertEqual(self.journal.evidence(), before)

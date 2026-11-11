@@ -12,7 +12,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from papertrade.api import MarketClient
+from papertrade.api import ApiError, MarketClient
 from tools.market_data_adapter import MarketDataAdapter
 from tools.market_data_gateway import DataResult, MarketDataGateway
 from tools.market_data_repository import DataRequest, MarketDataRepository
@@ -22,6 +22,7 @@ from tools.run_async_live_validation import (
     completed_candle_before,
     fetch_rest_book,
     recover_held_quotes,
+    wait_for_rest_cooldown,
 )
 
 START = datetime(2026, 11, 10, 15, 0, 15, tzinfo=UTC)
@@ -101,6 +102,120 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
             completed_candle_before(self.current.isoformat(), timestamp_is_end=False),
             "2026-11-10T14:59:00+00:00",
         )
+
+    async def test_watch_and_held_repair_share_retry_gate_after_stale_response(self) -> None:
+        monotonic = 100.0
+        clock = SimpleNamespace(monotonic=lambda: monotonic)
+        runtime = Mock(spec=Runtime)
+        raw, publish, failure = StringIO(), Mock(), AsyncMock()
+        self.client.book.side_effect = lambda symbol: {
+            **self.book(self.current - timedelta(seconds=61)), "symbol": symbol,
+        }
+        stale_until: dict[str, float] = {}
+
+        async def repair(symbol: str) -> None:
+            await fetch_rest_book(
+                self.gateway, symbol, raw, publish, failure, repair=True,
+                stale_until=stale_until if symbol == "B" else None,
+            )
+
+        with patch("tools.run_async_live_validation.time", clock):
+            for symbol, shared in (("A", False), ("B", True)):
+                attempts: dict[str, float] = {}
+                runtime.protected.return_value = {symbol}
+                await fetch_rest_book(
+                    self.gateway, symbol, raw, publish, failure,
+                    attempted_at=attempts if shared else None,
+                    stale_until=stale_until if shared else None,
+                )
+                await recover_held_quotes(
+                    runtime, repair, attempts, 200, gateway=self.gateway,
+                    stale_until=stale_until if shared else None,
+                )
+            self.assertEqual(
+                [call.args for call in self.client.book.call_args_list],
+                [("A",), ("A",), ("B",)],
+            )
+
+            monotonic += 6
+            await recover_held_quotes(
+                runtime, repair, attempts, 200, gateway=self.gateway, stale_until=stale_until,
+            )
+            self.assertEqual(self.client.book.call_count, 3)
+            monotonic += 4
+            await recover_held_quotes(
+                runtime, repair, attempts, 200, gateway=self.gateway, stale_until=stale_until,
+            )
+            await fetch_rest_book(
+                self.gateway, "B", raw, publish, failure, attempted_at=attempts,
+                stale_until=stale_until,
+            )
+            self.assertEqual(self.client.book.call_count, 4)
+            self.gateway.ingest_book(
+                "US", "B", self.book(self.current), received_time=self.current.isoformat(),
+            )
+            monotonic += 1
+            await recover_held_quotes(
+                runtime, repair, attempts, 200, gateway=self.gateway, stale_until=stale_until,
+            )
+            self.assertNotIn("B", stale_until)
+            monotonic += 4
+            await fetch_rest_book(
+                self.gateway, "B", raw, publish, failure, attempted_at=attempts,
+                stale_until=stale_until,
+            )
+        self.assertEqual(self.client.book.call_count, 4)
+        self.assertEqual([call.args[1].code for call in failure.await_args_list], [
+            "stale_market_data", "stale_market_data", "stale_market_data", "stale_market_data",
+        ])
+        self.assertEqual(raw.getvalue(), "")
+        publish.assert_not_called()
+
+    async def test_unusable_cached_book_does_not_bypass_response_freshness(self) -> None:
+        self.gateway.ingest_book(
+            "US", "A", {**self.book(START), "asks": []}, received_time=START.isoformat(),
+        )
+        self.client.book.return_value = self.book(START - timedelta(seconds=61))
+        raw, publish, failure = StringIO(), Mock(), AsyncMock()
+        await fetch_rest_book(self.gateway, "A", raw, publish, failure)
+        self.client.book.assert_called_once_with("A")
+        (failed,) = failure.await_args_list
+        self.assertEqual(failed.args[1].code, "stale_market_data")
+        self.assertEqual(raw.getvalue(), "")
+        publish.assert_not_called()
+
+    async def test_due_held_book_can_publish_before_chart_cooldown_ends(self) -> None:
+        monotonic = 100.0
+        clock = SimpleNamespace(time=lambda: self.current.timestamp(), monotonic=lambda: monotonic)
+        raw, publish, failure = StringIO(), Mock(), AsyncMock()
+        runtime = Mock(spec=Runtime)
+        runtime.protected.return_value = {"A"}
+        self.client.book.return_value = self.book(START)
+
+        async def repair(symbol: str) -> None:
+            nonlocal monotonic
+            await fetch_rest_book(self.gateway, symbol, raw, publish, failure, repair=True)
+            monotonic += 1
+            self.current += timedelta(seconds=1)
+
+        async def recover() -> None:
+            await recover_held_quotes(runtime, repair, {}, 104, gateway=self.gateway)
+
+        async def sleep(remaining: float) -> None:
+            self.assertEqual(remaining, 3)
+            publish.assert_called_once_with(
+                "book", ("A", self.book(START)), received=START.isoformat(),
+            )
+
+        retry = ApiError("fixture chart cooldown", status=429, retry_at=START.timestamp() + 8)
+        with (
+            patch("tools.run_async_live_validation.time", clock),
+            patch("tools.run_async_live_validation.asyncio", SimpleNamespace(sleep=sleep)),
+        ):
+            await wait_for_rest_cooldown(retry, 104, before_wait=recover)
+            await wait_for_rest_cooldown(retry, monotonic, before_wait=recover)
+        self.client.book.assert_called_once_with("A")
+        failure.assert_not_awaited()
 
     async def test_rest_cannot_replace_newer_stream_source_when_response_arrives_later(self) -> None:
         ws = self.gateway.ingest_book(

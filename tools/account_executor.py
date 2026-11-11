@@ -400,7 +400,6 @@ class _Bootstrap:
     account_id: str
     committed: tuple[int, int]
     audit_location: tuple[Path, str] | None
-    timeout: float
 
 
 @dataclass
@@ -473,7 +472,6 @@ async def _serve(
     account_id: str,
     committed: tuple[int, int],
     audit_location: tuple[Path, str] | None,
-    timeout: float,
 ) -> None:
     audit = RuntimeAudit(*audit_location) if audit_location else None
     last_command, last_cut = committed
@@ -503,42 +501,16 @@ async def _serve(
             ):
                 raise AccountProtocolError("Missing, duplicate, or unordered account command")
             context["sequence"] = command.sequence
-            if audit:
-                audit.heartbeat(
-                    MODULE,
-                    worker_id=account_id,
-                    status="active",
-                    timeout=timeout,
-                    progress=last_command,
-                    pid=pid,
-                )
             if pipe.recv() != EXECUTE:
                 raise AccountProtocolError("Expected an execution release after dispatch")
             result = await _evaluate(account, command)
-            if audit:
-                audit.heartbeat(
-                    MODULE,
-                    worker_id=account_id,
-                    status="waiting",
-                    timeout=timeout,
-                    progress=command.command_sequence,
-                    pid=pid,
-                )
-                if not audit.healthy:
-                    raise RuntimeAuditError("Account worker audit storage is unhealthy")
+            if audit and not audit.healthy:
+                raise RuntimeAuditError("Account worker audit storage is unhealthy")
             pipe.send(result)
             ack = pipe.recv()
             if not isinstance(ack, _Ack) or ack.command_sequence != command.command_sequence:
                 raise AccountProtocolError("Account result was not acknowledged in order")
             last_command, last_cut = command.command_sequence, command.sequence
-            if audit:
-                audit.heartbeat(
-                    MODULE,
-                    worker_id=account_id,
-                    status="idle",
-                    progress=last_command,
-                    pid=pid,
-                )
     except (BrokenPipeError, EOFError):
         return
     except Exception as error:  # noqa: BLE001 - Isolate every child failure at the process boundary.
@@ -568,7 +540,6 @@ def _worker_main(fd: int) -> None:
                 bootstrap.account_id,
                 bootstrap.committed,
                 bootstrap.audit_location,
-                bootstrap.timeout,
             )
         )
 
@@ -689,7 +660,6 @@ class AccountExecutor:
                     self._identity(name),
                     self._committed[name],
                     location,
-                    self.timeout,
                 )
             )
         for name, pid in _receive(booting, self.timeout, interrupted).items():

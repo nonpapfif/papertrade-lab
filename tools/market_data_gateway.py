@@ -151,7 +151,8 @@ class MarketDataGateway:
     def _operation(self, component: str, code: str) -> AbstractContextManager[None]:
         return (
             self._audit.operation(
-                component, code, timeout=120 if component == "market_data_gateway" else 10
+                component, code, timeout=120 if component == "market_data_gateway" else 10,
+                local_recovery=True,
             )
             if self._audit is not None
             else nullcontext()
@@ -165,15 +166,21 @@ class MarketDataGateway:
         with self._operation("market_data_store", "lookup_failed"):
             return self.repository.lookup(request, now=self._clock())
 
-    async def request(self, request: DataRequest) -> DataResult:
+    async def request(
+        self, request: DataRequest, *, cache_usable: Callable[[DataRecord], bool] | None = None,
+    ) -> DataResult:
         with self._operation("market_data_gateway", "request_failed"):
-            return await self._request(request)
+            return await self._request(request, cache_usable=cache_usable)
 
-    async def _request(self, request: DataRequest) -> DataResult:
+    async def _request(
+        self, request: DataRequest, *, cache_usable: Callable[[DataRecord], bool] | None,
+    ) -> DataResult:
         if self._closing:
             return _failure_result(request, "gateway_stopped")
         group = request.group
         cached = self.cached(request)
+        if cache_usable is not None:
+            cached = {symbol: row for symbol, row in cached.items() if cache_usable(row)}
         cache_hits = tuple(symbol for symbol in request.symbols if symbol in cached)
         missing = tuple(symbol for symbol in request.symbols if symbol not in cached)
         if request.as_of_cut is not None or not missing:
@@ -231,8 +238,17 @@ class MarketDataGateway:
     ) -> DataResult:
         return await self.request(DataRequest(market, "price", tuple(symbols), max_age=max_age))
 
-    async def book(self, market: str, symbol: str, *, max_age: float = 0) -> DataResult:
-        return await self.request(DataRequest(market, "book", (symbol,), max_age=max_age))
+    async def book(
+        self,
+        market: str,
+        symbol: str,
+        *,
+        max_age: float = 0,
+        cache_usable: Callable[[DataRecord], bool] | None = None,
+    ) -> DataResult:
+        return await self.request(
+            DataRequest(market, "book", (symbol,), max_age=max_age), cache_usable=cache_usable,
+        )
 
     async def candles(
         self, market: str, symbol: str, before: str, count: int = 200, *, max_age: float = 0

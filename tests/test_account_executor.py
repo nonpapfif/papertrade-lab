@@ -189,7 +189,7 @@ class AccountExecutorTests(unittest.IsolatedAsyncioTestCase):
         action = AccountAction("advance", stamp(0))
         commands = {"a": workers._Command("a", 1, 2, action, ("router", "all", "equal", 0))}
         boot = runner._start(commands)
-        boot["a"].send(workers._Bootstrap(runner.accounts["a"], "a", (0, 0), None, 10))
+        boot["a"].send(workers._Bootstrap(runner.accounts["a"], "a", (0, 0), None))
         self.assertEqual(workers._receive(boot, 10), runner.pids)
         worker = runner._workers["a"]
         worker.pipe.send(commands["a"])
@@ -200,7 +200,7 @@ class AccountExecutorTests(unittest.IsolatedAsyncioTestCase):
         runner.close()
 
         boot = runner._start(commands)
-        boot["a"].send(workers._Bootstrap(runner.accounts["a"], "a", (0, 0), None, 10))
+        boot["a"].send(workers._Bootstrap(runner.accounts["a"], "a", (0, 0), None))
         workers._receive(boot, 10)
         worker = runner._workers["a"]
         worker.pipe.close()

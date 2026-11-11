@@ -22,7 +22,9 @@ class MarketDataAdapter:
     def read(self, operation: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         """Serialize existing market-data operations against the same client's limiter."""
         with (
-            self._audit.operation("provider_adapter", "read_failed", timeout=30)
+            self._audit.operation(
+                "provider_adapter", "read_failed", timeout=30, local_recovery=True,
+            )
             if self._audit is not None else nullcontext(),
             self._lock,
         ):

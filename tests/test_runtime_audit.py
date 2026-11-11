@@ -81,6 +81,21 @@ class RuntimeAuditTests(unittest.TestCase):
         )
         self.assertNotIn("secret", repr(tuple(incident)))
 
+    def test_shared_operation_recovers_incidents_from_other_clients(self) -> None:
+        other = RuntimeAudit(self.path, self.audit.run_id, clock=self.clock, busy_timeout=0.01)
+        with closing(sqlite3.connect(self.path)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with other.operation("gateway", "fetch_failed"):
+                pass
+        self.assertTrue(other.healthy)
+        self.assertEqual(self.rows(), [])
+
+        self.audit.record("gateway", "fetch_failed", severity="warning")
+        with other.operation("gateway", "fetch_failed"):
+            pass
+        (incident,) = self.rows()
+        self.assertEqual((incident["state"], incident["severity"]), ("resolved", "warning"))
+
     def test_watchdog_distinguishes_idle_stall_death_and_backlog(self) -> None:
         self.audit.heartbeat("coordinator", status="waiting")
         self.audit.heartbeat("selector", status="idle")

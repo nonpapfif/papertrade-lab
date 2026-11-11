@@ -97,6 +97,40 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 FROM runtime_incidents WHERE code = 'stale_market_data'
             """).fetchall()
 
+    async def test_stream_ingress_writes_only_failure_and_recovery_audit(self) -> None:
+        gateway, audit = self.audited_gateway()
+        payload = {
+            "currency": "USD", "timestamp": self.clock(),
+            "asks": [{"price": "10", "volume": "1"}],
+            "bids": [{"price": "9", "volume": "1"}],
+        }
+        with patch.object(audit, "_transaction", wraps=audit._transaction) as transaction:
+            gateway.ingest_book("US", "A", payload, received_time=self.clock())
+            transaction.assert_not_called()
+            with (
+                patch.object(self.repo, "publish", side_effect=sqlite3.OperationalError),
+                self.assertRaises(sqlite3.OperationalError),
+            ):
+                gateway.ingest_book("US", "A", payload, received_time=self.clock())
+            transaction.assert_called_once_with("record")
+
+        resumed = RuntimeAudit(audit.path, audit.run_id)
+        gateway = MarketDataGateway(self.repo, self.provider, resumed, clock=self.clock)
+        self.addAsyncCleanup(gateway.close)
+        with patch.object(resumed, "_transaction", wraps=resumed._transaction) as transaction:
+            gateway.ingest_book("US", "A", payload, received_time=self.clock())
+            transaction.assert_called_once_with("record")
+            transaction.reset_mock()
+            gateway.ingest_book("US", "A", payload, received_time=self.clock())
+            transaction.assert_not_called()
+        with closing(sqlite3.connect(audit.path)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT component, code, state, occurrences FROM runtime_incidents"
+                ).fetchall(),
+                [("market_data_store", "publish_failed", "resolved", 1)],
+            )
+
     async def test_batches_unique_compatible_prices_and_reuses_hits(self) -> None:
         symbols = tuple(f"P{i}" for i in range(320))
         left, right = await asyncio.gather(
