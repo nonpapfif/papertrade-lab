@@ -162,7 +162,7 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         for slot_id, slot in restored.slots.items():
             self.assertEqual(slot.runtime.book_delivered, {"incumbent": 2, "candidate": 2})
             self.assertEqual(
-                slot.runtime._checkpoint(), self.slots.slots[slot_id].runtime._checkpoint()
+                slot.runtime.checkpoint(), self.slots.slots[slot_id].runtime.checkpoint()
             )
 
     async def test_net_target_candidate_replays_entry_block_and_owner(self) -> None:
@@ -206,7 +206,7 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(restored.close)
         await restored.restore()
         restored_runtime = restored.slots["comparison"].runtime
-        self.assertEqual(restored_runtime._checkpoint(), runtime._checkpoint())
+        self.assertEqual(restored_runtime.checkpoint(), runtime.checkpoint())
         self.assertEqual(restored_runtime.accounts["candidate"].summary(), candidate.summary())
 
     async def test_add_stop_replay_keeps_independent_ledgers_and_last_marks(self) -> None:
@@ -233,10 +233,10 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(small.account.prices, small_mark)
         self.assertTrue(small.status()["comparison"]["inputs_aligned"])
         self.assertTrue(large.status()["comparison"]["inputs_aligned"])
-        stopped = small._checkpoint()
+        stopped = small.checkpoint()
         await self.book("B", 8, price=2)
-        self.assertEqual(small._checkpoint(), stopped)
-        self.assertNotEqual(small._checkpoint(), large._checkpoint())
+        self.assertEqual(small.checkpoint(), stopped)
+        self.assertNotEqual(small.checkpoint(), large.checkpoint())
         await self.command(add("small", 500, "reuse"), 9)
         self.assertEqual(self.controls.report()["commands"][-1]["disposition"], "rejected")
         self.assertEqual(self.slots.capital, 200)
@@ -245,12 +245,12 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(recovered.close)
         await recovered.restore()
         self.assertEqual(recovered.slots["small"].state, "stopped")
-        self.assertEqual(recovered.slots["small"].runtime._checkpoint(), stopped)
-        self.assertEqual(recovered.slots["large"].runtime._checkpoint(), large._checkpoint())
+        self.assertEqual(recovered.slots["small"].runtime.checkpoint(), stopped)
+        self.assertEqual(recovered.slots["large"].runtime.checkpoint(), large.checkpoint())
         cursor = read_status(self.path)["cursor"]
         await recovered.marker("recovery_gap", (START + timedelta(seconds=10)).isoformat())
         self.assertEqual(read_status(self.path)["cursor"], cursor)
-        self.assertEqual(recovered.slots["small"].runtime._checkpoint(), stopped)
+        self.assertEqual(recovered.slots["small"].runtime.checkpoint(), stopped)
 
     async def test_recovery_acknowledges_already_committed_command(self) -> None:
         command = add("one", 100)
@@ -320,7 +320,7 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         recovered.poll_controls()
         self.assertTrue(recovered.queue.empty())
         self.assertEqual(self.controls.pending(), [])
-        self.assertEqual(recovered.slots["comparison"].runtime._checkpoint(), copied._checkpoint())
+        self.assertEqual(recovered.slots["comparison"].runtime.checkpoint(), copied.checkpoint())
         recovered.enable_reviews(Settings(Path("."), {}))
         self.assertIsNone(recovered.slots["comparison"].runtime.review_settings)
         await recovered.quiesce_reviews()
@@ -569,8 +569,8 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         await self.command(add("one", 100), offset=86_400)
         await self.command(add("flat", 120), offset=86_400)
         resumed = self.slots.slots["one"].runtime
-        self.assertEqual(resumed._checkpoint(), prior._checkpoint())
-        self.assertEqual(self.slots.slots["flat"].runtime._checkpoint(), flat._checkpoint())
+        self.assertEqual(resumed.checkpoint(), prior.checkpoint())
+        self.assertEqual(self.slots.slots["flat"].runtime.checkpoint(), flat.checkpoint())
         self.assertEqual(self.slots.slots["flat"].state, "active")
         self.assertIsNone(resumed.review_settings)
         self.assertCountEqual(self.slots.protected(), ["A", "B"])
@@ -610,7 +610,7 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(restored.close)
         await restored.load_predecessors(runtime_at)
         await restored.restore()
-        self.assertEqual(restored.slots["one"].runtime._checkpoint(), resumed._checkpoint())
+        self.assertEqual(restored.slots["one"].runtime.checkpoint(), resumed.checkpoint())
 
     async def test_review_is_slot_scoped_and_committed_before_external_call(self) -> None:
         self.slots.enable_reviews(Settings(Path("."), {}))
@@ -670,21 +670,21 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
         await self.command(add("two", 150))
         one = self.slots.slots["one"].runtime
         two = self.slots.slots["two"].runtime
-        checkpoints = one._checkpoint(), two._checkpoint()
+        checkpoints = one.checkpoint(), two.checkpoint()
         before = read_status(self.path)
         with (
             patch.object(two, "_consume_event", side_effect=OSError("second slot failed")),
             self.assertRaises(OSError),
         ):
             await self.book("A", 1)
-        self.assertNotEqual(one._checkpoint(), checkpoints[0])
+        self.assertNotEqual(one.checkpoint(), checkpoints[0])
         self.assertEqual(read_status(self.path), before)
 
         recovered = self.coordinator(self.journal)
         self.addAsyncCleanup(recovered.close)
         await recovered.restore()
         self.assertEqual(
-            tuple(slot.runtime._checkpoint() for _, slot in recovered.active()), checkpoints
+            tuple(slot.runtime.checkpoint() for _, slot in recovered.active()), checkpoints
         )
 
     async def test_cutoff_cancels_in_flight_review_and_keeps_terminal_evidence(self) -> None:

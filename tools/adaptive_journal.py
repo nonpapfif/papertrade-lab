@@ -8,11 +8,14 @@ import json
 import os
 import sqlite3
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from papertrade.jsonio import journal_json as encode
+
+if TYPE_CHECKING:
+    from tools.runtime_audit import RuntimeAudit
 
 SCHEMA = 1
 
@@ -162,6 +165,11 @@ class AdaptiveJournal:
                 )
         except sqlite3.Error as error:
             raise JournalError("Cannot commit paired observation") from error
+
+    def append_account_cut(self, event: dict[str, Any], *, audit: RuntimeAudit | None) -> None:
+        """Publish the prepared account results before their owner acknowledges them."""
+        with audit.publication_guard() if audit is not None else nullcontext():
+            self.append(event)
 
     def complete(self) -> None:
         with self.db:

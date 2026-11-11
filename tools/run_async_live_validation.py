@@ -436,10 +436,12 @@ class Runtime:
                 assert isinstance(payload, str)
                 await account.cancel_pending(payload)
 
-    async def cancel_accounts(self, sequence: int, at: str) -> None:
-        await self._apply_accounts(
-            sequence, {name: AccountAction("cancel", at) for name in self.accounts},
-        )
+    async def prepare_shared_stop(self, sequence: int, at: str, *, cancel_pending: bool) -> None:
+        self.last_account_results = {}
+        if cancel_pending:
+            await self._apply_accounts(
+                sequence, {name: AccountAction("cancel", at) for name in self.accounts},
+            )
 
     def assert_accounts_committable(self) -> None:
         if self._failed_cut:
@@ -520,6 +522,11 @@ class Runtime:
             }
             for name, result in self.last_account_results.items()
         }
+
+    def account_process_results(self, sequence: int) -> tuple[AccountResult, ...]:
+        return tuple(
+            result for result in self.last_account_results.values() if result.sequence == sequence
+        )
 
     async def close(self) -> None:
         if self.account_executor is not None:
@@ -846,6 +853,56 @@ class Runtime:
             finally:
                 self.processing_times.append(time.monotonic() - started)
                 self.queue.task_done()
+
+    async def seed_shared_inputs(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            await self._consume_event(copy.deepcopy(event), 0)
+
+    async def apply_shared_cut(
+        self,
+        entry: dict[str, Any],
+        delay: float,
+        *,
+        watch: set[str],
+        recorded: dict[str, Any] | None,
+        feature_cut: dict[tuple[Any, ...], Feature | None],
+        include_book_acceptance: bool,
+    ) -> dict[str, Any]:
+        self.shared_watch = watch
+        self.sequence = entry["sequence"]
+        book_count = self.book_delivered["incumbent"]
+        outcome_count = sum(len(account.outcomes) for account in self.accounts.values())
+        await self._consume_event(
+            entry,
+            delay,
+            replaying=recorded is not None,
+            feature_cut=feature_cut if self.concurrent_accounts else None,
+        )
+        if recorded is not None:
+            self.reviewed_fills = recorded["reviewed_fills"]
+            self.reviewed_families = set(recorded["reviewed_families"])
+            self.allocation_blocked = recorded["allocation_blocked"]
+        book_delivered = self.book_delivered["incumbent"] > book_count
+        output: dict[str, Any] = {
+            "progress": (
+                book_delivered
+                or sum(len(account.outcomes) for account in self.accounts.values()) > outcome_count
+                or bool(entry.get("applied"))
+            ),
+            "reviewed_fills": self.reviewed_fills,
+            "reviewed_families": sorted(self.reviewed_families),
+            "allocation_blocked": self.allocation_blocked,
+        }
+        if include_book_acceptance and entry["kind"] == "book":
+            result = self.last_account_results.get("incumbent")
+            output["accepted_book"] = (
+                result is not None and result.accepted_book
+                if self.concurrent_accounts
+                else book_delivered
+            )
+        if self.concurrent_accounts:
+            output["account_results"] = self.account_evidence()
+        return output
 
     async def _consume_event(
         self,
@@ -1219,7 +1276,7 @@ class Runtime:
             self._record_delivery(name, observation)
         return expired
 
-    def _checkpoint(self) -> str:
+    def checkpoint(self) -> str:
         return digest(
             encode(
                 {
@@ -1267,13 +1324,12 @@ class Runtime:
         record = {
             **entry,
             **({"account_results": self.account_evidence()} if self.concurrent_accounts else {}),
-            "checkpoint": self._checkpoint(),
+            "checkpoint": self.checkpoint(),
             "reviewed_fills": self.reviewed_fills,
             "reviewed_families": sorted(self.reviewed_families),
             "allocation_blocked": self.allocation_blocked,
         }
-        with self.audit.publication_guard() if self.audit is not None else nullcontext():
-            self.journal.append(record)
+        self.journal.append_account_cut(record, audit=self.audit)
 
     async def restore(self, journal: AdaptiveJournal) -> None:
         self.assert_accounts_committable()
@@ -1305,7 +1361,7 @@ class Runtime:
                     await self._consume_event(entry, 0, saved=saved)
                 if (
                     encode(entry) != encode({key: saved[key] for key in entry})
-                    or saved["checkpoint"] != self._checkpoint()
+                    or saved["checkpoint"] != self.checkpoint()
                     or (
                         self.concurrent_accounts
                         and encode(saved["account_results"]) != encode(self.account_evidence())

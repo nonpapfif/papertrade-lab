@@ -291,7 +291,7 @@ class SharedFeedSlots:
             runtime.policy_history = copy.deepcopy(prior.policy_history)
             continued_from = {
                 **self.session_seeds[slot_id],
-                "source_checkpoint": prior._checkpoint(),
+                "source_checkpoint": prior.checkpoint(),
             }
         else:
             runtime.fx = (0, entry["received"], None, None)
@@ -305,10 +305,11 @@ class SharedFeedSlots:
         runtime.shared_review_publish = lambda result: self.publish(
             "slot_review", (slot_id, result)
         )
-        for event in sorted(
-            (*self.seed.values(), *self.feature_seed.values()), key=lambda row: row["sequence"]
-        ):
-            await runtime._consume_event(copy.deepcopy(event), 0)
+        await runtime.seed_shared_inputs(
+            sorted(
+                (*self.seed.values(), *self.feature_seed.values()), key=lambda row: row["sequence"]
+            )
+        )
         runtime.review_settings = self.review_settings
         self.slots[slot_id] = Slot(
             runtime,
@@ -324,12 +325,12 @@ class SharedFeedSlots:
         }
 
     async def _stop(self, slot: Slot, entry: dict[str, Any], state: str) -> None:
-        slot.runtime.last_account_results = {}
         slot.state = state
         slot.stopped_sequence = entry["sequence"]
         slot.stopped_at = entry["at"]
-        if state != "parked":
-            await slot.runtime.cancel_accounts(entry["sequence"], entry["at"])
+        await slot.runtime.prepare_shared_stop(
+            entry["sequence"], entry["at"], cancel_pending=state != "parked",
+        )
 
     def _branch(self, command: SlotCommand, entry: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if command.slot_id in self.slots or command.slot_id in self.predecessors:
@@ -371,7 +372,7 @@ class SharedFeedSlots:
             "source_account": name,
             "cut": "execution",
             "through_sequence": self.consumed,
-            "source_checkpoint": prior._checkpoint(),
+            "source_checkpoint": prior.checkpoint(),
             "source_policy": current,
             "source_policy_version": account.entry_policy_version,
             "source_metrics": {
@@ -460,8 +461,7 @@ class SharedFeedSlots:
                         durable=False,
                     )
                 try:
-                    with self.audit.publication_guard() if self.audit is not None else nullcontext():
-                        self.journal.append(entry)
+                    self.journal.append_account_cut(entry, audit=self.audit)
                 except JournalError as error:
                     if self.audit is not None:
                         self.audit.report_exception(
@@ -568,8 +568,7 @@ class SharedFeedSlots:
         results = [
             result
             for slot in self.slots.values()
-            for result in slot.runtime.last_account_results.values()
-            if result.sequence == self.consumed
+            for result in slot.runtime.account_process_results(self.consumed)
         ]
         if not results:
             return
@@ -598,53 +597,6 @@ class SharedFeedSlots:
                 break
             if result.finished_ns > longest.finished_ns:
                 longest = result
-
-    async def _consume_slot(
-        self,
-        slot: Slot,
-        event: dict[str, Any],
-        delay: float,
-        recorded: dict[str, Any] | None,
-        feature_cut: dict[tuple[Any, ...], Feature | None],
-    ) -> dict[str, Any]:
-        runtime = slot.runtime
-        book_count = runtime.book_delivered["incumbent"]
-        outcome_count = sum(len(account.outcomes) for account in runtime.accounts.values())
-        if self.concurrent_accounts:
-            await runtime._consume_event(
-                event,
-                delay,
-                replaying=recorded is not None,
-                feature_cut=feature_cut,
-            )
-        else:
-            await runtime._consume_event(event, delay, replaying=recorded is not None)
-        if recorded is not None:
-            runtime.reviewed_fills = recorded["reviewed_fills"]
-            runtime.reviewed_families = set(recorded["reviewed_families"])
-            runtime.allocation_blocked = recorded["allocation_blocked"]
-        book_delivered = runtime.book_delivered["incumbent"] > book_count
-        accepted_book = book_delivered
-        if self.concurrent_accounts:
-            result = runtime.last_account_results.get("incumbent")
-            accepted_book = result is not None and result.accepted_book
-        return {
-            "progress": (
-                book_delivered
-                or sum(len(account.outcomes) for account in runtime.accounts.values())
-                > outcome_count
-                or bool(event.get("applied"))
-            ),
-            **(
-                {"accepted_book": accepted_book}
-                if self.session_seeds is not None and event["kind"] == "book"
-                else {}
-            ),
-            "reviewed_fills": runtime.reviewed_fills,
-            "reviewed_families": sorted(runtime.reviewed_families),
-            "allocation_blocked": runtime.allocation_blocked,
-            **({"account_results": runtime.account_evidence()} if self.concurrent_accounts else {}),
-        }
 
     async def _prepare_cut(
         self, entry: dict[str, Any], delay: float, *, saved: dict[str, Any] | None = None
@@ -699,15 +651,19 @@ class SharedFeedSlots:
                     slot.lineage is not None or self.session_seeds is not None
                 ):
                     raise JournalError("Frozen branch received an adaptive review")
-                runtime = slot.runtime
-                runtime.shared_watch = watch
-                runtime.sequence = sequence
                 event = {**entry, "kind": event_kind, "payload": event_payload}
                 recorded = saved["outputs"][slot_id] if saved is not None else None
                 targets[slot_id] = (slot, event, recorded)
             results = await asyncio.gather(
                 *(
-                    self._consume_slot(slot, event, delay, recorded, feature_cut)
+                    slot.runtime.apply_shared_cut(
+                        event,
+                        delay,
+                        watch=watch,
+                        recorded=recorded,
+                        feature_cut=feature_cut,
+                        include_book_acceptance=self.session_seeds is not None,
+                    )
                     for slot, event, recorded in targets.values()
                 ),
                 return_exceptions=True,
@@ -726,7 +682,7 @@ class SharedFeedSlots:
             }
         entry["outputs"] = outputs
         entry["checkpoints"] = {
-            slot_id: slot.runtime._checkpoint() for slot_id, slot in self.slots.items()
+            slot_id: slot.runtime.checkpoint() for slot_id, slot in self.slots.items()
         }
         if saved is not None and encode(entry) != encode(
             {key: value for key, value in saved.items() if key != "index"}
