@@ -48,6 +48,7 @@ from tools.market_data_adapter import MarketDataAdapter
 from tools.market_data_gateway import MarketDataGateway
 from tools.market_data_repository import DataRecord, DataRequest, MarketDataRepository
 from tools.market_stream import receive_market_stream
+from tools.paper_campaign.recovery import require_approved_restart
 from tools.paper_market import KR, US, PaperMarket
 from tools.probe_toss_websocket import (
     KR_SYMBOL,
@@ -76,6 +77,7 @@ SOURCES = (
     "papertrade/usage.py",
     "tools/account_executor.py",
     "tools/adaptive_journal.py",
+    "tools/autotest_jobs.py",
     "tools/async_layered_paper.py",
     "tools/kr_broker_profile.py",
     "tools/kr_comparison_ai.py",
@@ -86,6 +88,7 @@ SOURCES = (
     "tools/market_data_gateway.py",
     "tools/market_data_repository.py",
     "tools/market_stream.py",
+    "tools/paper_campaign/recovery.py",
     "tools/paper_market.py",
     "tools/probe_toss_websocket.py",
     "tools/replay_market_day.py",
@@ -96,6 +99,7 @@ SOURCES = (
     "tools/slot_control.py",
     "tools/source_identity.py",
     "tools/strategy_catalog.py",
+    "tools/supervisor_scopes.py",
     "tools/toss_order_contract.py",
     "tools/us_adaptive_ai.py",
     "tools/week_hypotheses.py",
@@ -1789,6 +1793,7 @@ async def campaign(
     resume: bool = False,
     market: PaperMarket = US,
     campaign_seeds: dict[str, Any] | None = None,
+    repair_anchor: dict[str, Any] | None = None,
 ) -> None:
     if market is KR and profile != "broker-constrained":
         raise ValueError("KR requires the broker-constrained profile")
@@ -1798,6 +1803,8 @@ async def campaign(
         if slot_control is None:
             raise ValueError("Campaign seeds require a shared-slot journal")
         validate_session_seeds(campaign_seeds)
+    if repair_anchor is not None and (not resume or slot_control is None):
+        raise ValueError("A repair requires an existing shared-slot journal")
     if resume and journal_path is None:
         raise ValueError("Recovery requires an existing journal")
     if journal_path is None:
@@ -1823,7 +1830,7 @@ async def campaign(
     )
     with ExitStack() as contexts:
         journal = contexts.enter_context(
-            AdaptiveJournal.open(journal_path, identity, resume=resume)
+            AdaptiveJournal.open(journal_path, identity, resume=resume, repair_anchor=repair_anchor)
         )
         control = contexts.enter_context(SlotControl.open(slot_control)) if slot_control else None
         await _campaign(
@@ -2589,6 +2596,7 @@ def main() -> None:
     parser.add_argument("--market", choices=MARKETS, default="US")
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
+    parser.add_argument("--repair-approval", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--journal", type=Path, help="Durable journal for an adaptive campaign")
     parser.add_argument(
         "--slot-control", type=Path, help="Enable shared slots with this command spool"
@@ -2654,6 +2662,7 @@ def main() -> None:
                 adaptive=args.adaptive,
                 end_epoch=end_epoch,
                 journal_path=args.journal.resolve() if args.journal else None,
+                repair_anchor=repair_anchor,
                 slot_control=args.slot_control.resolve() if args.slot_control else None,
                 resume=args.resume,
                 market=MARKETS[args.market],
@@ -2663,6 +2672,14 @@ def main() -> None:
             if args.adaptive:
                 loop.remove_signal_handler(signal.SIGTERM)
 
+    repair_anchor = None
+    if args.repair_approval is not None:
+        if not args.resume or args.journal is None:
+            parser.error("A published repair requires an existing journal and --resume")
+        _, failure = require_approved_restart(
+            ROOT, args.journal.resolve().parent, args.repair_approval
+        )
+        repair_anchor = failure["anchor"]
     try:
         asyncio.run(run())
     except asyncio.CancelledError:

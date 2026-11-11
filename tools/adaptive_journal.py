@@ -46,20 +46,40 @@ def _header(db: sqlite3.Connection) -> tuple[str, str, int, int, str]:
     return identity, state, tail, cursor, chain
 
 
-def _entries(db: sqlite3.Connection) -> Iterator[dict[str, Any]]:
+def _accepted_book(event: dict[str, Any]) -> bool:
+    return event.get("kind") == "book" and any(
+        result.get("accepted_book") is True for result in event.get("outputs", {}).values()
+    )
+
+
+def _entries(db: sqlite3.Connection, proof: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
     identity, _, tail, cursor, anchor = _header(db)
     chain = digest(identity)
     index = progress = 0
     rows = db.execute("SELECT id, body, hash FROM events ORDER BY id")
+    first_input = None
     for index, (stored_id, body, stored) in enumerate(rows, 1):
         event = json.loads(body)
         chain = digest(chain + body)
         if index != stored_id or index != event.get("index") or chain != stored:
             raise JournalError("Journal hash chain mismatch")
         progress += _made_progress(event)
+        if proof is not None:
+            if index == proof["records"] and chain != proof["hash"]:
+                raise JournalError("Resumed journal does not preserve the failure anchor")
+            if (
+                index > proof["records"]
+                and first_input is None
+                and _accepted_book(event)
+            ):
+                first_input = {"index": index, "kind": event["kind"], "hash": chain}
         yield event
     if (index, progress, chain) != (tail, cursor, anchor):
         raise JournalError("Journal anchor mismatch")
+    if proof is not None:
+        if not 0 < proof["records"] <= tail:
+            raise JournalError("Resumed journal has lost committed records")
+        proof["first_input"] = first_input
 
 
 def read_status(path: Path) -> dict[str, Any]:
@@ -81,10 +101,30 @@ def read_status(path: Path) -> dict[str, Any]:
         raise JournalError("Cannot read journal") from error
 
 
+def read_resumed_input(path: Path, anchor: dict[str, Any]) -> dict[str, Any] | None:
+    """Scan the new suffix first, verifying the full chain only when a book was accepted."""
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            db.execute("BEGIN")
+            rows = db.execute("SELECT body FROM events WHERE id > ? ORDER BY id", (anchor["records"],))
+            if not any(_accepted_book(json.loads(body)) for (body,) in rows):
+                return None
+            proof = dict(anchor)
+            for _ in _entries(db, proof):
+                pass
+            return proof["first_input"]
+    except (sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as error:
+        raise JournalError("Cannot verify resumed journal input") from error
+
+
 class AdaptiveJournal:
-    def __init__(self, db: sqlite3.Connection, identity: dict[str, Any]) -> None:
+    def __init__(
+        self, db: sqlite3.Connection, identity: dict[str, Any], *,
+        recorded_identity: dict[str, Any] | None = None,
+    ) -> None:
         self.db = db
         self.identity = identity
+        self.recorded_identity = identity if recorded_identity is None else recorded_identity
 
     @classmethod
     @contextmanager
@@ -103,7 +143,8 @@ class AdaptiveJournal:
     @classmethod
     @contextmanager
     def open(
-        cls, path: Path, identity: dict[str, Any], *, resume: bool
+        cls, path: Path, identity: dict[str, Any], *, resume: bool,
+        repair_anchor: dict[str, Any] | None = None,
     ) -> Iterator[AdaptiveJournal]:
         try:
             with path.with_suffix(path.suffix + ".lock").open("a") as lock:
@@ -111,6 +152,8 @@ class AdaptiveJournal:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as error:
                     raise JournalError("Journal already has a worker") from error
+                if repair_anchor is not None and not resume:
+                    raise JournalError("Repair requires a previously committed journal")
                 if not resume:
                     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                     os.close(fd)
@@ -133,10 +176,25 @@ class AdaptiveJournal:
                                 "INSERT INTO header VALUES (?, ?, 'active', 0, 0, ?)",
                                 (SCHEMA, header, digest(header)),
                             )
-                    stored, state, _, _, _ = _header(db)
+                    stored, state, tail, cursor, chain = _header(db)
+                    original = None
+                    if repair_anchor is not None:
+                        original = json.loads(stored)
+                        previous = {**original, "source_sha256": identity["source_sha256"]}
+                        if (
+                            type(tail) is not int or tail <= 0
+                            or (tail, cursor, chain) != (
+                                repair_anchor["records"], repair_anchor["cursor"],
+                                repair_anchor["hash"],
+                            )
+                            or encode(previous) != encode(identity)
+                        ):
+                            raise JournalError("Repaired source cannot resume this journal")
+                        # Keep the original header and chain. Full replay verifies every output.
+                        stored = encode(previous)
                     if stored != encode(identity) or state != "active":
                         raise JournalError("Journal identity or state does not permit execution")
-                    yield cls(db, identity)
+                    yield cls(db, identity, recorded_identity=original)
         except (sqlite3.Error, OSError) as error:
             raise JournalError("Cannot open or update journal") from error
 

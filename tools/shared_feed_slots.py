@@ -126,7 +126,7 @@ class SharedFeedSlots:
                     identity = journal.identity
                     if (
                         any(
-                            identity.get(key) != self.journal.identity.get(key)
+                            identity.get(key) != self.journal.recorded_identity.get(key)
                             for key in (
                                 "experiment",
                                 "market",

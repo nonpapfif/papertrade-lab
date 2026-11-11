@@ -11,10 +11,11 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from papertrade.ai import DISABLED_FEATURES, codex_environment, parse_codex_events
 from papertrade.clock import utc_iso as now
@@ -34,6 +35,10 @@ from tools.supervisor_scopes import (
     REFACTOR_EDITABLE,
     REFACTOR_REQUIREMENTS,
     REFACTOR_SCOPE,
+    REPAIR_CONTRACT,
+    REPAIR_EDITABLE,
+    REPAIR_REQUIREMENTS,
+    REPAIR_SCOPE,
     partition_recurring_tests,
 )
 
@@ -60,6 +65,10 @@ REQUIREMENTS = {
         "paired live comparison. Report actual limitations; no profitability proof required."
     ),
 }
+REPAIR_STATIC_CHECKS = (
+    [sys.executable, "-m", "ruff", "check", "."],
+    [sys.executable, "-m", "mypy", "--explicit-package-bases", "papertrade", "tools", "tests"],
+)
 COMPARISON_POLICY = "trend"
 KR_REQUIREMENTS = {
     "configuration": "Freeze both allocations and equal 100,000 KRW balances across four accounts.",
@@ -288,6 +297,8 @@ def verify_index_matches_worktree(
 
 
 def protected_files(scope: str) -> tuple[str, ...]:
+    if scope == REPAIR_SCOPE:
+        return tuple(path for path in PROTECTED if path not in REPAIR_EDITABLE)
     if scope == REFACTOR_SCOPE:
         return tuple(path for path in PROTECTED if path != "tools/run_async_live_validation.py") + (
             "docs/autotest-supervisor.md",
@@ -297,6 +308,8 @@ def protected_files(scope: str) -> tuple[str, ...]:
 
 
 def editable_files(scope: str) -> set[str]:
+    if scope == REPAIR_SCOPE:
+        return REPAIR_EDITABLE
     if scope == REFACTOR_SCOPE:
         return EDITABLE_EXISTING | REFACTOR_EDITABLE
     return EDITABLE_EXISTING | (RECURRING_EDITABLE if scope == "recurring-paper" else set())
@@ -310,6 +323,14 @@ def check_changes(
     protected = protected_files(scope)
     tracked = set(command(["git", "ls-files"], repo).splitlines())
     for name in paths:
+        if (
+            scope == REPAIR_SCOPE
+            and name not in REPAIR_EDITABLE
+            and not (
+                name not in tracked and re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", name)
+            )
+        ):
+            raise RuntimeError(f"Change is outside the session repair scope: {name}")
         if name in protected or not name.startswith(("tools/", "tests/", "docs/")):
             raise RuntimeError(f"Change requires separate review of supervisor authority: {name}")
         if (
@@ -380,6 +401,10 @@ def model_command(binary: Path, role: str, cwd: Path, job: Path) -> list[str]:
     return argv
 
 
+
+class JobDeadline(TypedDict, total=False):
+    stop_after: float
+
 def ensure_started(job: Path, argv: list[str], cwd: Path, **options: Any) -> None:
     if not (job / "spec.json").exists() and not (job / "start.claim").exists():
         start_job(job, argv, cwd, **options)
@@ -398,7 +423,7 @@ class Supervisor:
         audit: RuntimeAudit | None = None,
         local_validation: Path | None = None,
     ) -> None:
-        if scope not in ("finite", "recurring-paper", REFACTOR_SCOPE) or (kr_until and scope != "finite"):
+        if scope not in ("finite", "recurring-paper", REFACTOR_SCOPE, REPAIR_SCOPE) or (kr_until and scope != "finite"):
             raise ValueError("Invalid supervisor scope")
         self.scope = scope
         self.audit = audit
@@ -407,6 +432,8 @@ class Supervisor:
         self.requirements = (
             REFACTOR_REQUIREMENTS
             if scope == REFACTOR_SCOPE
+            else REPAIR_REQUIREMENTS
+            if scope == REPAIR_SCOPE
             else RECURRING_REQUIREMENTS
             if scope == "recurring-paper"
             else KR_REQUIREMENTS
@@ -424,6 +451,7 @@ class Supervisor:
                 self.state.get("scope", "finite") != scope
                 or self.state.get("requirements") != self.requirements
                 or self.state.get("kr_until") != kr_until
+                or (scope == REPAIR_SCOPE and self.state.get("inherited") != str(inherited))
             ):
                 raise RuntimeError(
                     "Saved supervisor scope differs; preserve it and use a new output"
@@ -458,13 +486,23 @@ class Supervisor:
     def worktree(self) -> Path:
         return Path(self.state.get("worktree", self.repo))
 
+    def repair_deadline(self) -> float:
+        return float(read_json(Path(self.state["inherited"]) / "failure.json")["end_epoch"])
+
+    def job_deadline(self) -> JobDeadline:
+        return {"stop_after": self.repair_deadline()} if self.scope == REPAIR_SCOPE else {}
+
     def evidence(self) -> dict[str, Any]:
-        handoff = Path(self.state["inherited"]) / "engineering_handoff.json"
+        handoff = Path(self.state["inherited"]) / (
+            "failure.json" if self.scope == REPAIR_SCOPE else "engineering_handoff.json"
+        )
         return {
             "engineering_handoff": read_json(handoff) if handoff.is_file() else None,
             "requirements": self.requirements,
             "milestone_document": (
-                "docs/concurrent-refactor.md"
+                "docs/recurring-paper-campaign.md"
+                if self.scope == REPAIR_SCOPE
+                else "docs/concurrent-refactor.md"
                 if self.scope == REFACTOR_SCOPE
                 else "docs/recurring-paper-campaign.md"
                 if self.scope == "recurring-paper"
@@ -511,7 +549,7 @@ class Supervisor:
             "regression_modules": REGRESSION_MODULES,
             "live_source_policy": (
                 "No live run is permitted in this scope. "
-                if self.scope == REFACTOR_SCOPE
+                if self.scope in (REFACTOR_SCOPE, REPAIR_SCOPE)
                 else "Live integration uses the frozen baseline; changed engines are validated offline. "
                 "Nested macOS sandbox tests require separate host-level validation."
             ),
@@ -584,7 +622,11 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             if self.kr_until
             else ""
         )
-        if self.scope == REFACTOR_SCOPE:
+        if self.scope == REPAIR_SCOPE:
+            contract = REPAIR_CONTRACT
+            if role == "review":
+                instructions += "\nUse an offline plan. The only requirement ID is live_integration.\n"
+        elif self.scope == REFACTOR_SCOPE:
             contract = REFACTOR_CONTRACT
             if role == "review":
                 instructions = instructions.replace(
@@ -608,6 +650,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             model_command(self.binary, role, self.worktree, job),
             self.worktree,
             stdin=job / "prompt.txt",
+            **self.job_deadline(),
         )
 
     def finish_model(self) -> None:
@@ -617,6 +660,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             model_command(self.binary, self.state["role"], self.worktree, job),
             self.worktree,
             stdin=job / "prompt.txt",
+            **self.job_deadline(),
         )
         result = poll_job(job)
         if result is None:
@@ -658,7 +702,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             self.state["history"].append(
                 {"cycle": self.state["cycle"], "review": value, "evidence": str(job), "at": now()}
             )
-            publish_ready = self.scope != REFACTOR_SCOPE or (
+            publish_ready = self.scope not in (REFACTOR_SCOPE, REPAIR_SCOPE) or (
                 value["decision"] == "complete" and set(value["satisfied"]) == set(self.requirements)
             )
             if (
@@ -692,6 +736,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         jobs = self.state.get("test_jobs", [])
         if self.state.get("tests_passed") is not True or not jobs:
             raise RuntimeError("Refactor requires passing controller-owned test jobs")
+        if self.scope == REPAIR_SCOPE and [job["argv"] for job in jobs[1:]] != list(
+            REPAIR_STATIC_CHECKS
+        ):
+            raise RuntimeError("Session repair requires fresh Ruff and mypy evidence")
         cycle_dir = self.output / f"cycle-{self.state['cycle']:04d}"
         for index, job in enumerate(jobs):
             directory = cycle_dir / f"test-{index}"
@@ -713,6 +761,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 or result.get("cutoff_stop")
                 or spec.get("argv") != expected_argv
                 or spec.get("cwd") != str(self.worktree.resolve())
+                or (
+                    self.scope == REPAIR_SCOPE
+                    and spec.get("stop_after") != self.repair_deadline()
+                )
             ):
                 raise RuntimeError("Refactor test exit records do not match this cycle")
             if index == 0:
@@ -781,6 +833,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         review = self.state["review"]
         if review["decision"] == "complete" and self.scope == REFACTOR_SCOPE:
             self.complete_refactor()
+        elif review["decision"] == "complete" and self.scope == REPAIR_SCOPE:
+            raise RuntimeError("Session repair requires a tested change and publication approval")
         elif review["decision"] == "complete":
             if self.state.get("tests_passed") is False:
                 raise RuntimeError("Cannot complete with failed mechanical checks")
@@ -846,7 +900,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if plan["kind"] == "blocked":
             self.transition("review", cycle=self.state["cycle"] + 1)
             return
-        if self.scope == REFACTOR_SCOPE and plan["kind"] == "live":
+        if self.scope in (REFACTOR_SCOPE, REPAIR_SCOPE) and plan["kind"] == "live":
             raise RuntimeError("Concurrent refactor forbids live validation")
         if self.scope == "recurring-paper" and plan["kind"] == "live":
             raise RuntimeError("Recurring deployment requires the reviewed campaign adapter")
@@ -874,7 +928,13 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             )
             return
         worktree = self.output / f"worktree-{cycle:04d}"
-        branch = "codex/" + self.output.name + f"-{cycle:04d}"
+        if self.scope == REPAIR_SCOPE:
+            task = read_json(Path(self.state["inherited"]) / "failure.json")["handoff"]["task_id"]
+            if not re.fullmatch(r"[0-9a-f]{64}", task):
+                raise RuntimeError("Invalid failed-session repair identity")
+            branch = f"codex/paper-repair-{task[:24]}-{cycle:04d}"
+        else:
+            branch = "codex/" + self.output.name + f"-{cycle:04d}"
         if command(["git", "status", "--porcelain"], self.repo):
             raise RuntimeError("Main checkout has user changes; no automatic overwrite")
         command(["git", "fetch", "origin"], self.repo)
@@ -913,6 +973,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             )
         if self.scope == REFACTOR_SCOPE:
             modules.append("tests.test_refactor_supervisor")
+        if self.scope == REPAIR_SCOPE:
+            modules.append("tests.test_architecture")
         for name in changed_paths(self.worktree) + self.state.get("generated_files", []):
             if re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", name):
                 module = name[:-3].replace("/", ".")
@@ -941,6 +1003,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                     + ", ".join(host_checks_not_run)
                 )
         tests = [[sys.executable, "-m", "unittest", "-q", *modules]]
+        if self.scope == REPAIR_SCOPE:
+            if experiment:
+                raise RuntimeError("Session repair accepts regression tests only")
+            tests.extend(REPAIR_STATIC_CHECKS)
         if experiment:
             path = self.worktree / experiment
             if (
@@ -1032,6 +1098,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 ],
                 self.worktree,
                 environment=environment,
+                **self.job_deadline(),
             )
             if (path / "start.claim").exists() and not (path / "spec.json").exists():
                 raise RuntimeError("Interrupted job reservation; inspect before retry")
@@ -1039,7 +1106,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         result = poll_job(path)
         if result is not None:
             job["returncode"] = result["returncode"]
-            if self.scope == REFACTOR_SCOPE or self.state.get("plan", {}).get("kind") == "test":
+            if (
+                self.scope in (REFACTOR_SCOPE, REPAIR_SCOPE)
+                or self.state.get("plan", {}).get("kind") == "test"
+            ):
                 job["skipped"] = bool(
                     re.search(r"\bskipped=\d+", (path / "stderr.log").read_text())
                 )
@@ -1104,17 +1174,22 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         start_job(path, argv, trusted)
 
     def publish(self) -> None:
-        if self.scope == REFACTOR_SCOPE:
+        if self.scope in (REFACTOR_SCOPE, REPAIR_SCOPE):
             self.verify_refactor_evidence()
             review = self.state["review"]
             if review["publish_ok"] is not True or review["decision"] != "complete":
                 raise RuntimeError("Refactor publication requires Astra completion and approval")
             if set(review["satisfied"]) != set(self.requirements):
                 raise RuntimeError("Astra completion omitted pending requirements")
-            if self.local_validation is None:
-                self.transition("validation_pending", live_validation_pending=True)
-                return
-            require_report(self.local_validation, self.state["publication_digest"])
+            if self.scope == REFACTOR_SCOPE:
+                if self.local_validation is None:
+                    self.transition("validation_pending", live_validation_pending=True)
+                    return
+                require_report(self.local_validation, self.state["publication_digest"])
+        if self.scope == REPAIR_SCOPE and not any(
+            name.startswith("tests/test_") for name in changed_paths(self.worktree)
+        ):
+            raise RuntimeError("Session repair requires a new regression test")
         if tree_digest(self.worktree) != self.state["publication_digest"]:
             raise RuntimeError("Reviewed source changed before publication")
         if self.state.get("tested_digest") != self.state["publication_digest"]:
@@ -1130,6 +1205,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         command(["git", "fetch", "origin"], self.worktree)
         if command(["git", "rev-parse", "origin/master"], self.worktree) != self.state["base"]:
             raise RuntimeError("Master advanced; rebase and a fresh test/review are required")
+        if self.scope == REPAIR_SCOPE and time.time() >= self.repair_deadline():
+            self.transition("blocked", reason="The failed session window ended before publication")
+            return
         # Persist before external mutations. An interrupted publication requires reconciliation.
         self.transition("publishing", publication_started_at=now())
         command(["git", "add", "--", *paths], self.worktree)
@@ -1147,7 +1225,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             ],
             self.worktree,
         )
-        title = "Validate layered paper trading: " + self.state["plan"]["requirement"]
+        title = (
+            "Repair failed paper session" if self.scope == REPAIR_SCOPE
+            else "Validate layered paper trading: " + self.state["plan"]["requirement"]
+        )
         command(["git", "commit", "-m", title], self.worktree)
         if command(["git", "rev-parse", "HEAD^{tree}"], self.worktree) != frozen_tree:
             raise RuntimeError("Committed tree differs from the reviewed staged tree")
@@ -1158,7 +1239,11 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             self.requirements[self.state["plan"]["requirement"]]
             + "\n\nChanged files:\n"
             + "\n".join("- " + path for path in paths)
-            + "\n\nValidation: layered regression suite passed. "
+            + (
+                "\n\nValidation: offline unittest targets, Ruff and mypy passed. "
+                if self.scope == REPAIR_SCOPE
+                else "\n\nValidation: layered regression suite passed. "
+            )
             + (
                 "The recorded offline experiment also passed. "
                 if self.state["worker"]["experiment"]
@@ -1175,7 +1260,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 + "\nHost checks not run by the offline supervisor:\n"
                 + "\n".join("- " + name for name in self.state["host_checks_not_run"])
                 + "\n"
-                if self.scope == REFACTOR_SCOPE
+                if self.scope in (REFACTOR_SCOPE, REPAIR_SCOPE)
                 else ""
             )
         )
@@ -1200,7 +1285,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         self.transition("pr_wait", pr=url, publish_sha=sha)
 
     def pr_step(self) -> None:
-        if self.scope == REFACTOR_SCOPE:
+        if self.scope in (REFACTOR_SCOPE, REPAIR_SCOPE):
             self.verify_refactor_evidence()
             if changed_paths(self.worktree):
                 raise RuntimeError("Refactor publication worktree is dirty")
@@ -1217,6 +1302,9 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             raise RuntimeError("PR head changed after review")
         if result["state"] != "OPEN":
             raise RuntimeError("Expected the published PR to be open")
+        if self.scope == REPAIR_SCOPE:
+            self.transition("repair_merge")
+            return
         self.state["history"][-1]["pr"] = self.state["pr"]
         self.transition(
             "pr_ready",
@@ -1239,6 +1327,13 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
 
     def _step(self) -> None:
         phase = self.state["phase"]
+        if (
+            self.scope == REPAIR_SCOPE
+            and phase not in ("model_wait", "test_wait", "repair_merging")
+            and time.time() >= self.repair_deadline()
+        ):
+            self.transition("blocked", reason="The failed session window ended")
+            return
         if phase == "inherit":
             path = Path(self.state["inherited"]) / "status.json"
             status = read_json(path)
@@ -1274,6 +1369,10 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             self.publish()
         elif phase == "pr_wait":
             self.pr_step()
+        elif phase in ("repair_merge", "repair_merging"):
+            from tools.paper_campaign.repair_publication import finish_publication
+
+            finish_publication(self)
         elif phase in ("publishing", "merging"):
             raise RuntimeError("Interrupted external mutation; reconcile GitHub before resuming")
 
@@ -1287,12 +1386,21 @@ def main() -> None:
     parser.add_argument("--codex", required=True, type=Path)
     parser.add_argument("--kr-until", type=datetime.fromisoformat)
     parser.add_argument("--local-validation", type=Path)
-    parser.add_argument("--scope", choices=("finite", "recurring-paper", REFACTOR_SCOPE), default="finite")
+    parser.add_argument(
+        "--scope", choices=("finite", "recurring-paper", REFACTOR_SCOPE, REPAIR_SCOPE),
+        default="finite",
+    )
     args = parser.parse_args()
     if args.kr_until is not None and args.kr_until.tzinfo is None:
         parser.error("--kr-until requires a timezone offset")
     args.output.mkdir(parents=True, exist_ok=True)
-    with (args.output / "supervisor.lock").open("w") as lock:
+    with ExitStack() as locks:
+        if args.scope == REPAIR_SCOPE:
+            shared_lock = args.repo / "state" / "engineering-repair.lock"
+            shared_lock.parent.mkdir(exist_ok=True)
+            repair_lock = locks.enter_context(shared_lock.open("a"))
+            fcntl.flock(repair_lock, fcntl.LOCK_EX)
+        lock = locks.enter_context((args.output / "supervisor.lock").open("a"))
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         audit = RuntimeAudit(args.output / "runtime-audit.sqlite3", "engineering-supervisor")
         with (
@@ -1310,12 +1418,12 @@ def main() -> None:
                 audit=audit,
                 local_validation=args.local_validation.resolve() if args.local_validation else None,
             )
-            terminal_phases = {"complete", "blocked", "pr_ready", "validation_pending"}
+            terminal_phases = {"complete", "blocked", "pr_ready", "validation_pending", "repair_ready"}
             if supervisor.state["phase"] == "validation_pending" and args.local_validation:
                 supervisor.transition("publish")
             if supervisor.state["phase"] in terminal_phases:
                 return
-            if args.scope != REFACTOR_SCOPE and "trusted_live_commit" not in supervisor.state:
+            if args.scope not in (REFACTOR_SCOPE, REPAIR_SCOPE) and "trusted_live_commit" not in supervisor.state:
                 if command(["git", "status", "--porcelain"], args.repo):
                     raise RuntimeError("Initial trusted live checkout must be clean")
                 supervisor.state["trusted_live_commit"] = command(
@@ -1323,7 +1431,7 @@ def main() -> None:
                 )
                 supervisor.state["trusted_live_digest"] = tree_digest(args.repo)
                 supervisor.save()
-            if supervisor.state["phase"] not in ("publish", "pr_wait"):
+            if supervisor.state["phase"] not in ("publish", "pr_wait", "repair_merge", "repair_merging"):
                 metadata = read_metadata(
                     [str(args.codex), "app-server", "--listen", "stdio://", "-c", "mcp_servers={}"],
                     codex_environment(),

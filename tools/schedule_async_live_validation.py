@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from papertrade.jsonio import atomic_json, read_json
+from tools.adaptive_journal import read_resumed_input
 from tools.adaptive_journal import read_status as read_journal_status
 from tools.autotest_jobs import ROOT, STOP_SECONDS, poll_job, start_job
+from tools.paper_campaign.recovery import require_approved_restart
 from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
 from tools.source_identity import command, tree_digest
 
@@ -39,7 +41,9 @@ def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
     )
 
 
-def run_schedule(output: Path, spec: dict[str, Any]) -> int:
+def run_schedule(
+    output: Path, spec: dict[str, Any], *, repair: dict[str, Any] | None = None
+) -> int:
     status = output / "status.json"
     recovery = spec.get("recover") is True
     dynamic_slots = spec.get("dynamic_slots") is True
@@ -47,12 +51,26 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     journal = output / "journal.sqlite3"
     slot_spool = output / SPOOL_NAME
     restarts: list[dict[str, Any]] = []
+    source = repair or spec
+    archive = read_json(Path(repair["failure"])) if repair is not None else None
+    proof_path = (
+        Path(repair["failure"]).with_name("resumed-input.json") if repair is not None else None
+    )
+
+    def verify_resumed_input() -> None:
+        if proof_path is None or proof_path.exists():
+            return
+        assert archive is not None and repair is not None
+        if first_input := read_resumed_input(journal, archive["anchor"]):
+            atomic_json(proof_path, {"repair": repair, "first_input": first_input})
 
     def paths(attempt: int) -> tuple[Path, Path]:
         base = output / "attempts" / str(attempt) if attempt > 1 else output
         return base / "job", base / "run"
 
     def save(state: str, **details: Any) -> None:
+        if repair is not None:
+            details["repair"] = repair
         if recovery:
             details["restarts"] = restarts
         if state in ("failed", "blocked", "incomplete"):
@@ -86,7 +104,10 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
         if previous.get("schedule") != spec:
             raise RuntimeError("Saved schedule differs from the requested schedule")
         previous_state = previous.get("state")
-        if previous_state in ("complete", "expired", "failed", "blocked", "incomplete"):
+        initial_repair = archive is not None and previous == archive["schedule"]
+        if not initial_repair and previous.get("repair") != repair:
+            raise RuntimeError("Saved schedule belongs to a different recovery")
+        if not initial_repair and previous_state in ("complete", "expired", "failed", "blocked", "incomplete"):
             return int(previous_state in ("failed", "blocked", "incomplete"))
         if recovery:
             history = previous.get("restarts")
@@ -105,6 +126,26 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                     raise RuntimeError("Saved restart evidence is invalid")
                 cursor = restart["cursor"]
             restarts = history
+        if initial_repair:
+            assert archive is not None
+            old_job, _ = paths(len(restarts) + 1)
+            if (
+                previous_state != "failed"
+                or not (old_job / "start.claim").exists()
+                or poll_job(old_job) != previous.get("job_exit")
+                or time.time() >= spec["end_epoch"]
+            ):
+                raise RuntimeError("Archived failed worker no longer authorizes this repair")
+            anchor = archive["anchor"]
+            restarts.append({
+                "cursor": anchor["cursor"],
+                "journal_hash": anchor["hash"],
+                "job_exit": previous["job_exit"],
+                "repair": repair,
+                "at": time.time(),
+            })
+            save("restarting")
+            previous_state = "restarting"
         job, _ = paths(len(restarts) + 1)
         if not (
             (previous_state == "waiting" and not restarts)
@@ -152,8 +193,8 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                     save("expired")
                     return 0
                 if (
-                    command(["git", "rev-parse", "HEAD"], ROOT) != spec["source_commit"]
-                    or tree_digest(ROOT) != spec["source_digest"]
+                    command(["git", "rev-parse", "HEAD"], ROOT) != source["source_commit"]
+                    or tree_digest(ROOT) != source["source_digest"]
                 ):
                     raise RuntimeError("Approved source changed before launch")
                 argv = list(spec["argv"])
@@ -174,6 +215,10 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                             raise RuntimeError("Journal changed after restart decision")
                         argv[argv.index("--output") + 1] = str(run_output)
                         argv.append("--resume")
+                        if archive is not None:
+                            assert repair is not None
+                            grant_file = Path(repair["failure"]).with_name("restart.json")
+                            argv.extend(["--repair-approval", str(grant_file)])
                     argv.extend(["--journal", str(journal)])
                 if time.time() >= spec["end_epoch"]:
                     if restarts:
@@ -188,6 +233,7 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             # if the wall clock moves backward while the job is running.
             poll_deadline = time.monotonic() + max(0, poll_until - time.time())
             while (result := poll_job(job)) is None:
+                verify_resumed_input()
                 remaining = min(poll_until - time.time(), poll_deadline - time.monotonic())
                 if remaining <= 0:
                     save(
@@ -196,12 +242,13 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                     )
                     return 1
                 time.sleep(min(remaining, 2))
+            verify_resumed_input()
             if result.get("cutoff_stop") is True:
                 save("incomplete", job_exit=result, reason="Worker stopped after cutoff drain")
                 return 1
             if result["returncode"] == 0:
                 break
-            if not recovery:
+            if not recovery or repair is not None:
                 save("failed", job_exit=result)
                 return 1
             status_file = run_output / "status.json"
@@ -280,7 +327,10 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                 )
             ):
                 raise RuntimeError("Run status does not confirm a completed comparison")
-        if tree_digest(ROOT) != spec["source_digest"]:
+        if proof_path is not None and not proof_path.exists():
+            save("incomplete", job_exit=result, reason="No committed market input after repair")
+            return 1
+        if tree_digest(ROOT) != source["source_digest"]:
             save("incomplete", job_exit=result, reason="Approved source changed during the run")
             return 1
         if dynamic_slots:
@@ -303,11 +353,11 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
 def main() -> int:
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start-at", required=True, type=datetime.fromisoformat)
-    parser.add_argument("--end-at", required=True, type=datetime.fromisoformat)
-    parser.add_argument("--capital", required=True, type=float)
+    parser.add_argument("--start-at", type=datetime.fromisoformat)
+    parser.add_argument("--end-at", type=datetime.fromisoformat)
+    parser.add_argument("--capital", type=float)
     parser.add_argument("--market", choices=("US", "KR"), default="US")
-    parser.add_argument("--source-digest", required=True)
+    parser.add_argument("--source-digest")
     parser.add_argument("--source-commit")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
@@ -319,7 +369,16 @@ def main() -> int:
     parser.add_argument(
         "--campaign-plan", type=Path, help="Frozen recurring campaign plan and carryover seeds"
     )
+    parser.add_argument("--repair", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.repair is not None:
+        output = args.output.resolve()
+        grant, archive = require_approved_restart(ROOT, output, args.repair)
+        with (output / "schedule.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return run_schedule(output, archive["schedule"]["schedule"], repair=grant)
+    if None in (args.start_at, args.end_at, args.capital, args.source_digest):
+        parser.error("Start, end, capital and source digest are required")
     if args.start_at.utcoffset() is None or args.end_at.utcoffset() is None:
         parser.error("Start and end require a timezone offset")
     if args.start_at >= args.end_at:
