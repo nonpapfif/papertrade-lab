@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 from papertrade.api import ApiError
 from tools.layered_paper import Feature
+from tools.market_stream import websocket_retry_at
 from tools.paper_market import KR
 from tools.run_async_live_validation import (
     SOURCES,
@@ -25,7 +26,6 @@ from tools.run_async_live_validation import (
     rank_candidates,
     subscription_set,
     wait_for_rest_cooldown,
-    websocket_retry_at,
     write_comparison,
 )
 

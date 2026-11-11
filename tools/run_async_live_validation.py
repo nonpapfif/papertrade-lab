@@ -18,7 +18,6 @@ from collections.abc import Awaitable, Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -48,13 +47,12 @@ from tools.live_feed import MAX_AGE_SECONDS, LiveFeed
 from tools.market_data_adapter import MarketDataAdapter
 from tools.market_data_gateway import MarketDataGateway
 from tools.market_data_repository import DataRecord, DataRequest, MarketDataRepository
+from tools.market_stream import receive_market_stream
 from tools.paper_market import KR, US, PaperMarket
 from tools.probe_toss_websocket import (
     KR_SYMBOL,
     ROOT,
-    URL,
     CachedTokenClient,
-    declaration,
     error_details,
     read_spec,
 )
@@ -87,6 +85,7 @@ SOURCES = (
     "tools/market_data_adapter.py",
     "tools/market_data_gateway.py",
     "tools/market_data_repository.py",
+    "tools/market_stream.py",
     "tools/paper_market.py",
     "tools/probe_toss_websocket.py",
     "tools/replay_market_day.py",
@@ -1696,25 +1695,6 @@ async def fetch_rest_book(
         publish("book", (symbol, book))
 
 
-def websocket_retry_at(headers: list[str], now_epoch: float) -> float:
-    retry_at = now_epoch + 2
-    for header in headers:
-        value = header.strip()
-        try:
-            if value.isascii() and value.isdecimal():
-                candidate = now_epoch + float(value)
-            else:
-                stamp = parsedate_to_datetime(value)
-                if stamp.utcoffset() is None:
-                    continue
-                candidate = stamp.timestamp()
-        except (ValueError, TypeError, OSError, OverflowError):
-            continue
-        if math.isfinite(candidate):
-            retry_at = max(retry_at, candidate)
-    return retry_at
-
-
 def journal_identity(
     capital: float,
     end_epoch: float,
@@ -1829,8 +1809,7 @@ async def _campaign(
         or time.time() >= end_epoch
     ):
         raise ValueError("Adaptive campaign requires a constrained profile and future cutoff")
-    from websockets.asyncio.client import connect
-    from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
+    from websockets.exceptions import WebSocketException
 
     os.umask(0o077)
     output.mkdir(parents=True, exist_ok=False)
@@ -1989,7 +1968,6 @@ async def _campaign(
         calendar = await asyncio.to_thread(adapter.read, client.calendar, market.code, calendar_day)
         if constrained:
             runtime.publish("calendar", (calendar_day, calendar))
-        stream_market = market.code.lower()
         private_json(
             output / "manifest.json",
             {
@@ -2324,188 +2302,24 @@ async def _campaign(
                 if audit.healthy:
                     audit.heartbeat("collector", status="idle", pid=os.getpid(), durable=False)
 
-        async def stream() -> None:
-            def rejected_frame(frame: str | bytes, received: str, code: str) -> ValueError:
-                data = (
-                    frame.encode("utf-8", errors="surrogatepass")
-                    if isinstance(frame, str)
-                    else frame
-                )
-                raw.write(
-                    json.dumps(
-                        {
-                            "kind": "websocket_frame_failure",
-                            "received_at": received,
-                            "frame_type": "text" if isinstance(frame, str) else "binary",
-                            "byte_length": len(data),
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                            "code": code,
-                        }
-                    )
-                    + "\n"
-                )
-                raw.flush()
-                error = ValueError(f"Invalid WebSocket frame: {code}")
-                audit.report_exception(
-                    "provider_adapter", code, error, {"market": market.code},
-                )
-                return error
-
-            injected = False
-            while time.monotonic() < deadline:
-                if not runtime.desired:
-                    await asyncio.sleep(0.1)
-                    continue
-                try:
-                    async with connect(
-                        URL,
-                        additional_headers={"Authorization": "Bearer " + token},
-                        proxy=None,
-                        ping_interval=20,
-                        ping_timeout=20,
-                        open_timeout=15,
-                        close_timeout=5,
-                    ) as ws:
-                        stats["connections"] += 1
-                        record("connected", connection=stats["connections"])
-                        for code in ("websocket_disconnected", "websocket_handshake_failed"):
-                            audit.record(
-                                "provider_adapter", code, {"market": market.code}, state="resolved",
-                            )
-                        resync.set()
-                        selected: list[str] = []
-                        accepted: set[str] = set()
-                        expected: set[str] = set()
-                        ack_pending = False
-                        declaration_at = 0.0
-                        next_ping = 0.0
-                        ping_at: float | None = None
-                        while time.monotonic() < deadline:
-                            tick = time.monotonic()
-                            if not runtime.desired:
-                                await ws.close(code=1000, reason="No candidates or holdings")
-                                break
-                            if not adaptive and not injected and tick - started >= duration / 2:
-                                injected = True
-                                stats["faults"].append(
-                                    {"kind": "controlled_disconnect", "at": now()}
-                                )
-                                await ws.close(code=1000, reason="Controlled integration test")
-                                record("controlled_disconnect")
-                                break
-                            if (
-                                runtime.desired != selected
-                                and not ack_pending
-                                and tick - declaration_at >= 1
-                            ):
-                                selected = list(runtime.desired)
-                                expected = {
-                                    f"{c}:{stream_market}:{s}"
-                                    for c in ("trade", "orderbook")
-                                    for s in selected
-                                }
-                                await ws.send(json.dumps(declaration(stream_market, selected)))
-                                declaration_at, ack_pending = tick, True
-                            if ack_pending and tick - declaration_at > 20:
-                                raise TimeoutError("Subscription acknowledgement timeout")
-                            if ping_at is not None and tick - ping_at > 20:
-                                raise TimeoutError("Application pong timeout")
-                            if tick >= next_ping:
-                                await ws.send("PING")
-                                ping_at, next_ping = tick, tick + 60
-                            try:
-                                wire = await asyncio.wait_for(ws.recv(), 0.25)
-                            except TimeoutError:
-                                continue
-                            received = now()
-                            try:
-                                message = json.loads(wire)
-                            except (ValueError, RecursionError):
-                                raise rejected_frame(wire, received, "invalid_json") from None
-                            if not isinstance(message, dict):
-                                raise rejected_frame(wire, received, "non_object")
-                            kind = message.get("type")
-                            if kind == "subscriptions":
-                                subscribed = message.get("subscribed", [])
-                                if not isinstance(subscribed, list) or any(
-                                    not isinstance(topic, str) for topic in subscribed
-                                ):
-                                    raise rejected_frame(wire, received, "invalid_subscription")
-                                actual = set(subscribed)
-                                if actual != expected or message.get("rejected"):
-                                    raise rejected_frame(wire, received, "subscription_mismatch")
-                                accepted, ack_pending = actual, False
-                                stats["acks"].append(
-                                    {
-                                        "at": now(),
-                                        "connection": stats["connections"],
-                                        "symbols": selected,
-                                        "protected": sorted(runtime.protected()),
-                                    }
-                                )
-                                record("subscription_ack", symbols=selected)
-                            elif kind == "pong":
-                                ping_at = None
-                            elif kind == "message":
-                                topic = message.get("topic")
-                                if not isinstance(topic, str) or topic not in accepted | expected:
-                                    rejected_frame(wire, received, "unexpected_topic")
-                                    continue
-                                frame: dict[str, Any] = {"received_at": received, "frame": message}
-                                stats["market_messages"] = stats.get("market_messages", 0) + 1
-                                if topic.startswith(f"orderbook:{stream_market}:"):
-                                    symbol = topic.rsplit(":", 1)[1]
-                                    data = message.get("data")
-                                    if not isinstance(data, dict):
-                                        rejected_frame(wire, received, "invalid_orderbook_data")
-                                        continue
-                                    try:
-                                        observation = shared_gateway.ingest_book(
-                                            market.code, symbol, data,
-                                            received_time=received,
-                                        )
-                                    except ApiError as error:
-                                        record("stream_symbol_failure", symbol=symbol, code=error.code)
-                                    else:
-                                        frame["published_sequence"] = observation.published_sequence
-                                        frame["source_identity"] = observation.source_identity
-                                        runtime.publish(
-                                            "book", (symbol, observation.payload), received=received
-                                        )
-                                raw.write(json.dumps(frame) + "\n")
-                            else:
-                                raise rejected_frame(wire, received, "unknown_type")
-                except InvalidStatus as error:
-                    status = error.response.status_code
-                    audit.report_exception(
-                        "provider_adapter", "websocket_handshake_failed", error,
-                        {"market": market.code, "http_status": status},
-                        severity="warning" if status in (429, 503) else "error",
-                    )
-                    if not adaptive or status not in (429, 503):
-                        raise
-                    record("connection_failure", **error_details(error, token))
-                    raise ApiError(
-                        "WebSocket handshake temporarily unavailable",
-                        status=status,
-                        code="cooldown",
-                        retry_at=websocket_retry_at(
-                            error.response.headers.get_all("Retry-After"), time.time()
-                        ),
-                    ) from error
-                except (ConnectionClosed, OSError, TimeoutError) as error:
-                    audit.report_exception(
-                        "provider_adapter", "websocket_disconnected", error,
-                        {"market": market.code}, severity="warning",
-                    )
-                    record("connection_failure", **error_details(error, token))
-                if time.monotonic() < deadline:
-                    record("reconnect_backoff", seconds=2)
-                    await asyncio.sleep(2)
-
         consumer = asyncio.create_task(runtime.consume())
         collector = asyncio.create_task(collect_until_cutoff() if adaptive else collect())
-        streamer = asyncio.create_task(stream())
+        streamer = asyncio.create_task(receive_market_stream(
+            runtime,
+            shared_gateway,
+            market=market.code,
+            token=token,
+            deadline=deadline,
+            started=started,
+            duration=duration,
+            adaptive=adaptive,
+            raw=raw,
+            stats=stats,
+            record=record,
+            resync=resync,
+            audit=audit,
+            clock=now,
+        ))
         tasks = [consumer, collector, streamer]
         while time.monotonic() < deadline:
             if slots is not None:
