@@ -2449,7 +2449,8 @@ async def _campaign(
                             elif kind == "message":
                                 topic = message.get("topic")
                                 if not isinstance(topic, str) or topic not in accepted | expected:
-                                    raise rejected_frame(wire, received, "unexpected_topic")
+                                    rejected_frame(wire, received, "unexpected_topic")
+                                    continue
                                 frame: dict[str, Any] = {"received_at": received, "frame": message}
                                 stats["market_messages"] = stats.get("market_messages", 0) + 1
                                 if topic.startswith(f"orderbook:{stream_market}:"):

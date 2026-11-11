@@ -329,14 +329,25 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
             runtime.desired = ["A"]
             await asyncio.Future()
 
+        malformed = b'{"secret-fixture"'
+        unsubscribed = json.dumps({"type": "message", "topic": "orderbook:us:secret-fixture"})
+        acknowledgement = json.dumps({
+            "type": "subscriptions", "subscribed": ["trade:us:A", "orderbook:us:A"],
+        })
+        accepted = json.dumps({
+            "type": "message", "topic": "orderbook:us:A", "data": self.book(START),
+        })
         fixtures = (
-            (b'{"secret-fixture"', "invalid_json"),
-            ('["secret-fixture"]', "non_object"),
-            ('{"type": "secret-fixture"}', "unknown_type"),
+            ((malformed,), ((malformed, "invalid_json"),), False),
+            (('["secret-fixture"]',), (('["secret-fixture"]', "non_object"),), False),
+            (('{"type": "secret-fixture"}',),
+             (('{"type": "secret-fixture"}', "unknown_type"),), False),
+            ((acknowledgement, unsubscribed, accepted, malformed),
+             ((unsubscribed, "unexpected_topic"), (malformed, "invalid_json")), True),
         )
-        for wire, code in fixtures:
+        for frames, rejected, valid_book_expected in fixtures:
             with (
-                self.subTest(code=code),
+                self.subTest(code=rejected[0][1]),
                 tempfile.TemporaryDirectory() as directory,
                 patch.dict("sys.modules", modules),
                 patch("tools.run_async_live_validation.Settings.load", return_value=settings),
@@ -346,32 +357,31 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(Runtime, "consume", new=select),
             ):
                 connect.reset_mock()
-                ws.recv = AsyncMock(return_value=wire)
+                ws.recv = AsyncMock(side_effect=frames)
                 output = Path(directory) / "run"
                 with self.assertRaisesRegex(SystemExit, "Live validation failed"):
                     await campaign(output, 30, 100)
                 connect.assert_called_once()
-                ws.recv.assert_awaited_once()
+                self.assertEqual(ws.recv.await_count, len(frames))
                 with gzip.open(output / "market.jsonl.gz", "rt") as stream:
                     raw = stream.read()
                 self.assertNotIn("secret-fixture", raw)
                 self.assertNotIn("fixture-token", raw)
-                observed = [
-                    row
-                    for line in raw.splitlines()
-                    if (row := json.loads(line)).get("kind") == "websocket_frame_failure"
-                ]
-                data = wire.encode("utf-8") if isinstance(wire, str) else wire
-                self.assertEqual(
-                    observed,
-                    [
-                        {
-                            "kind": "websocket_frame_failure",
-                            "received_at": START.isoformat(),
-                            "frame_type": "text" if isinstance(wire, str) else "binary",
-                            "byte_length": len(data),
-                            "sha256": hashlib.sha256(data).hexdigest(),
-                            "code": code,
-                        }
-                    ],
-                )
+                rows = [json.loads(line) for line in raw.splitlines()]
+                observed = [row for row in rows if row.get("kind") == "websocket_frame_failure"]
+                expected = []
+                for wire, code in rejected:
+                    data = wire.encode("utf-8") if isinstance(wire, str) else wire
+                    expected.append({
+                        "kind": "websocket_frame_failure",
+                        "received_at": START.isoformat(),
+                        "frame_type": "text" if isinstance(wire, str) else "binary",
+                        "byte_length": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "code": code,
+                    })
+                self.assertEqual(observed, expected)
+                published = [row for row in rows if "published_sequence" in row]
+                self.assertEqual(len(published), int(valid_book_expected))
+                if valid_book_expected:
+                    self.assertEqual(published[0]["frame"]["topic"], "orderbook:us:A")
