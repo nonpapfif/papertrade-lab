@@ -81,6 +81,59 @@ class RuntimeAuditTests(unittest.TestCase):
         )
         self.assertNotIn("secret", repr(tuple(incident)))
 
+    def test_noop_recovery_skips_writer_lock_and_sees_other_client_incidents(self) -> None:
+        other = RuntimeAudit(self.path, "run-a", clock=self.clock)
+        with closing(sqlite3.connect(self.path)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            key = self.audit.record("gateway", "failure", state="resolved")
+        self.assertTrue(self.audit.healthy)
+        self.assertEqual(self.rows(), [])
+
+        self.assertEqual(other.record("gateway", "failure"), key)
+        self.at += 1
+        self.assertEqual(self.audit.record("gateway", "failure", state="resolved"), key)
+        self.assertEqual(
+            tuple(self.rows()[0][column] for column in ("state", "last_at", "occurrences")),
+            ("resolved", self.at, 1),
+        )
+
+        self.assertEqual(other.record("gateway", "failure"), key)
+        with closing(sqlite3.connect(self.path)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(RuntimeAuditError):
+                self.audit.record("gateway", "failure", state="resolved")
+        self.assertFalse(self.audit.healthy)
+        self.assertEqual(self.rows()[0]["state"], "open")
+
+    def test_completion_batch_rolls_back_worker_updates_and_recovery_on_storage_error(self) -> None:
+        self.audit.record("journal", "append_failed")
+        for component in ("ordered_dispatch", "journal"):
+            self.audit.heartbeat(component, status="active", timeout=10, progress=4)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("""
+                CREATE TRIGGER reject_journal_completion
+                BEFORE INSERT ON runtime_workers
+                WHEN NEW.component='journal' AND NEW.status='idle'
+                BEGIN SELECT RAISE(ABORT, 'fixture completion write failure'); END
+            """)
+
+        with self.assertRaisesRegex(RuntimeAuditError, "idle_workers"):
+            self.audit.idle_workers(
+                ("ordered_dispatch", "journal"),
+                progress=5,
+                recoveries=(("journal", "append_failed", None),),
+            )
+        self.assertEqual(self.rows()[0]["state"], "open")
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute("SELECT status,progress FROM runtime_workers").fetchall()
+        self.assertEqual(rows, [("active", 4), ("active", 4)])
+        self.assertEqual(json.loads(self.emergency[0])["action"], "idle_workers")
+        with (
+            self.assertRaisesRegex(RuntimeAuditError, "storage is unhealthy"),
+            self.audit.publication_guard(),
+        ):
+            self.fail("An incomplete audit batch allowed publication")
+
     def test_watchdog_distinguishes_idle_stall_death_and_backlog(self) -> None:
         self.audit.heartbeat("coordinator", status="waiting")
         self.audit.heartbeat("selector", status="idle")

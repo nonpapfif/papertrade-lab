@@ -523,17 +523,17 @@ class SharedFeedSlots:
                     **command_result[2],
                 )
         if self.audit is not None:
-            self.audit.heartbeat("ordered_dispatch", progress=self.consumed, pid=os.getpid())
+            cut_context = {"sequence": self.consumed}
+            self.audit.idle_workers(
+                ("ordered_dispatch", "journal") if saved is None else ("ordered_dispatch",),
+                progress=self.consumed,
+                pid=os.getpid(),
+                recoveries=(
+                    ("ordered_dispatch", "cut_failed", cut_context),
+                    ("journal", "append_failed", cut_context),
+                ) if saved is None else (),
+            )
         if saved is None:
-            if self.audit is not None:
-                self.audit.heartbeat("journal", progress=self.consumed, pid=os.getpid())
-                for module in ("ordered_dispatch", "journal"):
-                    self.audit.record(
-                        module,
-                        "cut_failed" if module == "ordered_dispatch" else "append_failed",
-                        {"sequence": self.consumed},
-                        state="resolved",
-                    )
             for _, slot in self.active():
                 slot.runtime.launch_review()
 
