@@ -803,6 +803,7 @@ class Runtime:
                         "ordered_dispatch", status="active", timeout=DISPATCH_TIMEOUT,
                         progress=sequence - 1, oldest_pending_at=time.time() - (started - queued),
                         backlog_timeout=DISPATCH_BACKLOG_TIMEOUT, pid=os.getpid(),
+                        durable=False,
                     )
                 entry = {
                     "sequence": sequence,
@@ -834,9 +835,13 @@ class Runtime:
             else:
                 self._acknowledge_cut(sequence, durable=self.journal is not None)
                 if self.audit is not None:
-                    self.audit.heartbeat("ordered_dispatch", progress=sequence, pid=os.getpid())
+                    self.audit.heartbeat(
+                        "ordered_dispatch", progress=sequence, pid=os.getpid(), durable=False,
+                    )
                     if self.journal is not None:
-                        self.audit.heartbeat("journal", progress=sequence, pid=os.getpid())
+                        self.audit.heartbeat(
+                            "journal", progress=sequence, pid=os.getpid(), durable=False,
+                        )
                 self.launch_review()
             finally:
                 self.processing_times.append(time.monotonic() - started)
@@ -885,6 +890,7 @@ class Runtime:
                     self.audit.operation(
                         "features", "computation_failed", {"symbol": symbol, "sequence": sequence},
                         timeout=5,
+                        local_recovery=True,
                     )
                     if self.audit is not None else nullcontext()
                 ):
@@ -1255,6 +1261,7 @@ class Runtime:
         if self.audit is not None:
             self.audit.heartbeat(
                 "journal", status="active", timeout=10, progress=entry["sequence"], pid=os.getpid(),
+                durable=False,
             )
             self.assert_accounts_committable()
         record = {
@@ -1344,7 +1351,9 @@ class Runtime:
             raise
         self._acknowledge_cut(self.sequence, durable=self.journal is not None)
         if self.audit is not None and self.journal is not None:
-            self.audit.heartbeat("journal", progress=self.sequence, pid=os.getpid())
+            self.audit.heartbeat(
+                "journal", progress=self.sequence, pid=os.getpid(), durable=False,
+            )
         self.record(kind, sequence=self.sequence, previous_at=last, at=at)
 
     def status(self, at: str | None = None) -> dict[str, Any]:
@@ -2037,11 +2046,15 @@ async def _campaign(
             def collector_progress(*, waiting: bool = False) -> None:
                 nonlocal progress
                 if waiting:
-                    audit.heartbeat("collector", status="waiting", progress=progress, pid=os.getpid())
+                    audit.heartbeat(
+                        "collector", status="waiting", progress=progress, pid=os.getpid(),
+                        durable=False,
+                    )
                 else:
                     progress += 1
                     audit.heartbeat(
                         "collector", status="active", timeout=30, progress=progress, pid=os.getpid(),
+                        durable=False,
                     )
 
             async def symbol_failure(symbol: str, error: ApiError) -> None:
@@ -2261,7 +2274,7 @@ async def _campaign(
                 record("rest_cutoff")
             finally:
                 if audit.healthy:
-                    audit.heartbeat("collector", status="idle", pid=os.getpid())
+                    audit.heartbeat("collector", status="idle", pid=os.getpid(), durable=False)
 
         async def stream() -> None:
             def rejected_frame(frame: str | bytes, received: str, code: str) -> ValueError:

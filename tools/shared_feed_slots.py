@@ -6,7 +6,7 @@ import asyncio
 import copy
 import os
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -97,6 +97,7 @@ class SharedFeedSlots:
         self.commands: dict[str, tuple[SlotCommand, str, dict[str, Any]]] = {}
         self.queued_commands: set[str] = set()
         self.queue: asyncio.Queue[tuple[dict[str, Any], float]] = asyncio.Queue()
+        self._pending_times: deque[float] = deque()
         self.sequence = 0
         self.consumed = 0
         self.processing_clock = ProcessingClock()
@@ -206,6 +207,19 @@ class SharedFeedSlots:
             )
         )
         self.max_queue = max(self.max_queue, self.queue.qsize())
+        if self.audit is not None:
+            self._pending_times.append(time.time())
+            if len(self._pending_times) == 1:
+                self._track_backlog()
+
+    def _track_backlog(self) -> None:
+        if self.audit is not None:
+            oldest = self._pending_times[0] if self._pending_times else None
+            self.audit.heartbeat(
+                "ordered_dispatch", worker_id="queue", oldest_pending_at=oldest,
+                backlog_timeout=DISPATCH_BACKLOG_TIMEOUT if oldest is not None else None,
+                durable=False,
+            )
 
     def poll_controls(self) -> None:
         for command in self.control.pending():
@@ -226,6 +240,9 @@ class SharedFeedSlots:
             try:
                 async with self.committing:
                     await self._apply(entry, delay)
+                if self.audit is not None:
+                    self._pending_times.popleft()
+                    self._track_backlog()
             finally:
                 self.queue.task_done()
 
@@ -384,6 +401,7 @@ class SharedFeedSlots:
                 "configuration_failed",
                 {"account_id": command.slot_id, "sequence": entry["sequence"]},
                 timeout=5,
+                local_recovery=True,
             )
             if self.audit is not None
             else nullcontext()
@@ -423,9 +441,8 @@ class SharedFeedSlots:
                     status="active",
                     timeout=DISPATCH_TIMEOUT,
                     progress=self.consumed,
-                    oldest_pending_at=time.time() - delay,
-                    backlog_timeout=DISPATCH_BACKLOG_TIMEOUT,
                     pid=os.getpid(),
+                    durable=False,
                 )
             command_result = await self._prepare_cut(entry, delay, saved=saved)
             for slot in self.slots.values():
@@ -440,6 +457,7 @@ class SharedFeedSlots:
                         timeout=10,
                         progress=self.consumed,
                         pid=os.getpid(),
+                        durable=False,
                     )
                 try:
                     with self.audit.publication_guard() if self.audit is not None else nullcontext():
@@ -501,7 +519,10 @@ class SharedFeedSlots:
                 command, disposition, _ = command_result
                 context = {"account_id": command.slot_id, "request_id": command.id}
                 with (
-                    self.audit.operation("ordered_dispatch", "control_projection_failed", context)
+                    self.audit.operation(
+                        "ordered_dispatch", "control_projection_failed", context,
+                        local_recovery=True,
+                    )
                     if self.audit is not None
                     else nullcontext()
                 ):
@@ -523,16 +544,20 @@ class SharedFeedSlots:
                     **command_result[2],
                 )
         if self.audit is not None:
-            self.audit.heartbeat("ordered_dispatch", progress=self.consumed, pid=os.getpid())
+            self.audit.heartbeat(
+                "ordered_dispatch", progress=self.consumed, pid=os.getpid(), durable=False,
+            )
         if saved is None:
             if self.audit is not None:
-                self.audit.heartbeat("journal", progress=self.consumed, pid=os.getpid())
+                self.audit.heartbeat(
+                    "journal", progress=self.consumed, pid=os.getpid(), durable=False,
+                )
                 for module in ("ordered_dispatch", "journal"):
-                    self.audit.record(
+                    self.audit.recover(
                         module,
                         "cut_failed" if module == "ordered_dispatch" else "append_failed",
                         {"sequence": self.consumed},
-                        state="resolved",
+                        local=True,
                     )
             for _, slot in self.active():
                 slot.runtime.launch_review()

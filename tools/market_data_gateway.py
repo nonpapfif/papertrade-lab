@@ -151,7 +151,8 @@ class MarketDataGateway:
     def _operation(self, component: str, code: str) -> AbstractContextManager[None]:
         return (
             self._audit.operation(
-                component, code, timeout=120 if component == "market_data_gateway" else 10
+                component, code, timeout=120 if component == "market_data_gateway" else 10,
+                local_recovery=True,
             )
             if self._audit is not None
             else nullcontext()

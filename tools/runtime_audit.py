@@ -39,6 +39,7 @@ class RuntimeAuditSink(Protocol):
         context: Mapping[str, object] | None = None,
         *,
         timeout: float | None = None,
+        local_recovery: bool = False,
     ) -> AbstractContextManager[None]: ...
 
     def record(
@@ -294,6 +295,8 @@ class RuntimeAudit:
         self._emergency_sink = emergency
         self._storage_failed = Event()
         self._publication_lock = RLock()
+        self._health_lock = Lock()
+        self._live_workers: dict[tuple[str, str], dict[str, Any]] = {}
         with self._transaction("initialize", initialize=True) as db:
             for statement in _SCHEMA.strip().rstrip(";").split(";"):
                 db.execute(statement)
@@ -305,6 +308,13 @@ class RuntimeAudit:
                     "ALTER TABLE runtime_incidents ADD COLUMN severity TEXT NOT NULL"
                     " DEFAULT 'error' CHECK (severity IN ('warning', 'error'))"
                 )
+            self._open_incidents = {
+                row["id"]
+                for row in db.execute(
+                    "SELECT id FROM runtime_incidents WHERE run_id=? AND state='open'",
+                    (self.run_id,),
+                )
+            }
 
     @property
     def healthy(self) -> bool:
@@ -344,12 +354,18 @@ class RuntimeAudit:
 
     @contextmanager
     def _transaction(
-        self, action: str, *, initialize: bool = False
+        self, action: str, *, initialize: bool = False, write: bool = True
     ) -> Iterator[sqlite3.Connection]:
-        # Acquire the publication lock before opening either SQLite write transaction.
+        # Detect a storage failure before allowing the next publication.
         with self._publication_lock:
             try:
-                with closing(sqlite3.connect(self.path, timeout=self._busy_timeout)) as db, db:
+                path = self.path if write else self.path.absolute().as_uri() + "?mode=ro"
+                with (
+                    closing(
+                        sqlite3.connect(path, timeout=self._busy_timeout, uri=not write)
+                    ) as db,
+                    db,
+                ):
                     db.row_factory = sqlite3.Row
                     if (
                         initialize
@@ -357,7 +373,8 @@ class RuntimeAudit:
                         and db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal"
                     ):
                         raise sqlite3.OperationalError("Could not enable WAL for runtime audit")
-                    db.execute("BEGIN IMMEDIATE")
+                    if write:
+                        db.execute("BEGIN IMMEDIATE")
                     yield db
             except (sqlite3.Error, OSError) as error:
                 self._storage_failed.set()
@@ -366,6 +383,12 @@ class RuntimeAudit:
                 return
         self._emergency(action, failure)
         raise RuntimeAuditError(f"Runtime audit storage failed during {action}") from None
+
+    def _incident_id(self, component: str, code: str, context: dict[str, str | int]) -> str:
+        identity = [context.get(key) for key in _IDENTITIES]
+        return hashlib.sha256(
+            json.dumps([self.run_id, component, code, identity]).encode()
+        ).hexdigest()[:24]
 
     def _record(
         self,
@@ -380,10 +403,7 @@ class RuntimeAudit:
         aggregate: bool = True,
         severity: IncidentSeverity = "error",
     ) -> str:
-        identity = [context.get(key) for key in _IDENTITIES]
-        key = hashlib.sha256(
-            json.dumps([self.run_id, component, code, identity]).encode()
-        ).hexdigest()[:24]
+        key = self._incident_id(component, code, context)
         if state == "resolved":
             db.execute(
                 """UPDATE runtime_incidents SET state='resolved', last_at=?
@@ -440,17 +460,44 @@ class RuntimeAudit:
     ) -> str:
         if severity not in ("warning", "error"):
             raise ValueError("Unknown audit severity")
-        with self._transaction("record") as db:
-            return self._record(
-                db,
-                _label(component),
-                _label(code),
-                _safe_context(context),
-                self._clock(),
-                state,
-                error,
-                severity=severity,
-            )
+        with self._publication_lock:
+            with self._transaction("record") as db:
+                key = self._record(
+                    db,
+                    _label(component),
+                    _label(code),
+                    _safe_context(context),
+                    self._clock(),
+                    state,
+                    error,
+                    severity=severity,
+                )
+            if state == "open":
+                self._open_incidents.add(key)
+            else:
+                self._open_incidents.discard(key)
+        return key
+
+    def recover(
+        self,
+        component: str,
+        code: str,
+        context: Mapping[str, object] | None = None,
+        *,
+        local: bool = False,
+    ) -> None:
+        """Resolve an open incident. Use local only for identities owned by this runtime."""
+        key = self._incident_id(_label(component), _label(code), _safe_context(context))
+        with self._publication_lock:
+            if local:
+                opened = key in self._open_incidents
+            else:
+                with self._transaction("read_recovery", write=False) as db:
+                    opened = db.execute(
+                        "SELECT 1 FROM runtime_incidents WHERE id=? AND state='open'", (key,),
+                    ).fetchone() is not None
+            if opened:
+                self.record(component, code, context, state="resolved")
 
     def report_exception(
         self,
@@ -497,6 +544,7 @@ class RuntimeAudit:
         context: Mapping[str, object] | None = None,
         *,
         timeout: float | None = None,
+        local_recovery: bool = False,
     ) -> Iterator[None]:
         identity = (component, code)
         lane = 0
@@ -509,7 +557,6 @@ class RuntimeAudit:
             label = _label(code)
             suffix = hashlib.sha256(label.encode()).hexdigest()[:8]
             worker_id = f"{label[:48]}-{suffix}-{os.getpid()}-{id(self):x}-{lane}"
-        original_error = None
         try:
             if timeout is not None:
                 self.heartbeat(
@@ -518,26 +565,20 @@ class RuntimeAudit:
                     status="active",
                     timeout=timeout,
                     pid=os.getpid(),
+                    durable=False,
                 )
             yield
         except BaseException as error:
-            original_error = error
             if not isinstance(error, asyncio.CancelledError):
                 self.report_exception(component, code, error, context)
             raise
         else:
-            self.record(component, code, context, state="resolved")
+            self.recover(component, code, context, local=local_recovery)
         finally:
             if timeout is not None:
-                try:
-                    self.heartbeat(component, worker_id=worker_id, status="idle")
-                except RuntimeAuditError:
-                    if original_error is None:
-                        raise
-                    original_error.add_note("The runtime audit could not clear operation health.")
-                finally:
-                    with self._operation_lock:
-                        self._operation_lanes[identity].remove(lane)
+                self.heartbeat(component, worker_id=worker_id, durable=False)
+                with self._operation_lock:
+                    self._operation_lanes[identity].remove(lane)
 
     @contextmanager
     def capture_runtime_failures(self, component: str) -> Iterator[None]:
@@ -826,8 +867,9 @@ class RuntimeAudit:
         oldest_pending_at: float | None = None,
         backlog_timeout: float | None = None,
         pid: int | None = None,
+        durable: bool = True,
     ) -> None:
-        """Refresh liveness. During active work, advance progress to reset its deadline."""
+        """Refresh local liveness or register a worker across processes."""
         _validate_worker_state(
             status, timeout, progress, progress_timeout, oldest_pending_at, backlog_timeout, pid
         )
@@ -837,6 +879,26 @@ class RuntimeAudit:
             float(value) if value is not None else None
             for value in (timeout, progress_timeout, oldest_pending_at, backlog_timeout)
         )
+        if not durable:
+            key = _label(component), _label(worker_id)
+            with self._health_lock:
+                at = self._clock()
+                previous = self._live_workers.get(key)
+                progress_at = (
+                    previous["progress_at"]
+                    if previous is not None
+                    and previous["status"] == status == "active"
+                    and previous["progress"] == progress
+                    else at
+                )
+                self._live_workers[key] = {
+                    "component": key[0], "worker_id": key[1],
+                    "status": status, "heartbeat_at": at, "timeout": timeout,
+                    "progress": progress, "progress_at": progress_at,
+                    "progress_timeout": progress_timeout, "oldest_pending_at": oldest_pending_at,
+                    "backlog_timeout": backlog_timeout, "pid": pid,
+                }
+            return
         with self._transaction("heartbeat") as db:
             at = self._clock()
             db.execute(
@@ -875,11 +937,23 @@ class RuntimeAudit:
         issues = []
         with self._transaction("scan_health") as db:
             at = self._clock()
-            rows = db.execute(
-                "SELECT * FROM runtime_workers WHERE run_id=? ORDER BY component, worker_id",
-                (self.run_id,),
-            ).fetchall()
-            for row in rows:
+            rows: dict[tuple[str, str], sqlite3.Row | dict[str, Any]] = {
+                (row["component"], row["worker_id"]): row
+                for row in db.execute(
+                    "SELECT * FROM runtime_workers WHERE run_id=? ORDER BY component, worker_id",
+                    (self.run_id,),
+                )
+            }
+            with self._health_lock:
+                rows.update(self._live_workers)
+            open_incidents = {
+                row["id"]
+                for row in db.execute(
+                    "SELECT id FROM runtime_incidents WHERE run_id=? AND state='open'",
+                    (self.run_id,),
+                )
+            }
+            for row in rows.values():
                 component, worker_id = row["component"], row["worker_id"]
                 context: dict[str, str | int] = {
                     "worker_id": _label(worker_id) if isinstance(worker_id, str) else "[redacted]"
@@ -920,7 +994,8 @@ class RuntimeAudit:
                         )
                     )
                     continue
-                self._record(db, component, "worker_state_invalid", context, at, "resolved")
+                if self._incident_id(component, "worker_state_invalid", context) in open_incidents:
+                    self._record(db, component, "worker_state_invalid", context, at, "resolved")
                 dead = _worker_dead(row["pid"])
                 missing = (
                     not dead
@@ -939,15 +1014,16 @@ class RuntimeAudit:
                 ):
                     if overdue:
                         issues.append(RuntimeHealthIssue(component, worker_id, code))
-                    self._record(
-                        db,
-                        component,
-                        code,
-                        context,
-                        at,
-                        "open" if overdue else "resolved",
-                        aggregate=False,
-                    )
+                    if overdue or self._incident_id(component, code, context) in open_incidents:
+                        self._record(
+                            db,
+                            component,
+                            code,
+                            context,
+                            at,
+                            "open" if overdue else "resolved",
+                            aggregate=False,
+                        )
         return tuple(issues)
 
     def watch(self, stop_event: Event, *, interval: float = 1.0) -> None:
