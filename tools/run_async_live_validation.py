@@ -102,6 +102,7 @@ SOURCES = (
     "tools/week_hypotheses.py",
 )
 HELD_QUOTE_RETRY_SECONDS = 5.0
+STALE_BOOK_RETRY_SECONDS = 2 * HELD_QUOTE_RETRY_SECONDS
 
 MARKET_CAPABILITY_SNAPSHOT = {
     "source": "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json",
@@ -1522,7 +1523,12 @@ def write_comparison(
     return result
 
 
-async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
+async def wait_for_rest_cooldown(
+    error: ApiError,
+    deadline: float,
+    *,
+    before_wait: Callable[[], Awaitable[None]] | None = None,
+) -> None:
     if error.status in (401, 403):
         raise error
     if error.status != 429 and error.code != "cooldown":
@@ -1530,6 +1536,9 @@ async def wait_for_rest_cooldown(error: ApiError, deadline: float) -> None:
     if error.retry_at is None or not math.isfinite(error.retry_at):
         raise error
     delay = min(error.retry_at - time.time(), deadline - time.monotonic())
+    if delay > 0 and before_wait is not None:
+        await before_wait()
+        delay = min(error.retry_at - time.time(), deadline - time.monotonic())
     if delay > 0:
         await asyncio.sleep(delay)
 
@@ -1542,6 +1551,7 @@ async def recover_held_quotes(
     *,
     gateway: MarketDataGateway | None = None,
     market: PaperMarket = US,
+    stale_until: dict[str, float] | None = None,
 ) -> None:
     if gateway is None:
         stale = runtime.stale_held_symbols(now())
@@ -1560,14 +1570,20 @@ async def recover_held_quotes(
             if protected
             else {}
         )
-        stale = protected - {
+        usable = {
             symbol for symbol, book in cached.items() if book_has_usable_depth(book, market)
         }
+        stale = protected - usable
+        if stale_until is not None:
+            for symbol in usable:
+                stale_until.pop(symbol, None)
     for symbol in sorted(stale):
         current = time.monotonic()
         if current >= deadline:
             break
-        if current - attempted_at.get(symbol, -math.inf) >= HELD_QUOTE_RETRY_SECONDS:
+        if current - attempted_at.get(symbol, -math.inf) >= HELD_QUOTE_RETRY_SECONDS and (
+            stale_until is None or current >= stale_until.get(symbol, -math.inf)
+        ):
             await fetch_book(symbol)
             attempted_at[symbol] = time.monotonic()
 
@@ -1615,19 +1631,29 @@ async def fetch_rest_book(
     *,
     repair: bool = False,
     market: PaperMarket = US,
+    attempted_at: dict[str, float] | None = None,
+    stale_until: dict[str, float] | None = None,
 ) -> None:
+    current = time.monotonic()
+    if attempted_at is not None and (
+        current - attempted_at.get(symbol, -math.inf) < HELD_QUOTE_RETRY_SECONDS
+    ):
+        return
+    if stale_until is not None and current < stale_until.get(symbol, -math.inf):
+        return
     evidence = {}
     try:
         if isinstance(client, MarketDataGateway):
             schedule = KR_FEES if market is KR else DEFAULT_FEES
             result = await client.book(
-                market.code, symbol, max_age=schedule["max_quote_age_seconds"]
+                market.code, symbol, max_age=schedule["max_quote_age_seconds"],
+                cache_usable=lambda row: book_has_usable_depth(row, market),
             )
             observation = result.require(symbol)
             if symbol in result.cache_hits:
-                if book_has_usable_depth(observation, market):
-                    return
-                observation = (await client.book(market.code, symbol)).require(symbol)
+                if stale_until is not None:
+                    stale_until.pop(symbol, None)
+                return
             book, received = observation.payload, observation.received_time
             evidence = {
                 "source_identity": observation.source_identity,
@@ -1638,7 +1664,19 @@ async def fetch_rest_book(
             received = now()
     except ApiError as error:
         await symbol_failure(symbol, error)
+        current = time.monotonic()
+        if attempted_at is not None:
+            attempted_at[symbol] = current
+        if stale_until is not None:
+            if error.code == "stale_market_data":
+                stale_until[symbol] = current + STALE_BOOK_RETRY_SECONDS
+            else:
+                stale_until.pop(symbol, None)
         return
+    if attempted_at is not None:
+        attempted_at[symbol] = time.monotonic()
+    if stale_until is not None:
+        stale_until.pop(symbol, None)
     raw.write(
         json.dumps(
             {
@@ -2041,6 +2079,7 @@ async def _campaign(
             previous: dict[str, float] = {}
             metadata: dict[str, dict] = {}
             repairs: dict[str, float] = {}
+            stale_books: dict[str, float] = {}
             progress = 0
 
             def collector_progress(*, waiting: bool = False) -> None:
@@ -2057,7 +2096,13 @@ async def _campaign(
                         durable=False,
                     )
 
-            async def symbol_failure(symbol: str, error: ApiError) -> None:
+            async def symbol_failure(
+                symbol: str, error: ApiError, *, chart_request: bool = False,
+            ) -> None:
+                async def before_chart_wait() -> None:
+                    await recover_held()
+                    collector_progress(waiting=True)
+
                 audit.report_exception(
                     "collector", "rest_symbol_failure", error,
                     {"market": market.code, "symbol": symbol}, severity="warning",
@@ -2070,19 +2115,23 @@ async def _campaign(
                     retry_at=error.retry_at,
                 )
                 collector_progress(waiting=True)
-                await wait_for_rest_cooldown(error, deadline)
+                # Chart cooldown leaves the existing MARKET_DATA limiter available.
+                await wait_for_rest_cooldown(
+                    error, deadline, before_wait=before_chart_wait if chart_request else None,
+                )
                 collector_progress()
 
             async def repair_book(symbol: str) -> None:
                 await fetch_rest_book(
                     shared_gateway, symbol, raw, runtime.publish, symbol_failure,
-                    repair=True, market=market,
+                    repair=True, market=market, stale_until=stale_books,
                 )
 
             async def recover_held() -> None:
                 collector_progress()
                 await recover_held_quotes(
-                    runtime, repair_book, repairs, deadline, gateway=shared_gateway, market=market
+                    runtime, repair_book, repairs, deadline, gateway=shared_gateway, market=market,
+                    stale_until=stale_books,
                 )
 
             cycle = 0
@@ -2234,17 +2283,16 @@ async def _campaign(
                                 received=observation.received_time,
                             )
                     except ApiError as error:
-                        await symbol_failure(symbol, error)
+                        await symbol_failure(symbol, error, chart_request=True)
                         continue
                     await recover_held()
                     current = time.monotonic()
                     if current >= deadline:
                         break
-                    if current - repairs.get(symbol, -math.inf) >= HELD_QUOTE_RETRY_SECONDS:
-                        await fetch_rest_book(
-                            shared_gateway, symbol, raw, runtime.publish, symbol_failure,
-                            market=market,
-                        )
+                    await fetch_rest_book(
+                        shared_gateway, symbol, raw, runtime.publish, symbol_failure,
+                        market=market, attempted_at=repairs, stale_until=stale_books,
+                    )
                 elapsed = time.monotonic() - begin
                 stats["rest_cycles"].append(
                     {
