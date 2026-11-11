@@ -2502,6 +2502,8 @@ async def _campaign(
         ValueError,
         KeyError,
         TypeError,
+        AttributeError,
+        IndexError,
         OverflowError,
         RuntimeError,
         SafetyError,

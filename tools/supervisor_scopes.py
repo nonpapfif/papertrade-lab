@@ -85,6 +85,7 @@ _OFFLINE_TEST_IDS = (
 _REPAIR_HOST = _REPAIR_FIXTURE + ".test_detached_repaired_worker_replays_and_appends_once"
 _REPAIR_OFFLINE = (
     _REPAIR_FIXTURE + ".test_failure_requires_exit_identity_and_rejects_auth_failure",
+    _REPAIR_FIXTURE + ".test_worker_runtime_errors_produce_eligible_failed_status_after_replay",
     _REPAIR_FIXTURE + ".test_resumed_failure_has_separate_handoff_and_blocks_further_launch",
     _REPAIR_FIXTURE + ".test_close_preserves_recovered_lineage_and_blocks_stale_capacity",
     _REPAIR_FIXTURE + ".test_repair_keeps_original_header_and_requires_accepted_new_book",

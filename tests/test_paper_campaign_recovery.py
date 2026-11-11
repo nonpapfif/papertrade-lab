@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 from papertrade.jsonio import atomic_json, read_json
-from tools import adaptive_journal
+from tools import adaptive_journal, run_async_live_validation
 from tools import schedule_async_live_validation as scheduler
 from tools.adaptive_journal import AdaptiveJournal, JournalError, read_resumed_input, read_status
 from tools.autotest_supervisor import REPAIR_STATIC_CHECKS, Supervisor
@@ -22,6 +23,8 @@ from tools.paper_campaign import recovery, repair_publication
 from tools.paper_campaign.controller import Campaign
 from tools.paper_campaign.recovery import SessionRecovery
 from tools.paper_market import US
+from tools.shared_feed_slots import SharedFeedSlots
+from tools.slot_control import SPOOL_NAME, SlotControl
 from tools.supervisor_scopes import REPAIR_SCOPE
 
 
@@ -88,6 +91,50 @@ class RepairFixture(unittest.TestCase):
         atomic_json(status, {"state": "failed", "error_type": "RuntimeError"})
         (self.schedule / "job" / "target.json").unlink()
         self.assertIsNone(recovery.collect_failure(self.output, self.handoff))
+
+    def test_worker_runtime_errors_produce_eligible_failed_status_after_replay(self) -> None:
+        spool = self.schedule / SPOOL_NAME
+        self.journal.unlink()
+        identity = run_async_live_validation.journal_identity(
+            1000, self.end, slot_control=spool, campaign_seeds={}
+        )
+        with (
+            SlotControl.open(spool, initialize=True) as control,
+            AdaptiveJournal.open(self.journal, identity, resume=False) as journal,
+        ):
+            slots = SharedFeedSlots(
+                Mock(), run_async_live_validation.subscription_set, Mock(), journal, control,
+                session_seeds={}, concurrent_accounts=True,
+            )
+            asyncio.run(slots.marker("clock", datetime.now(UTC).isoformat()))
+
+        run = self.schedule / "run"
+        for error in (ValueError, AttributeError, IndexError):
+            with self.subTest(error=error.__name__):
+                run.rename(self.schedule / f"previous-{error.__name__}")
+                with (
+                    patch.object(run_async_live_validation.Settings, "load", side_effect=error),
+                    patch.object(run_async_live_validation, "MarketClient") as market_client,
+                    self.assertRaisesRegex(SystemExit, "Live validation failed"),
+                ):
+                    asyncio.run(run_async_live_validation.campaign(
+                        run,
+                        60,
+                        1000,
+                        profile="broker-constrained",
+                        adaptive=True,
+                        end_epoch=self.end,
+                        journal_path=self.journal,
+                        slot_control=spool,
+                        campaign_seeds={},
+                        resume=True,
+                    ))
+                market_client.assert_not_called()
+                status = read_json(run / "status.json")
+                self.assertEqual(status["state"], "failed")
+                self.assertEqual(status["error_type"], error.__name__)
+                self.assertGreaterEqual(status["recovered_from"]["records"], 1)
+                self.assertIsNotNone(recovery.collect_failure(self.output, self.handoff))
 
     def test_repair_keeps_original_header_and_requires_accepted_new_book(self) -> None:
         identity = {**self.identity, "source_sha256": {"stream.py": "new"}}
