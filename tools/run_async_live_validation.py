@@ -2457,7 +2457,8 @@ async def _campaign(
                                     symbol = topic.rsplit(":", 1)[1]
                                     data = message.get("data")
                                     if not isinstance(data, dict):
-                                        raise rejected_frame(wire, received, "invalid_orderbook_data")
+                                        rejected_frame(wire, received, "invalid_orderbook_data")
+                                        continue
                                     try:
                                         observation = shared_gateway.ingest_book(
                                             market.code, symbol, data,

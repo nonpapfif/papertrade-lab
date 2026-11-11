@@ -331,6 +331,7 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         malformed = b'{"secret-fixture"'
         unsubscribed = json.dumps({"type": "message", "topic": "orderbook:us:secret-fixture"})
+        bad_book = json.dumps({"type": "message", "topic": "orderbook:us:A", "data": []})
         acknowledgement = json.dumps({
             "type": "subscriptions", "subscribed": ["trade:us:A", "orderbook:us:A"],
         })
@@ -344,6 +345,8 @@ class SharedDataIntegrationTests(unittest.IsolatedAsyncioTestCase):
              (('{"type": "secret-fixture"}', "unknown_type"),), False),
             ((acknowledgement, unsubscribed, accepted, malformed),
              ((unsubscribed, "unexpected_topic"), (malformed, "invalid_json")), True),
+            ((acknowledgement, bad_book, accepted, malformed),
+             ((bad_book, "invalid_orderbook_data"), (malformed, "invalid_json")), True),
         )
         for frames, rejected, valid_book_expected in fixtures:
             with (
