@@ -4,21 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import time
 from collections import Counter
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from papertrade.clock import utc_iso as now
 from papertrade.core import Settings
-from tools.adaptive_journal import AdaptiveJournal, JournalError, encode
+from papertrade.jsonio import journal_json as encode
+from tools.adaptive_journal import AdaptiveJournal, JournalError
 from tools.async_layered_paper import ProcessingClock
-from tools.probe_toss_websocket import now
+from tools.runtime_audit import DISPATCH_BACKLOG_TIMEOUT, DISPATCH_TIMEOUT, RuntimeAudit
 from tools.slot_control import IDENTIFIER, SlotCommand, SlotControl
-from tools.us_adaptive_ai import ENTRY_OPTIONS
+from tools.strategy_catalog import ENTRY_OPTIONS
 
 if TYPE_CHECKING:
+    from tools.layered_paper import Feature
     from tools.run_async_live_validation import Runtime
 
 
@@ -67,6 +72,8 @@ class SharedFeedSlots:
         control: SlotControl,
         *,
         session_seeds: dict[str, Any] | None = None,
+        concurrent_accounts: bool = False,
+        audit: RuntimeAudit | None = None,
     ) -> None:
         self.make_runtime = make_runtime
         self.subscribe = subscribe
@@ -74,6 +81,15 @@ class SharedFeedSlots:
         self.journal = journal
         self.control = control
         self.session_seeds = session_seeds
+        self.concurrent_accounts = concurrent_accounts
+        self.audit = audit
+        self._failed_cut = False
+        self._committed_protection: set[str] | None = None
+        self._account_execution: dict[str, Any] = {
+            "measured_cuts": 0,
+            "overlap_cuts": 0,
+            "worker_pids": [],
+        }
         self.predecessors: dict[str, Slot] = {}
         self.session_closed = False
         self.review_settings: Settings | None = None
@@ -137,6 +153,8 @@ class SharedFeedSlots:
                         journal,
                         self.control,
                         session_seeds=seeds,
+                        concurrent_accounts=self.concurrent_accounts,
+                        audit=self.audit,
                     )
                     try:
                         await prior.load_predecessors(make_runtime_at)
@@ -162,6 +180,11 @@ class SharedFeedSlots:
         )
 
     def protected(self) -> set[str]:
+        if self._committed_protection is not None:
+            return self._committed_protection.copy()
+        return self._slot_protection()
+
+    def _slot_protection(self) -> set[str]:
         return {symbol for _, slot in self.active() for symbol in slot.runtime.protected()}
 
     def stale_held_symbols(self, at: str) -> set[str]:
@@ -169,7 +192,7 @@ class SharedFeedSlots:
             symbol for _, slot in self.active() for symbol in slot.runtime.stale_held_symbols(at)
         }
 
-    def publish(self, kind: str, payload: Any) -> None:
+    def publish(self, kind: str, payload: Any, *, received: str | None = None) -> None:
         self.sequence += 1
         self.queue.put_nowait(
             (
@@ -177,7 +200,7 @@ class SharedFeedSlots:
                     "sequence": self.sequence,
                     "kind": kind,
                     "payload": copy.deepcopy(payload),
-                    "received": now(),
+                    "received": received or now(),
                 },
                 time.monotonic(),
             )
@@ -216,6 +239,11 @@ class SharedFeedSlots:
             }
         )
 
+    def _configure_runtime(self, runtime: Runtime, slot_id: str) -> None:
+        runtime.concurrent_accounts = self.concurrent_accounts
+        runtime.audit = self.audit
+        runtime.account_prefix = slot_id
+
     async def _add(self, command: SlotCommand, entry: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if command.slot_id in self.slots:
             return "rejected", {"reason": "slot_id_already_used"}
@@ -232,6 +260,7 @@ class SharedFeedSlots:
         predecessor = self.predecessors.get(slot_id)
         continued_from = None
         runtime = self.make_runtime(float(capital), record)
+        self._configure_runtime(runtime, slot_id)
         if predecessor is not None:
             assert self.session_seeds is not None
             prior = predecessor.runtime
@@ -278,13 +307,12 @@ class SharedFeedSlots:
         }
 
     async def _stop(self, slot: Slot, entry: dict[str, Any], state: str) -> None:
+        slot.runtime.last_account_results = {}
         slot.state = state
         slot.stopped_sequence = entry["sequence"]
         slot.stopped_at = entry["at"]
-        await slot.runtime.close()
         if state != "parked":
-            for account in slot.runtime.accounts.values():
-                await account.cancel_pending(entry["at"])
+            await slot.runtime.cancel_accounts(entry["sequence"], entry["at"])
 
     def _branch(self, command: SlotCommand, entry: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if command.slot_id in self.slots or command.slot_id in self.predecessors:
@@ -313,6 +341,7 @@ class SharedFeedSlots:
             self.record(kind, slot_id=command.slot_id, **payload)
 
         runtime = self.make_runtime(account.book.initial_equity, record)
+        self._configure_runtime(runtime, command.slot_id)
         runtime.inherit_accounts(prior, {"incumbent": name, "candidate": name})
         runtime.configurations["incumbent"].update(current)
         runtime.configurations["candidate"].update(spec["candidate"])
@@ -349,7 +378,17 @@ class SharedFeedSlots:
         command = SlotCommand(**entry["payload"])
         if command.id in self.commands:
             raise JournalError("Duplicate committed slot command")
-        command.validate()
+        with (
+            self.audit.operation(
+                "strategy_registry",
+                "configuration_failed",
+                {"account_id": command.slot_id, "sequence": entry["sequence"]},
+                timeout=5,
+            )
+            if self.audit is not None
+            else nullcontext()
+        ):
+            command.validate()
         if command.action == "add":
             disposition, detail = await self._add(command, entry)
         elif command.action == "branch":
@@ -369,13 +408,222 @@ class SharedFeedSlots:
                 disposition, detail = "applied", {"state": state, "sequence": entry["sequence"]}
         else:
             raise JournalError("Unknown slot command")
-        result = command, disposition, detail
-        self.commands[command.id] = result
-        return result
+        return command, disposition, detail
 
     async def _apply(
         self, entry: dict[str, Any], delay: float, *, saved: dict[str, Any] | None = None
     ) -> None:
+        if self._failed_cut:
+            raise JournalError("Shared slots require a fresh journal replay")
+        self._committed_protection = self._slot_protection()
+        try:
+            if self.audit is not None:
+                self.audit.heartbeat(
+                    "ordered_dispatch",
+                    status="active",
+                    timeout=DISPATCH_TIMEOUT,
+                    progress=self.consumed,
+                    oldest_pending_at=time.time() - delay,
+                    backlog_timeout=DISPATCH_BACKLOG_TIMEOUT,
+                    pid=os.getpid(),
+                )
+            command_result = await self._prepare_cut(entry, delay, saved=saved)
+            for slot in self.slots.values():
+                slot.runtime.assert_accounts_committable()
+            if self.audit is not None and not self.audit.healthy:
+                raise JournalError("Shared runtime audit storage is unhealthy")
+            if saved is None:
+                if self.audit is not None:
+                    self.audit.heartbeat(
+                        "journal",
+                        status="active",
+                        timeout=10,
+                        progress=self.consumed,
+                        pid=os.getpid(),
+                    )
+                try:
+                    with self.audit.publication_guard() if self.audit is not None else nullcontext():
+                        self.journal.append(entry)
+                except JournalError as error:
+                    if self.audit is not None:
+                        self.audit.report_exception(
+                            "journal",
+                            "append_failed",
+                            error,
+                            {"sequence": entry["sequence"]},
+                        )
+                    raise
+        except BaseException as error:
+            self._failed_cut = True
+            for slot in self.slots.values():
+                slot.runtime.abort_accounts()
+            if (
+                self.audit is not None
+                and self.audit.healthy
+                and not isinstance(error, asyncio.CancelledError)
+            ):
+                self.audit.report_exception(
+                    "ordered_dispatch",
+                    "cut_failed",
+                    error,
+                    {"sequence": entry["sequence"]},
+                )
+            raise
+        self._committed_protection = None
+        self.consumed = entry["sequence"]
+        self.counts[entry["kind"]] += 1
+        self._record_process_evidence()
+        ack_error: Exception | None = None
+        for slot in self.slots.values():
+            try:
+                with self.audit.publication_guard() if self.audit is not None else nullcontext():
+                    slot.runtime.acknowledge_accounts()
+                if slot.stopped_sequence == self.consumed:
+                    await slot.runtime.close()
+            except Exception as error:  # noqa: BLE001 - Finish acknowledging the durable cut.
+                if self.audit is not None:
+                    self.audit.report_exception(
+                        "account_evaluation",
+                        "committed_cut_ack_failed",
+                        error,
+                        {"account_id": slot.runtime.account_prefix, "sequence": self.consumed},
+                    )
+                if ack_error is None:
+                    ack_error = error
+        if ack_error is not None:
+            self._failed_cut = True
+            if saved is None:
+                ack_error.add_note(f"Journal cut {self.consumed} is durable and requires replay.")
+            raise ack_error
+        if command_result is not None:
+            self.commands[command_result[0].id] = command_result
+            if saved is None:
+                command, disposition, _ = command_result
+                context = {"account_id": command.slot_id, "request_id": command.id}
+                with (
+                    self.audit.operation("ordered_dispatch", "control_projection_failed", context)
+                    if self.audit is not None
+                    else nullcontext()
+                ):
+                    self.control.record(*command_result)
+                if self.audit is not None and disposition == "rejected":
+                    self.audit.record(
+                        "strategy_registry",
+                        "slot_command_rejected",
+                        context,
+                        severity="warning",
+                    )
+                self.queued_commands.discard(command_result[0].id)
+                self.record(
+                    "slot_command",
+                    command_id=command_result[0].id,
+                    slot_id=command_result[0].slot_id,
+                    action=command_result[0].action,
+                    disposition=command_result[1],
+                    **command_result[2],
+                )
+        if self.audit is not None:
+            self.audit.heartbeat("ordered_dispatch", progress=self.consumed, pid=os.getpid())
+        if saved is None:
+            if self.audit is not None:
+                self.audit.heartbeat("journal", progress=self.consumed, pid=os.getpid())
+                for module in ("ordered_dispatch", "journal"):
+                    self.audit.record(
+                        module,
+                        "cut_failed" if module == "ordered_dispatch" else "append_failed",
+                        {"sequence": self.consumed},
+                        state="resolved",
+                    )
+            for _, slot in self.active():
+                slot.runtime.launch_review()
+
+    def _record_process_evidence(self) -> None:
+        if not self.concurrent_accounts:
+            return
+        results = [
+            result
+            for slot in self.slots.values()
+            for result in slot.runtime.last_account_results.values()
+            if result.sequence == self.consumed
+        ]
+        if not results:
+            return
+        self._account_execution["measured_cuts"] += 1
+        self._account_execution["worker_pids"] = sorted(
+            set(self._account_execution["worker_pids"]) | {result.pid for result in results}
+        )
+        ordered = sorted(results, key=lambda result: result.started_ns)
+        longest = ordered[0]
+        for result in ordered[1:]:
+            if result.started_ns < longest.finished_ns and result.pid != longest.pid:
+                self._account_execution["overlap_cuts"] += 1
+                self._account_execution["overlap_example"] = {
+                    "sequence": self.consumed,
+                    "workers": [
+                        {
+                            "account_id": worker.account_id,
+                            "pid": worker.pid,
+                            "started_ns": worker.started_ns,
+                            "finished_ns": worker.finished_ns,
+                            "cpu_ns": worker.cpu_ns,
+                        }
+                        for worker in (longest, result)
+                    ],
+                }
+                break
+            if result.finished_ns > longest.finished_ns:
+                longest = result
+
+    async def _consume_slot(
+        self,
+        slot: Slot,
+        event: dict[str, Any],
+        delay: float,
+        recorded: dict[str, Any] | None,
+        feature_cut: dict[tuple[Any, ...], Feature | None],
+    ) -> dict[str, Any]:
+        runtime = slot.runtime
+        book_count = runtime.book_delivered["incumbent"]
+        outcome_count = sum(len(account.outcomes) for account in runtime.accounts.values())
+        if self.concurrent_accounts:
+            await runtime._consume_event(
+                event,
+                delay,
+                replaying=recorded is not None,
+                feature_cut=feature_cut,
+            )
+        else:
+            await runtime._consume_event(event, delay, replaying=recorded is not None)
+        if recorded is not None:
+            runtime.reviewed_fills = recorded["reviewed_fills"]
+            runtime.reviewed_families = set(recorded["reviewed_families"])
+            runtime.allocation_blocked = recorded["allocation_blocked"]
+        book_delivered = runtime.book_delivered["incumbent"] > book_count
+        accepted_book = book_delivered
+        if self.concurrent_accounts:
+            result = runtime.last_account_results.get("incumbent")
+            accepted_book = result is not None and result.accepted_book
+        return {
+            "progress": (
+                book_delivered
+                or sum(len(account.outcomes) for account in runtime.accounts.values())
+                > outcome_count
+                or bool(event.get("applied"))
+            ),
+            **(
+                {"accepted_book": accepted_book}
+                if self.session_seeds is not None and event["kind"] == "book"
+                else {}
+            ),
+            "reviewed_fills": runtime.reviewed_fills,
+            "reviewed_families": sorted(runtime.reviewed_families),
+            "allocation_blocked": runtime.allocation_blocked,
+            **({"account_results": runtime.account_evidence()} if self.concurrent_accounts else {}),
+        }
+
+    async def _prepare_cut(
+        self, entry: dict[str, Any], delay: float, *, saved: dict[str, Any] | None = None
+    ) -> tuple[SlotCommand, str, dict[str, Any]] | None:
         sequence, kind, payload = entry["sequence"], entry["kind"], entry["payload"]
         if self.session_closed:
             raise JournalError("Events follow a sealed paper session")
@@ -388,8 +636,13 @@ class SharedFeedSlots:
             command_result = await self._command(entry)
             entry["disposition"], entry["detail"] = command_result[1:]
         elif kind == "final_advance":
-            for _, slot in self.active():
-                await self._stop(slot, entry, "completed")
+            stopped = await asyncio.gather(
+                *(self._stop(slot, entry, "completed") for _, slot in self.active()),
+                return_exceptions=True,
+            )
+            for stop_error in stopped:
+                if isinstance(stop_error, BaseException):
+                    raise stop_error
         elif kind == "session_close":
             if self.session_seeds is None:
                 raise JournalError("Session close requires recurring mode")
@@ -412,6 +665,8 @@ class SharedFeedSlots:
             elif kind == "recovery_gap":
                 event_kind = "clock"
             watch = set(self.desired)
+            feature_cut: dict[tuple[Any, ...], Feature | None] = {}
+            targets = {}
             for slot_id, slot in self.active():
                 if target_id is not None and slot_id != target_id:
                     continue
@@ -424,58 +679,35 @@ class SharedFeedSlots:
                 runtime.sequence = sequence
                 event = {**entry, "kind": event_kind, "payload": event_payload}
                 recorded = saved["outputs"][slot_id] if saved is not None else None
-                books_before = runtime.book_delivered["incumbent"]
-                outcomes_before = sum(
-                    len(account.outcomes) for account in runtime.accounts.values()
-                )
-                await runtime._consume_event(event, delay, replaying=saved is not None)
-                if recorded is not None:
-                    runtime.reviewed_fills = recorded["reviewed_fills"]
-                    runtime.reviewed_families = set(recorded["reviewed_families"])
-                    runtime.allocation_blocked = recorded["allocation_blocked"]
-                outputs[slot_id] = {
-                    "progress": (
-                        runtime.book_delivered["incumbent"] > books_before
-                        or sum(len(account.outcomes) for account in runtime.accounts.values())
-                        > outcomes_before
-                        or bool(event.get("applied"))
-                    ),
-                    **(
-                        {"accepted_book": runtime.book_delivered["incumbent"] > books_before}
-                        if self.session_seeds is not None and kind == "book"
-                        else {}
-                    ),
-                    "reviewed_fills": runtime.reviewed_fills,
-                    "reviewed_families": sorted(runtime.reviewed_families),
-                    "allocation_blocked": runtime.allocation_blocked,
-                }
-        self.desired = self.subscribe(self.candidates, self.protected()) if self.active() else []
-        self.counts[kind] += 1
-        self.consumed = sequence
+                targets[slot_id] = (slot, event, recorded)
+            results = await asyncio.gather(
+                *(
+                    self._consume_slot(slot, event, delay, recorded, feature_cut)
+                    for slot, event, recorded in targets.values()
+                ),
+                return_exceptions=True,
+            )
+            for slot_id, result in zip(targets, results, strict=True):
+                if isinstance(result, BaseException):
+                    raise result
+                outputs[slot_id] = result
+        protected = self._slot_protection()
+        self.desired = self.subscribe(self.candidates, protected) if self.active() else []
+        if self.concurrent_accounts and kind in ("slot_command", "final_advance"):
+            entry["account_results"] = {
+                slot_id: slot.runtime.account_evidence()
+                for slot_id, slot in self.slots.items()
+                if slot.stopped_sequence == sequence
+            }
         entry["outputs"] = outputs
         entry["checkpoints"] = {
             slot_id: slot.runtime._checkpoint() for slot_id, slot in self.slots.items()
         }
-        if saved is not None:
-            if encode(entry) != encode(
-                {key: value for key, value in saved.items() if key != "index"}
-            ):
-                raise JournalError("Shared feed replay diverged from committed slot results")
-            return
-        self.journal.append(entry)
-        if command_result is not None:
-            self.control.record(*command_result)
-            self.queued_commands.discard(command_result[0].id)
-            self.record(
-                "slot_command",
-                command_id=command_result[0].id,
-                slot_id=command_result[0].slot_id,
-                action=command_result[0].action,
-                disposition=command_result[1],
-                **command_result[2],
-            )
-        for _, slot in self.active():
-            slot.runtime.launch_review()
+        if saved is not None and encode(entry) != encode(
+            {key: value for key, value in saved.items() if key != "index"}
+        ):
+            raise JournalError("Shared feed replay diverged from committed slot results")
+        return command_result
 
     async def restore(self) -> None:
         original_record = self.record
@@ -532,7 +764,9 @@ class SharedFeedSlots:
                     tasks.append(runtime.review_task)
                     runtime.review_task.cancel()
                     runtime.review_task = None
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if self.audit is not None:
+                self.audit.report_task_failures("strategic_review", "task_cleanup_failed", results)
 
     async def close(self) -> None:
         for slot in self.slots.values():
@@ -559,6 +793,11 @@ class SharedFeedSlots:
         ]
         return {
             "shared_slots": rows,
+            **(
+                {"account_execution": copy.deepcopy(self._account_execution)}
+                if self.concurrent_accounts
+                else {}
+            ),
             "ai_calls": sum(row["ai_calls"] for row in rows),
             "counts": dict(self.counts),
             "committed_sequence": self.consumed,

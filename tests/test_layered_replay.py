@@ -39,7 +39,7 @@ class ReplayTests(unittest.TestCase):
             output.mkdir()
             start = datetime(2026, 11, 3, 14, 30, tzinfo=UTC)
 
-            def stamp(seconds):
+            def stamp(seconds: float) -> str:
                 return (start + timedelta(seconds=seconds)).isoformat()
 
             rows = [

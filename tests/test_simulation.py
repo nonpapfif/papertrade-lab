@@ -7,11 +7,10 @@ import json
 import sqlite3
 from unittest.mock import MagicMock, patch
 
-from test_framework import AT, ROOT, BaseCase
-
 from papertrade.ai import validate_simulation
 from papertrade.core import Settings, decimal
 from papertrade.simulation import Simulation
+from tests.test_framework import AT, ROOT, BaseCase
 
 
 class SimulationTests(BaseCase):
@@ -36,7 +35,7 @@ class SimulationTests(BaseCase):
                 "observed_reference",
             )
             self.assertEqual(self.sim.propose(), [])
-        self.sim.reviewer.review.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
 
     def test_watch_requires_a_new_crossing_and_is_consumed_once(self) -> None:
         self.sim.save_quote(
@@ -206,14 +205,14 @@ class SimulationTests(BaseCase):
         self.assertEqual(len(self.sim.propose()), 2)
 
     def test_observation_ignores_calendar_status_and_does_not_call_a_model(self) -> None:
-        self.sim.client.get.return_value = {"midRate": "1337.2"}
-        self.sim.client.listed.side_effect = lambda exchange, status: (
+        self.client_mock.get.return_value = {"midRate": "1337.2"}
+        self.client_mock.listed.side_effect = lambda exchange, status: (
             [{"symbol": "OLD", "status": "DELISTED"}]
             if exchange == "NASDAQ" and status == "DELISTED"
             else []
         )
-        self.sim.client.ranking.return_value = {"rankings": []}
-        self.sim.client.prices.side_effect = lambda symbols: [
+        self.client_mock.ranking.return_value = {"rankings": []}
+        self.client_mock.prices.side_effect = lambda symbols: [
             {"symbol": symbol, "lastPrice": "10", "currency": "USD"} for symbol in symbols
         ]
         self.sim.observe()
@@ -222,9 +221,9 @@ class SimulationTests(BaseCase):
                 "SELECT data FROM simulation_quotes WHERE symbol='OLD'"
             ).fetchone()
         )
-        self.sim.client.calendar.assert_not_called()
-        self.sim.client.warnings.assert_not_called()
-        self.sim.reviewer.review.assert_not_called()
+        self.client_mock.calendar.assert_not_called()
+        self.client_mock.warnings.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
 
     def test_review_has_no_candidate_expiry_and_can_open_a_fractional_short(self) -> None:
         self.store.put_cache("simulation_regime:US", "mixed", AT)
@@ -237,7 +236,7 @@ class SimulationTests(BaseCase):
         )
         self.sim.propose()
         self.store.db.execute("UPDATE jobs SET observed_at='2000-01-01T00:00:00+00:00'")
-        self.sim.reviewer.review.return_value = {
+        self.reviewer_mock.review.return_value = {
             "0": {
                 "symbol": "TEST",
                 "action": "SELL",
@@ -248,18 +247,20 @@ class SimulationTests(BaseCase):
                 "reason": "Test a short hypothesis",
             }
         }
-        self.sim.client.prices.return_value = [{"symbol": "TEST", "lastPrice": "100"}]
+        self.client_mock.prices.return_value = [{"symbol": "TEST", "lastPrice": "100"}]
         self.assertEqual(self.sim.review(), 1)
         self.assertEqual(decimal(self.store.positions()[0]["quantity"]), decimal("-20.125"))
         self.assertEqual(self.store.equity(), 1000)
-        self.sim.client.calendar.assert_not_called()
+        self.client_mock.calendar.assert_not_called()
 
     def setUp(self) -> None:
         super().setUp()
         self.settings = Settings(self.root, copy.deepcopy(Settings.load(ROOT).data))
-        self.sim = Simulation(self.settings, self.store, MagicMock(), MagicMock())
+        self.client_mock = MagicMock()
+        self.reviewer_mock = MagicMock()
+        self.sim = Simulation(self.settings, self.store, self.client_mock, self.reviewer_mock)
 
-    def apply(self, quantity: str, price: str, key: str, **kwargs) -> None:
+    def apply(self, quantity: str, price: str, key: str, **kwargs: str | None) -> None:
         self.store.simulate(
             "TEST",
             "US",
@@ -341,9 +342,9 @@ class SimulationTests(BaseCase):
         evidence = self.store.positions()[0]["price_evidence"]
         self.assertTrue(evidence["market_hours_liquidity_settlement_ignored"])
         self.assertEqual(evidence["fill_basis"], "assumed_fill_at_reference_price")
-        self.sim.client.book.assert_not_called()
-        self.sim.client.calendar.assert_not_called()
-        self.sim.client.warnings.assert_not_called()
+        self.client_mock.book.assert_not_called()
+        self.client_mock.calendar.assert_not_called()
+        self.client_mock.warnings.assert_not_called()
 
     def test_no_overnight_or_thirty_minute_forced_exit_exists(self) -> None:
         self.apply("1", "100", "open")
@@ -355,7 +356,7 @@ class SimulationTests(BaseCase):
         )
         self.sim.inspect()
         self.assertEqual(len(self.store.positions()), 1)
-        self.sim.reviewer.review.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
 
     def test_optional_short_target_uses_the_reference_and_closes_once(self) -> None:
         self.store.simulate(
@@ -405,7 +406,7 @@ class SimulationTests(BaseCase):
         )
         self.assertEqual(len(self.sim.propose()), 1)
         self.assertEqual(self.sim.propose(), [])
-        self.sim.reviewer.review.assert_not_called()
+        self.reviewer_mock.review.assert_not_called()
 
     def test_review_consumes_the_latest_signal_actually_sent_to_the_model(self) -> None:
         self.sim.save_quote(
@@ -415,7 +416,7 @@ class SimulationTests(BaseCase):
         self.sim.save_quote(
             "US", {"symbol": "TEST", "lastPrice": "105"}, decimal(1), "observed"
         )
-        self.sim.reviewer.review.return_value = {}
+        self.reviewer_mock.review.return_value = {}
         self.assertEqual(self.sim.review(), 1)
         self.assertEqual(self.sim.propose(), [])
 

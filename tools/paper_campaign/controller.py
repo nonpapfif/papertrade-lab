@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import nullcontext, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from tools.autotest_jobs import atomic_json
-from tools.autotest_supervisor import read_json
+from papertrade.jsonio import atomic_json, read_json
 from tools.paper_campaign.calendar import MarketCalendar, Window
 from tools.paper_campaign.evidence import (
     MAX_BOOK_GAP_SECONDS,
@@ -25,11 +25,13 @@ from tools.paper_campaign.policy import (
     MIN_QUALIFIED_SESSIONS,
     POLICY_VERSION,
     Admission,
+    fingerprint,
     next_plan,
 )
 from tools.paper_campaign.review import AstraReview
 from tools.paper_campaign.runner import SessionRunner
 from tools.paper_market import PaperMarket
+from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
 from tools.slot_control import SlotCommand
 
 MIN_SESSION_COVERAGE = 0.8
@@ -57,6 +59,8 @@ class Campaign:
         review: AstraReview,
         admissions: dict[str, Admission],
         not_before: dict[str, datetime] | None = None,
+        *,
+        audit: RuntimeAudit | None = None,
     ) -> None:
         self.output = output
         self.calendar = calendar
@@ -64,8 +68,39 @@ class Campaign:
         self.review = review
         self.admissions = admissions
         self.not_before = not_before or {}
+        self.audit = audit
 
     def tick(self, market: PaperMarket, now: datetime) -> None:
+        if self.audit is None:
+            self._tick(market, now)
+            return
+        context = {"market": market.code}
+        try:
+            with self.audit.operation("campaign", "tick_failed", context):
+                if not self.audit.healthy:
+                    raise RuntimeAuditError("Campaign audit storage is unhealthy")
+                self.audit.heartbeat("campaign", worker_id=market.code, status="active", timeout=120)
+                try:
+                    self._tick(market, now)
+                finally:
+                    if self.audit.healthy:
+                        with suppress(RuntimeAuditError):
+                            self.audit.heartbeat(
+                                "campaign", worker_id=market.code, status="waiting"
+                            )
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+            try:
+                self._handoff(
+                    self.output / market.code,
+                    f"campaign_{type(error).__name__}",
+                    market.code,
+                    now.date().isoformat(),
+                )
+            except (OSError, RuntimeError, ValueError, TypeError) as handoff_error:
+                error.add_note(f"Engineering handoff failed: {type(handoff_error).__name__}")
+            raise
+
+    def _tick(self, market: PaperMarket, now: datetime) -> None:
         admission = self.admissions[market.code]
         earliest = self.not_before.get(market.code)
         approved_start = earliest.isoformat() if earliest is not None else None
@@ -114,7 +149,15 @@ class Campaign:
         session_dir = directory / active["day"]
         if "evidence" not in active:
             try:
-                outcome = self.runner.poll(session_dir, active)
+                with (
+                    self.audit.operation(
+                        "campaign_runner", "session_poll_failed",
+                        {"market": market.code, "event_id": active["day"]}, timeout=30,
+                    ) if self.audit is not None else nullcontext()
+                ):
+                    outcome = self.runner.poll(session_dir, active)
+            except RuntimeAuditError:
+                raise
             except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error) as error:
                 self._block(path, state, session_dir, f"session_{type(error).__name__}")
                 return
@@ -127,10 +170,24 @@ class Campaign:
                 atomic_json(path, state)
                 return
             if outcome["state"] != "complete":
+                if self.audit is not None:
+                    self.audit.record(
+                        "campaign_runner", "session_unsuccessful",
+                        {"market": market.code, "event_id": active["day"]},
+                    )
                 self._block(path, state, session_dir, outcome["reason"])
                 return
             try:
-                self._finish(active, outcome, market, state)
+                audit_scope = (
+                    self.audit.operation(
+                        "evidence", "terminal_evidence_invalid",
+                        {"market": market.code, "event_id": active["day"]},
+                    ) if self.audit is not None else nullcontext()
+                )
+                with audit_scope:
+                    self._finish(active, outcome, market, state, audit=self.audit)
+            except RuntimeAuditError:
+                raise
             except (KeyError, RuntimeError, TypeError, ValueError):
                 self._block(path, state, session_dir, "invalid_terminal_evidence")
                 return
@@ -187,10 +244,21 @@ class Campaign:
             return
         try:
             live = self.runner.live(output)
-        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+            if self.audit is not None:
+                self.audit.record(
+                    "campaign", "session_status_unavailable",
+                    {"market": market.code, "event_id": active["day"]}, error=error,
+                    severity="warning",
+                )
             return
         if live is None:
             return
+        if self.audit is not None:
+            self.audit.record(
+                "campaign", "session_status_unavailable",
+                {"market": market.code, "event_id": active["day"]}, state="resolved",
+            )
         summary = live["summary"]
         sequence = summary.get("committed_sequence")
         running = [row["slot_id"] for row in live["slots"] if row["state"] == "active"]
@@ -245,8 +313,6 @@ class Campaign:
                 )
                 and len(metrics.get(slot, {})) == 2
             ]
-            if not targets or (len(occupied) >= admission.max_slots and not parkable):
-                return
             starting_fills = {
                 f"{slot}.{account}": row["fills"]
                 for slot, stats in statistics.items()
@@ -332,7 +398,12 @@ class Campaign:
                     )
                     self.runner.branch(output, request, cutoff)
                     decision["branch_dispatched"] = True
-            except (OSError, ValueError, sqlite3.Error):
+            except (OSError, ValueError, sqlite3.Error) as error:
+                if self.audit is not None:
+                    self.audit.record(
+                        "campaign", "branch_dispatch_failed",
+                        {"market": market.code, "request_id": branch_id}, error=error,
+                    )
                 decision["branch_dispatched"] = False
         intraday["decisions"].append(decision)
         intraday["pending"] = None
@@ -340,7 +411,12 @@ class Campaign:
 
     @staticmethod
     def _finish(
-        active: dict[str, Any], outcome: dict[str, Any], market: PaperMarket, state: dict[str, Any]
+        active: dict[str, Any],
+        outcome: dict[str, Any],
+        market: PaperMarket,
+        state: dict[str, Any],
+        *,
+        audit: RuntimeAudit | None = None,
     ) -> None:
         summary = outcome["summary"]
         checks = summary["checks"]
@@ -380,6 +456,8 @@ class Campaign:
             chain,
             datetime.fromisoformat(active["start"]).timestamp(),
             datetime.fromisoformat(active["end"]).timestamp(),
+            audit=audit,
+            context={"market": market.code, "event_id": active["day"]},
         )
         required = (
             "stream_observed",
@@ -494,7 +572,12 @@ class Campaign:
                     result, previous, admission, stats, set(state["seeds"]), retired
                 )
                 retired_now = sorted(set(previous) - set(approved))
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as error:
+                if self.audit is not None:
+                    self.audit.record(
+                        "strategic_review", "unsafe_plan_rejected",
+                        {"market": market.code, "event_id": active["day"]}, error=error,
+                    )
                 result.update(quality="degraded", disposition="unsafe_plan_rejected")
         elif not close["qualified"]:
             result["disposition"] = "degraded_market_evidence"
@@ -514,22 +597,49 @@ class Campaign:
         state["active"] = None
         atomic_json(path, state)
 
-    @staticmethod
-    def _block(path: Path, state: dict[str, Any], output: Path, reason: str) -> None:
+    def _block(self, path: Path, state: dict[str, Any], output: Path, reason: str) -> None:
+        active = state["active"]
+        handoff = self._handoff(output, reason, path.parent.name, active["day"])
+        state["blocked"] = handoff
+        atomic_json(path, state)
+
+    def _handoff(self, output: Path, reason: str, market: str, day: str) -> dict[str, Any]:
+        path = output / "engineering_handoff.json"
+        identity = fingerprint({
+            "market": market, "session": day, "reason": reason,
+            "source_commit": self.runner.source_commit,
+            "source_digest": self.runner.source_digest,
+        })
+        if path.exists():
+            saved = read_json(path)
+            if saved.get("task_id") == identity:
+                return saved
         handoff = {
             "state": "blocked",
+            "task_id": identity,
             "reason": reason,
-            "source_commit": state["source_commit"],
-            "source_digest": state["source_digest"],
-            "session": state["active"]["day"],
+            "source_commit": self.runner.source_commit,
+            "source_digest": self.runner.source_digest,
+            "market": market,
+            "session": day,
             "evidence": {
                 "scheduler": str(output / "scheduler"),
                 "schedule": str(output / "schedule" / "status.json"),
                 "journal": str(output / "schedule" / "journal.sqlite3"),
             },
-            "tests": ["tests/test_paper_campaign.py", "tests/test_async_live_validation.py"],
+            "tests": ["tests.test_paper_campaign", "tests.test_async_live_validation"],
             "required": "Reconcile the worker exit and committed accounts before any restart.",
         }
-        atomic_json(output / "engineering_handoff.json", handoff)
-        state["blocked"] = handoff
-        atomic_json(path, state)
+        with (
+            self.audit.operation(
+                "engineering_handoff", "write_failed",
+                {"market": market, "request_id": identity}, timeout=10,
+            ) if self.audit is not None and self.audit.healthy else nullcontext()
+        ):
+            atomic_json(path, handoff)
+        if self.audit is not None and self.audit.healthy:
+            self.audit.record(
+                "engineering_handoff", "campaign_blocked",
+                {"market": market, "request_id": identity},
+            )
+        return handoff

@@ -13,9 +13,11 @@ from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from papertrade.core import encode
-from tools.autotest_jobs import atomic_json, poll_job
-from tools.run_kr_paper_comparison import CAPITAL, now
+from papertrade.clock import now_utc as now
+from papertrade.jsonio import atomic_json
+from papertrade.jsonio import paper_json as encode
+from tools.autotest_jobs import poll_job
+from tools.kr_comparison_account import CAPITAL
 
 COMMISSION = Decimal("0.00015")
 STOCK_SELL_TAX = Decimal("0.002")

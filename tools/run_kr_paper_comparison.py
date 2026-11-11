@@ -10,140 +10,26 @@ import math
 import os
 import time
 from collections import Counter, defaultdict, deque
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from papertrade.api import SYMBOL, ApiError
-from papertrade.core import SafetyError, Settings, encode
-from tools.autotest_jobs import atomic_json
+from papertrade.clock import now_utc as now
+from papertrade.core import SafetyError, Settings
+from papertrade.jsonio import atomic_json
+from papertrade.jsonio import paper_json as encode
+from tools.kr_comparison_account import CAPITAL, Account
 from tools.kr_comparison_ai import SOL, decide, review_cascade
 from tools.live_feed import LiveFeed
 from tools.paper_market import KR
 from tools.probe_toss_websocket import CachedTokenClient
 
 ROOT = Path(__file__).resolve().parents[1]
-CAPITAL = Decimal(100_000)
 ALLOCATION_LOOKBACK = 12
 
 
-def now() -> datetime:
-    return datetime.now(UTC)
-
-
-class Account:
-    def __init__(self, allocation: Decimal | None = None) -> None:
-        self.allocation = allocation
-        self.cash = CAPITAL
-        self.positions: dict[str, tuple[Decimal, Decimal]] = {}
-        self.realized = Decimal(0)
-        self.fills = 0
-        self.pending: dict[str, tuple[dict[str, Any], datetime, str]] = {}
-        self.budgets: dict[str, Decimal] = {}
-
-    def queue(
-        self,
-        signal: dict[str, Any],
-        decided: datetime,
-        reason: str,
-        prices: dict[str, tuple[Decimal, datetime]],
-    ) -> None:
-        symbol = signal["symbol"]
-        self.pending[symbol] = signal, decided, reason
-        if self.allocation is not None and signal["action"] == "BUY":
-            self.budgets[symbol] = self.summary(prices)["equity_krw"] * self.allocation
-
-    def wants(self, signal: dict[str, Any]) -> bool:
-        return (signal["symbol"] in self.positions) == (signal["action"] == "SELL")
-
-    def execute(
-        self,
-        quotes: dict[str, tuple[Decimal, datetime]],
-        observed: datetime,
-        latest: dict[str, dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        ready = []
-        for symbol, (signal, decided, reason) in list(self.pending.items()):
-            if latest.get(symbol) != signal or not self.wants(signal):
-                del self.pending[symbol]
-                self.budgets.pop(symbol, None)
-                continue
-            if symbol in quotes and quotes[symbol][1] > decided:
-                ready.append((symbol, signal, decided, reason))
-                del self.pending[symbol]
-
-        buy_count = sum(signal["action"] == "BUY" for _, signal, _, _ in ready)
-        records = []
-        budget = Decimal(0)
-        for symbol, signal, decided, reason in sorted(
-            ready,
-            key=lambda row: (
-                row[1]["action"] == "BUY",
-                -row[1].get("strength", Decimal(0)) if self.allocation is not None else 0,
-                row[0] if self.allocation is not None else "",
-            ),
-        ):
-            price, source = quotes[symbol]
-            if signal["action"] == "SELL":
-                quantity, basis = self.positions.pop(symbol)
-                proceeds = quantity * price
-                self.cash += proceeds
-                self.realized += proceeds - basis
-            else:
-                if self.allocation is None:
-                    if not budget:
-                        budget = self.cash / buy_count
-                    cost = min(budget, self.cash)
-                else:
-                    cost = self.budgets.pop(symbol)
-                    if self.cash < cost:
-                        continue
-                if cost <= 0:
-                    continue
-                quantity = cost / price
-                self.cash -= cost
-                self.positions[symbol] = quantity, cost
-            self.fills += 1
-            records.append(
-                {
-                    "symbol": symbol,
-                    "action": signal["action"],
-                    "quantity": quantity,
-                    "assumed_price_krw": price,
-                    "source_at": source,
-                    "observed_at": observed,
-                    "fill_at": observed,
-                    "decision_at": decided,
-                    "signal": signal,
-                    "reason": reason,
-                }
-            )
-        return records
-
-    def summary(self, prices: dict[str, tuple[Decimal, datetime]]) -> dict[str, Any]:
-        positions = {}
-        unrealized = Decimal(0)
-        for symbol, (quantity, basis) in self.positions.items():
-            price, source = prices[symbol]
-            value = quantity * price
-            unrealized += value - basis
-            positions[symbol] = {
-                "quantity": quantity,
-                "cost_krw": basis,
-                "mark_krw": price,
-                "market_value_krw": value,
-                "source_at": source,
-            }
-        return {
-            "cash_krw": self.cash,
-            "equity_krw": CAPITAL + self.realized + unrealized,
-            "realized_krw": self.realized,
-            "unrealized_krw": unrealized,
-            "positions": positions,
-            "fills": self.fills,
-            "pending": sorted(self.pending),
-        }
 
 
 class Comparison:
@@ -442,6 +328,9 @@ async def campaign(
             source_files: tuple[Path, ...] = (
                 Path(__file__).resolve(),
                 ROOT / "tools/kr_comparison_ai.py",
+                ROOT / "tools/kr_comparison_account.py",
+                ROOT / "papertrade/clock.py",
+                ROOT / "papertrade/jsonio.py",
             )
             if profile == "broker-constrained":
                 from tools.kr_broker_profile import continuous_window, eligible

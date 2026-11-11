@@ -11,7 +11,9 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from .core import SEOUL, SafetyError, decimal, encode, now_utc
+from .clock import now_utc
+from .core import SEOUL, SafetyError, decimal
+from .jsonio import paper_json as encode
 
 
 def quota_report(payload: dict[str, Any]) -> dict[str, Any]:

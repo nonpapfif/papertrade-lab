@@ -76,13 +76,11 @@ The list records checks that were outside the offline job, with no inferred pass
 Run these checks separately on the host against the exact reviewed source and retain that
 result with the deployment validation. The offline network and credential restrictions remain in force.
 
-Changes use an isolated branch/worktree. Failed implementations remain in that worktree for the
-next correction. After tests and Astra approval, the controller commits, pushes, creates a PR,
-waits for checks, merges with an exact head SHA, and fast-forwards local `master`. It never
-overwrites a dirty checkout, rewrites history or ignores failing checks. New PR URLs are retained
-in status/history. The standalone CLI cannot attach artifacts to this Codex chat; attach them
-when inspecting results here. An interrupted external GitHub mutation blocks for reconciliation
-instead of blindly creating or merging a second PR.
+Changes use an isolated branch and worktree. Failed implementations remain there for the next
+correction. After tests and Astra approval, the controller commits, pushes and creates a PR.
+It verifies the reviewed head of the open PR and saves terminal state `pr_ready` with the PR URL.
+Merging and updating local `master` are separate user actions. An interrupted publication blocks
+for reconciliation before any further publication.
 Publication runs the installed GitHub workflow's staged-language guard before committing.
 Branches use the `codex/` prefix.
 PR bodies use the English requirement, changed file paths and test/review status. Localized
@@ -145,7 +143,16 @@ test partition and retains introduced regression files across PR cycles. The off
 execute at least one test without skips. Host checks excluded by the partition are listed separately.
 Use the repository's pinned optional WebSocket dependency for applicable offline tests.
 
-Completion requires source-matched test and Astra exit records from the current cycle, all R1-R4
-requirements, a clean worktree and matching published source on local and remote-tracking master.
-The controller writes `refactor-report.json` with `live_validation_pending: true`. The report
-records offline evidence and excluded host checks. A later live validation is separate.
+Publication requires source-matched test and Astra exit records from the current cycle, plus a
+passing full local report supplied with `--local-validation <path>/validation.json`. Complete the
+R1–R4 corrections on the same branch. `pr_ready` records the reviewed source and leaves live
+validation pending. A report marked complete after a separate user merge still requires the
+published and local source to match the verified tree.
+
+A failed campaign writes `engineering_handoff.json` in its session directory. Use that directory
+as `--inherited` so the existing supervisor reads the task, journal and scheduler references.
+Keep the same supervisor output directory when reconciling the task. The campaign records the
+handoff and leaves the failed session blocked. An explicitly started supervisor loads that packet
+into the first Astra review, then uses its existing reviewed-plan step to assign changes to Sol.
+Writing the packet alone starts neither worker. A separate launch approval is required before
+using corrected code on market data.

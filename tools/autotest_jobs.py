@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -16,40 +14,20 @@ from typing import Any
 
 from papertrade.ai import codex_environment
 from papertrade.core import process_identity
+from papertrade.jsonio import atomic_json, read_json
 
 ROOT = Path(__file__).resolve().parents[1]
 STARTUP_SECONDS = 5
 STOP_SECONDS = 5
 
 
-def atomic_json(path: Path, value: dict[str, Any]) -> None:
-    """Replace a private JSON file only after its complete contents are durable."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            json.dump(value, stream, ensure_ascii=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-
-
 def _read(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text())
+        return read_json(path)
     except (OSError, ValueError) as error:
         raise RuntimeError(f"Invalid job file: {path.name}") from error
-    if not isinstance(value, dict):
-        raise TypeError(f"Invalid job object: {path.name}")
-    return value
+    except TypeError:
+        raise TypeError(f"Invalid job object: {path.name}") from None
 
 
 def _claim(path: Path) -> None:

@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from typing import Any
 
 from papertrade.api import ApiError
 from tools.probe_toss_websocket import (
@@ -41,7 +42,7 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("private", str(details))
 
     def test_clock_difference_is_not_clamped_or_called_latency(self) -> None:
-        stats = {}
+        stats: dict[str, Any] = {}
         record_source_delta(stats, "2026-11-03T14:00:02+09:00", "2026-11-03T05:00:00+00:00")
         record_source_delta(stats, "2026-11-03T05:00:00+00:00", "2026-11-03T05:00:01+00:00")
         record_source_delta(stats, "invalid", "2026-11-03T05:00:01+00:00")

@@ -78,7 +78,7 @@ class PortfolioTests(unittest.TestCase):
         book = Book(
             config(slots=2, hold=0), "US", "whole", True, initial_equity=50, whole_shares=True
         )
-        prices = {0: 30, 1: 40, 2: 10, 3: 5}
+        prices: dict[int, float] = {0: 30, 1: 40, 2: 10, 3: 5}
         book.step(at(5), 1, prices, prices, [[s, 1, 1] for s in prices], True)
         self.assertEqual(set(book.positions), {2, 3})
         self.assertEqual([p.quantity for p in book.positions.values()], [2, 5])

@@ -96,7 +96,7 @@ class TossOrderContractTests(unittest.TestCase):
                 )
 
     def test_cash_and_tick_rejections_have_no_accepted_order(self) -> None:
-        fixtures = (
+        fixtures: tuple[tuple[int, str, dict[str, Any], Decimal | None], ...] = (
             (422, "insufficient-buying-power", {}, None),
             (
                 400,

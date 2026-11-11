@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from tools.kr_broker_profile import continuous_window, eligible
+from tools.kr_whole_share_accounts import WholeShareAccount
 from tools.run_kr_paper_comparison import Comparison
 
 
@@ -51,6 +52,7 @@ class ConstrainedTests(unittest.TestCase):
 
     def test_reservations_do_not_reuse_cash_or_duplicate_intents(self) -> None:
         account = self.pair.accounts["fixed"]
+        assert isinstance(account, WholeShareAccount)
         account.cash = account.ledger.cash = Decimal(1000)
         prices = {str(i): (Decimal(600), self.start) for i in range(3)}
         for symbol in prices:
@@ -78,11 +80,13 @@ class ConstrainedTests(unittest.TestCase):
         self.assertNotIn("X", pair.prices)
         self.assertEqual(pair.observe([self.row("A", 103, at)], at + timedelta(minutes=3)), [])
         self.assertEqual(pair.observe([self.row("A", 102, self.end)], self.end), [])
-        self.assertEqual(pair.accounts["fixed"].reserved_cash, 0)
-        self.assertFalse(pair.accounts["fixed"].positions)
+        account = pair.accounts["fixed"]
+        assert isinstance(account, WholeShareAccount)
+        self.assertEqual(account.reserved_cash, 0)
+        self.assertFalse(account.positions)
 
     def test_calendar_requires_verified_auction_boundary_and_current_day(self) -> None:
-        regular = {
+        regular: dict[str, str | None] = {
             "startTime": self.start.isoformat(),
             "endTime": (self.end + timedelta(minutes=10)).isoformat(),
             "singlePriceAuctionStartTime": self.end.isoformat(),

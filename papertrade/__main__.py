@@ -15,8 +15,10 @@ from types import SimpleNamespace
 from .ai import DISABLED_FEATURES, Reviewer, sandbox_profile
 from .api import ApiError, secret_file
 from .audit import Audit
-from .core import SEOUL, SafetyError, Settings, decimal, encode, now_utc
+from .clock import now_utc
+from .core import SEOUL, SafetyError, Settings, decimal
 from .engine import Engine
+from .jsonio import paper_json as encode
 from .service import ROLES, generate_services, run_worker
 from .simulation import Simulation
 from .store import Store

@@ -9,9 +9,12 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from collections.abc import AsyncIterator, Iterator
+from contextlib import ExitStack, asynccontextmanager, closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from threading import Event, Thread
+from typing import Any, cast
 from unittest.mock import PropertyMock, patch
 
 from papertrade.core import Settings
@@ -19,6 +22,7 @@ from tools.adaptive_journal import AdaptiveJournal, JournalError, read_status
 from tools.layered_paper import Feature
 from tools.paper_market import KR
 from tools.run_async_live_validation import Runtime, campaign
+from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
 
 BASE = datetime(2026, 11, 5, 15, tzinfo=UTC)
 DEADLINE = (BASE + timedelta(hours=1)).timestamp()
@@ -133,6 +137,190 @@ async def kill_worker(path: Path, through: int) -> int:
     return await asyncio.wait_for(child.wait(), 10)
 
 
+class DirectRuntimePublicationTests(unittest.IsolatedAsyncioTestCase):
+    @asynccontextmanager
+    async def direct_run(self) -> AsyncIterator[tuple[Runtime, AdaptiveJournal, RuntimeAudit]]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = RuntimeAudit(root / "audit.db", "fixture")
+            run = self.runtime_with_audit(audit)
+            with AdaptiveJournal.open(root / "journal.db", IDENTITY, resume=False) as journal:
+                run.journal = journal
+                journal.append({"kind": "initial", "fx_at": run.fx[1]})
+                try:
+                    yield run, journal, audit
+                finally:
+                    await run.close()
+
+    def runtime_with_audit(self, audit: RuntimeAudit) -> Runtime:
+        run = runtime()
+        run.audit = audit
+        run.concurrent_accounts = True
+        self.addAsyncCleanup(run.close)
+        return run
+
+    @contextmanager
+    def fail_audit_at_guard(
+        self, audit: RuntimeAudit, target: int, *, journal: AdaptiveJournal | None = None
+    ) -> Iterator[None]:
+        with closing(sqlite3.connect(audit.path)) as db, db:
+            db.execute("""
+                CREATE TRIGGER reject_probe BEFORE INSERT ON runtime_incidents
+                WHEN NEW.code = 'probe_failure'
+                BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END
+            """)
+        at_guard, lock_checked, failed = Event(), Event(), Event()
+        acquired_early = []
+        guard = audit.publication_guard
+        calls = 0
+
+        def writer() -> None:
+            if at_guard.wait(3):
+                if journal is not None:
+                    acquired = audit._publication_lock.acquire(blocking=False)
+                    acquired_early.append(acquired)
+                    if acquired:
+                        audit._publication_lock.release()
+                    lock_checked.set()
+                audit.report_exception("probe", "probe_failure", RuntimeError("fixture"))
+                failed.set()
+
+        @contextmanager
+        def interleave() -> Iterator[None]:
+            nonlocal calls
+            calls += 1
+            if calls == target:
+                if journal is None:
+                    at_guard.set()
+                self.assertTrue(failed.wait(3), "audit fault did not complete before guard")
+                self.assertFalse(audit.healthy)
+            with guard():
+                yield
+
+        thread = Thread(target=writer, daemon=True)
+        thread.start()
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(audit, "publication_guard", side_effect=interleave))
+                if journal is not None:
+                    append = journal.append
+
+                    def append_under_contention(entry: dict[str, Any]) -> None:
+                        at_guard.set()
+                        self.assertTrue(lock_checked.wait(3), "audit thread did not reach the lock")
+                        self.assertEqual(acquired_early, [False])
+                        append(entry)
+                        self.assertTrue(audit.healthy)
+
+                    stack.enter_context(
+                        patch.object(journal, "append", side_effect=append_under_contention)
+                    )
+                yield
+        finally:
+            at_guard.set()
+            thread.join(4)
+            self.assertFalse(thread.is_alive())
+            with closing(sqlite3.connect(audit.path)) as db, db:
+                db.execute("DROP TRIGGER reject_probe")
+        self.assertGreaterEqual(calls, target)
+
+    async def test_audit_failure_before_direct_append_aborts_consume_and_marker(self) -> None:
+        for marker in (False, True):
+            with self.subTest(marker=marker):
+                async with self.direct_run() as (run, journal, audit):
+                    await inputs(run, 0, 4)
+                    before, checkpoint = journal.evidence(), run._checkpoint()
+                    executor = run.account_executor
+                    assert executor is not None
+                    committed = executor._committed.copy()
+                    with (
+                        self.fail_audit_at_guard(audit, 1),
+                        patch.object(journal, "append", wraps=journal.append) as append,
+                        self.assertRaisesRegex(RuntimeAuditError, "storage is unhealthy"),
+                    ):
+                        if marker:
+                            await run.mark_advance("final_advance", stamp(40))
+                        else:
+                            await inputs(run, 4, 5)
+                    append.assert_not_called()
+                    self.assertEqual(journal.evidence(), before)
+                    self.assertEqual(run._checkpoint(), checkpoint)
+                    self.assertEqual(executor._committed, committed)
+                    self.assertEqual(executor.pids, {})
+                    with self.assertRaisesRegex(JournalError, "fresh journal replay"):
+                        await run.mark_advance("final_advance", stamp(40))
+
+    async def test_audit_failure_after_direct_append_replays_consume_and_marker_once(self) -> None:
+        for marker in (False, True):
+            with self.subTest(marker=marker):
+                async with self.direct_run() as (run, journal, audit):
+                    await inputs(run, 0, 5 if marker else 4)
+                    before = journal.evidence()
+                    executor = run.account_executor
+                    assert executor is not None
+                    committed = executor._committed.copy()
+                    with (
+                        self.fail_audit_at_guard(audit, 2, journal=journal),
+                        patch.object(run, "acknowledge_accounts", wraps=run.acknowledge_accounts)
+                        as ack,
+                        self.assertRaisesRegex(RuntimeAuditError, "storage is unhealthy") as raised,
+                    ):
+                        if marker:
+                            await run.mark_advance("final_advance", stamp(40))
+                        else:
+                            await inputs(run, 4, 5)
+                    ack.assert_not_called()
+                    self.assertIn(
+                        "is durable and requires replay", " ".join(raised.exception.__notes__)
+                    )
+                    after = journal.evidence()
+                    self.assertEqual(after["records"], before["records"] + 1)
+                    self.assertNotEqual(after["chain_sha256"], before["chain_sha256"])
+                    self.assertEqual(executor._committed, committed)
+                    with self.assertRaisesRegex(JournalError, "fresh journal replay"):
+                        await run.restore(journal)
+                    checkpoint = list(journal.events())[-1]["checkpoint"]
+                    await run.close()
+                    recovered = self.runtime_with_audit(RuntimeAudit(audit.path, audit.run_id))
+                    await recovered.restore(journal)
+                    self.assertEqual(recovered._checkpoint(), checkpoint)
+                    self.assertEqual(journal.evidence(), after)
+                    for account in recovered.accounts.values():
+                        self.assertEqual(len(account.book.trades), 1)
+                    await recovered.close()
+
+    async def test_audit_failure_before_replay_ack_leaves_saved_cut_recoverable(self) -> None:
+        async with self.direct_run() as (run, journal, audit):
+            await inputs(run, 0, 5)
+            before, checkpoint = journal.evidence(), run._checkpoint()
+            await run.close()
+            replay = self.runtime_with_audit(audit)
+            with (
+                self.fail_audit_at_guard(audit, 5),
+                patch.object(replay, "acknowledge_accounts", wraps=replay.acknowledge_accounts)
+                as ack,
+                self.assertRaisesRegex(RuntimeAuditError, "storage is unhealthy") as raised,
+            ):
+                await replay.restore(journal)
+            self.assertEqual(ack.call_count, 4)
+            self.assertIn("Journal cut 5 is durable and requires replay.", raised.exception.__notes__)
+            executor = replay.account_executor
+            assert executor is not None
+            self.assertEqual(executor._committed, {"incumbent": (1, 4), "candidate": (1, 4)})
+            self.assertEqual(executor.pids, {})
+            self.assertEqual(journal.evidence(), before)
+            for account in replay.accounts.values():
+                self.assertFalse(account.book.trades)
+
+            recovered = self.runtime_with_audit(RuntimeAudit(audit.path, audit.run_id))
+            await recovered.restore(journal)
+            self.assertEqual(recovered._checkpoint(), checkpoint)
+            self.assertEqual(journal.evidence(), before)
+            for account in recovered.accounts.values():
+                self.assertEqual(len(account.book.trades), 1)
+            await recovered.close()
+
+
 class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
     async def test_review_requires_new_affordable_rule_or_allocation_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -142,7 +330,7 @@ class AdaptiveJournalTests(unittest.IsolatedAsyncioTestCase):
             run.shared_watch = {"A", "B"}
             candidate = run.accounts["candidate"]
             at = stamp(0)
-            features = {
+            features: dict[str, Feature | None] = {
                 name: Feature(index, 10, at, at, 0.01, 0.02, 10, 9, 0.8)
                 for index, name in enumerate(("A", "B"))
             }

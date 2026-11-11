@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import SafetyError, Settings
+from .jsonio import private_json
 
 BASE_URL = "https://openapi.tossinvest.com"
 GET_PATHS = frozenset(
@@ -84,15 +85,6 @@ def secret_file(path: Path) -> str:
     if not value or value != value.strip() or "\n" in value or "\r" in value:
         raise SafetyError("Credential file must contain exactly one nonempty value")
     return value
-
-
-def private_json(path: Path, data: dict[str, Any]) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "w") as stream:
-        os.fchmod(stream.fileno(), 0o600)
-        json.dump(data, stream)
-    os.replace(temporary, path)
 
 
 class MarketClient:

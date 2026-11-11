@@ -8,13 +8,18 @@ import json
 import os
 from collections import Counter
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from papertrade.core import Settings, encode
-from tools.autotest_jobs import atomic_json
+from papertrade.clock import now_utc as now
+from papertrade.core import Settings
+from papertrade.jsonio import atomic_json
+from papertrade.jsonio import paper_json as encode
+from tools.kr_comparison_account import CAPITAL
 from tools.kr_comparison_ai import ASTRA, SOL, decide, review_cascade
-from tools.run_kr_paper_comparison import CAPITAL, ROOT, Comparison, now
+from tools.kr_comparison_events import write_event
+from tools.run_kr_paper_comparison import ROOT, Comparison
 
 
 async def campaign(market: Path, output: Path, until: datetime) -> None:
@@ -49,8 +54,7 @@ async def campaign(market: Path, output: Path, until: datetime) -> None:
             source.seek(-1, os.SEEK_END)
             partial_at_start = source.read(1) != b"\n"
 
-        def record(kind: str, **fields: Any) -> None:
-            events.write(encode({"kind": kind, "recorded_at": now(), **fields}) + "\n")
+        record = partial(write_event, events, now)
 
         def status() -> None:
             atomic_json(

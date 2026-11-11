@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from tools.autotest_jobs import ROOT, atomic_json, poll_job, start_job
-from tools.autotest_supervisor import read_json
+from papertrade.jsonio import atomic_json, read_json
+from tools.autotest_jobs import ROOT, poll_job, start_job
 from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
 
 

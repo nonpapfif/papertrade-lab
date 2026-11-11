@@ -13,7 +13,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .core import SEOUL, ZERO, SafetyError, decimal, encode, now_utc, stamp
+from .clock import now_utc
+from .core import SEOUL, ZERO, SafetyError, decimal, stamp
+from .jsonio import paper_json as encode
 
 
 class Store:

@@ -12,15 +12,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from papertrade.api import MarketClient
+from papertrade.clock import now_utc
 from papertrade.core import Settings
+from papertrade.jsonio import read_json
 from tools.autotest_jobs import ROOT
-from tools.autotest_supervisor import command, read_json, tree_digest
 from tools.paper_campaign.calendar import MarketCalendar
 from tools.paper_campaign.controller import Campaign
 from tools.paper_campaign.policy import Admission
 from tools.paper_campaign.review import AstraReview, run_review
 from tools.paper_campaign.runner import SessionRunner
 from tools.paper_market import KR, US
+from tools.runtime_audit import RuntimeAudit
+from tools.source_identity import command, tree_digest
 
 
 def main() -> int:
@@ -34,9 +37,14 @@ def main() -> int:
     parser.add_argument("--not-before-us", type=datetime.fromisoformat)
     parser.add_argument("--once", action="store_true", help="Reconcile one pass and exit")
     parser.add_argument("--review", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--audit-path", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--audit-run-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.review is not None:
-        return asyncio.run(run_review(args.review.resolve()))
+        if bool(args.audit_path) != bool(args.audit_run_id):
+            parser.error("Review audit path and run identity must be supplied together")
+        audit = RuntimeAudit(args.audit_path, args.audit_run_id) if args.audit_path else None
+        return asyncio.run(run_review(args.review.resolve(), audit))
     if (
         not args.output
         or not args.capacity
@@ -71,20 +79,23 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (output / "campaign.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        audit = RuntimeAudit(output / "runtime-audit.sqlite3", args.source_digest)
         campaign = Campaign(
             output,
-            MarketCalendar(MarketClient(settings), output / "calendar"),
+            MarketCalendar(MarketClient(settings), output / "calendar", audit),
             SessionRunner(args.source_commit, args.source_digest),
-            AstraReview(),
+            AstraReview(audit),
             admissions,
             not_before,
+            audit=audit,
         )
-        while True:
-            for market in markets:
-                campaign.tick(market, datetime.now(UTC))
-            if args.once:
-                return 0
-            time.sleep(5)
+        with audit.capture_runtime_failures("campaign"), audit.watching():
+            while True:
+                for market in markets:
+                    campaign.tick(market, now_utc())
+                if args.once:
+                    return 0
+                time.sleep(5)
 
 
 if __name__ == "__main__":

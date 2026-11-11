@@ -10,9 +10,9 @@ from typing import Any
 
 from tools.live_execution import DEFAULT_FEES, KR_FEES, ExecutionBook, ExecutionContext
 from tools.paper_market import US, PaperMarket
+from tools.strategy_catalog import REBOUND_NET_TARGET
 
 FAMILIES = ("trend", "breakout", "rebound")
-REBOUND_NET_TARGET = "rebound_net_target"
 
 
 def eligible_stock(row: dict[str, Any]) -> bool:

@@ -14,12 +14,15 @@ import random
 import signal
 import sqlite3
 import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from papertrade.api import SYMBOL, ApiError, MarketClient
+from papertrade.clock import now_utc
+from papertrade.clock import utc_iso as utc_now
 from papertrade.core import SafetyError, Settings, decimal, stamp
+from papertrade.jsonio import compact_unicode_json as encoded
 
 EXCHANGES = {
     "KR": ("KOSPI", "KOSDAQ", "KR_ETC"),
@@ -64,14 +67,6 @@ CREATE TABLE IF NOT EXISTS candles (
     page_id INTEGER NOT NULL REFERENCES pages(id), PRIMARY KEY (market, symbol, at)
 ) WITHOUT ROWID;
 """
-
-
-def encoded(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 class Blocked(Exception):
@@ -248,7 +243,7 @@ class Downloader:
                 end = max(stamp(w["end"]) for w in windows)
                 if market == "US":
                     end = max(end, start + timedelta(days=1))
-                if end > datetime.now(UTC):
+                if end > now_utc():
                     raise ValueError("Only completed historical days can be frozen")
                 scopes[market] = {"start": start.isoformat(), "end": end.isoformat(),
                                   "sessions": windows}

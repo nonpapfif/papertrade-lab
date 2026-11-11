@@ -17,8 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from papertrade.ai import DISABLED_FEATURES, codex_environment, parse_codex_events
+from papertrade.clock import utc_iso as now
+from papertrade.jsonio import atomic_json, read_json
 from papertrade.usage import read_metadata
-from tools.autotest_jobs import atomic_json, poll_job, start_job
+from tools.autotest_jobs import poll_job, start_job
+from tools.local_validation import require_report
+from tools.runtime_audit import RuntimeAudit, RuntimeAuditError
+from tools.source_identity import command, tree_digest
 from tools.supervisor_scopes import (
     PARTITIONED_TEST_MODULES,
     RECURRING_CONTRACT,
@@ -137,8 +142,11 @@ PROTECTED = (
     "papertrade/ai.py",
     "papertrade/usage.py",
     "papertrade/core.py",
+    "papertrade/clock.py",
+    "papertrade/jsonio.py",
     "tools/autotest_supervisor.py",
     "tools/autotest_jobs.py",
+    "tools/source_identity.py",
     "tools/supervisor_scopes.py",
     "AGENTS.md",
     "pyproject.toml",
@@ -171,22 +179,6 @@ EDITABLE_EXISTING = {
     "tools/live_execution.py",
     *(name.replace(".", "/") + ".py" for name in REGRESSION_MODULES),
 }
-
-
-def now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text())
-    if not isinstance(value, dict):
-        raise TypeError(f"Expected JSON object: {path.name}")
-    return value
-
-
-def command(argv: list[str], cwd: Path) -> str:
-    result = subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True)
-    return result.stdout.strip()
 
 
 def validate_result(role: str, value: dict[str, Any]) -> None:
@@ -229,22 +221,6 @@ def validate_fields(fields: dict[str, Any], value: dict[str, Any]) -> None:
                 raise ValueError(f"Unknown requirement: {name}")
         if "minimum" in field and item < field["minimum"]:
             raise ValueError(f"Invalid result minimum: {name}")
-
-
-def tree_digest(repo: Path) -> str:
-    paths = command(["git", "ls-files", "--cached", "--others", "--exclude-standard"], repo)
-    digest = hashlib.sha256()
-    for name in sorted(set(paths.splitlines())):
-        path = repo / name
-        digest.update(name.encode())
-        if path.is_symlink():
-            digest.update(b"symlink:" + os.readlink(path).encode())
-        elif path.is_file():
-            digest.update(path.read_bytes())
-            digest.update(b"executable" if path.stat().st_mode & 0o111 else b"regular")
-        else:
-            digest.update(b"missing")
-    return digest.hexdigest()
 
 
 def changed_paths(repo: Path) -> list[str]:
@@ -419,10 +395,14 @@ class Supervisor:
         *,
         kr_until: str | None = None,
         scope: str = "finite",
+        audit: RuntimeAudit | None = None,
+        local_validation: Path | None = None,
     ) -> None:
         if scope not in ("finite", "recurring-paper", REFACTOR_SCOPE) or (kr_until and scope != "finite"):
             raise ValueError("Invalid supervisor scope")
         self.scope = scope
+        self.audit = audit
+        self.local_validation = local_validation
         self.kr_until = kr_until
         self.requirements = (
             REFACTOR_REQUIREMENTS
@@ -479,7 +459,9 @@ class Supervisor:
         return Path(self.state.get("worktree", self.repo))
 
     def evidence(self) -> dict[str, Any]:
+        handoff = Path(self.state["inherited"]) / "engineering_handoff.json"
         return {
+            "engineering_handoff": read_json(handoff) if handoff.is_file() else None,
             "requirements": self.requirements,
             "milestone_document": (
                 "docs/concurrent-refactor.md"
@@ -560,10 +542,10 @@ For initial live evidence assess its actual scope, then continue with missing re
 Use fix for actionable defects. Use blocked only when no independent offline work can proceed.
 A blocked plan is a proposal, not a confirmed blocker. Verify its concrete external cause.
 Failed tests and repairable code are fix work, not external blockers.
-publish_ok requires tested changes with no actionable correctness findings; failures block merge.
+publish_ok requires tested changes with no actionable correctness findings. Publication stops at PR.
 complete requires all requirements satisfied, with residual real-market limits documented.
 For continue or fix, set next_plan to the single necessary action. Specify the change objective,
-acceptance criteria, and exact unittest targets under tests.test_*. Use offline for Sol changes,
+acceptance criteria, and exact unittest targets under tests.test_*. Keep each response concise. Use offline for Sol changes,
 test for targeted Python checks without edits, and live for a finite frozen-baseline run.
 Choose test targets compatible with the offline runner. If a prerequisite is unavailable there
 and no independent work remains, report the blocker. A skip is not evidence of a passing test.
@@ -676,7 +658,13 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             self.state["history"].append(
                 {"cycle": self.state["cycle"], "review": value, "evidence": str(job), "at": now()}
             )
-            if value["publish_ok"] and self.state.get("worktree") and changed_paths(self.worktree):
+            publish_ready = self.scope != REFACTOR_SCOPE or (
+                value["decision"] == "complete" and set(value["satisfied"]) == set(self.requirements)
+            )
+            if (
+                publish_ready and value["publish_ok"]
+                and self.state.get("worktree") and changed_paths(self.worktree)
+            ):
                 if not self.state.get("tests_passed"):
                     raise RuntimeError("Review cannot override failed mechanical checks")
                 if self.state.get("tested_digest") != self.state["review_digest"]:
@@ -864,14 +852,14 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             raise RuntimeError("Recurring deployment requires the reviewed campaign adapter")
         cycle = self.state["cycle"] + 1
         if plan["kind"] == "test":
-            if changed_paths(self.worktree):
+            if self.scope != REFACTOR_SCOPE and changed_paths(self.worktree):
                 raise RuntimeError("Unpublished changes require the offline regression suite")
             self.state.update(cycle=cycle, tests_passed=False, worker=None, live_run=None)
             self.prepare_tests("")
             return
         if (
             self.state.get("worktree")
-            and self.state["review"]["decision"] == "fix"
+            and (self.scope == REFACTOR_SCOPE or self.state["review"]["decision"] == "fix")
             and changed_paths(self.worktree)
         ):
             if plan["kind"] != "offline":
@@ -892,8 +880,7 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         command(["git", "fetch", "origin"], self.repo)
         if command(["git", "branch", "--show-current"], self.repo) != "master":
             raise RuntimeError("Main checkout is not master")
-        command(["git", "merge", "--ff-only", "origin/master"], self.repo)
-        base = command(["git", "rev-parse", "HEAD"], self.repo)
+        base = command(["git", "rev-parse", "origin/master"], self.repo)
         command(["git", "worktree", "add", "-b", branch, str(worktree), base], self.repo)
         self.transition(
             "live_start" if plan["kind"] == "live" else "implement",
@@ -1120,12 +1107,14 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         if self.scope == REFACTOR_SCOPE:
             self.verify_refactor_evidence()
             review = self.state["review"]
-            if review["publish_ok"] is not True or review["decision"] not in ("continue", "complete"):
-                raise RuntimeError("Refactor publication requires Astra approval")
-            if review["decision"] == "complete" and set(review["satisfied"]) != set(
-                self.requirements
-            ):
+            if review["publish_ok"] is not True or review["decision"] != "complete":
+                raise RuntimeError("Refactor publication requires Astra completion and approval")
+            if set(review["satisfied"]) != set(self.requirements):
                 raise RuntimeError("Astra completion omitted pending requirements")
+            if self.local_validation is None:
+                self.transition("validation_pending", live_validation_pending=True)
+                return
+            require_report(self.local_validation, self.state["publication_digest"])
         if tree_digest(self.worktree) != self.state["publication_digest"]:
             raise RuntimeError("Reviewed source changed before publication")
         if self.state.get("tested_digest") != self.state["publication_digest"]:
@@ -1177,6 +1166,11 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
             )
             + "Astra reviewed this source and evidence before publication.\n"
             + (
+                "Full local Ruff, mypy and unittest checks passed against this source.\n"
+                if self.scope == REFACTOR_SCOPE
+                else ""
+            )
+            + (
                 "\nLive validation remains pending.\n"
                 + "\nHost checks not run by the offline supervisor:\n"
                 + "\n".join("- " + name for name in self.state["host_checks_not_run"])
@@ -1213,54 +1207,37 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
         result = json.loads(
             command(
                 [
-                    "gh",
-                    "pr",
-                    "view",
-                    "--repo",
-                    "nonpapfif/papertrade-lab",
-                    self.state["pr"],
-                    "--json",
-                    "headRefOid,mergeable,mergeStateStatus,statusCheckRollup",
+                    "gh", "pr", "view", "--repo", "nonpapfif/papertrade-lab", self.state["pr"],
+                    "--json", "headRefOid,state",
                 ],
                 self.worktree,
             )
         )
         if result["headRefOid"] != self.state["publish_sha"]:
             raise RuntimeError("PR head changed after review")
-        if result["mergeable"] == "UNKNOWN":
-            return
-        checks = result["statusCheckRollup"] or []
-        for check in checks:
-            if check.get("status") in ("QUEUED", "IN_PROGRESS", "PENDING"):
-                return
-            outcome = check.get("conclusion") or check.get("state")
-            if outcome not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-                raise RuntimeError("Required PR check has not passed")
-        if result["mergeable"] != "MERGEABLE" or result["mergeStateStatus"] != "CLEAN":
-            raise RuntimeError("PR is not cleanly mergeable")
-        self.transition("merging")
-        command(
-            [
-                "gh",
-                "pr",
-                "merge",
-                "--repo",
-                "nonpapfif/papertrade-lab",
-                self.state["pr"],
-                "--merge",
-                "--match-head-commit",
-                self.state["publish_sha"],
-            ],
-            self.worktree,
-        )
-        command(["git", "fetch", "origin"], self.repo)
-        if command(["git", "status", "--porcelain"], self.repo):
-            raise RuntimeError("Main checkout changed during publication")
-        command(["git", "merge", "--ff-only", "origin/master"], self.repo)
+        if result["state"] != "OPEN":
+            raise RuntimeError("Expected the published PR to be open")
         self.state["history"][-1]["pr"] = self.state["pr"]
-        self.after_review()
+        self.transition(
+            "pr_ready",
+            publication_verified=True,
+            live_validation_pending=self.scope == REFACTOR_SCOPE,
+        )
 
     def step(self) -> None:
+        if self.audit is None:
+            self._step()
+            return
+        with self.audit.operation(
+            "engineering_handoff", "supervisor_step_failed", {"event_id": self.state["phase"]}
+        ):
+            if not self.audit.healthy:
+                raise RuntimeAuditError("Supervisor audit storage is unhealthy")
+            self.audit.heartbeat("engineering_handoff", status="active", timeout=180)
+            self._step()
+            self.audit.heartbeat("engineering_handoff", status="waiting")
+
+    def _step(self) -> None:
         phase = self.state["phase"]
         if phase == "inherit":
             path = Path(self.state["inherited"]) / "status.json"
@@ -1290,6 +1267,8 @@ Do not rewrite source while the experiment runs. Do not change unrelated legacy 
                 )
             result = poll_job(Path(self.state["job"]))
             if result is not None:
+                if self.audit is not None and result["returncode"] != 0:
+                    self.audit.record("engineering_handoff", "validation_worker_failed")
                 self.transition("review", live_returncode=result["returncode"])
         elif phase == "publish":
             self.publish()
@@ -1307,6 +1286,7 @@ def main() -> None:
     parser.add_argument("--inherited", required=True, type=Path)
     parser.add_argument("--codex", required=True, type=Path)
     parser.add_argument("--kr-until", type=datetime.fromisoformat)
+    parser.add_argument("--local-validation", type=Path)
     parser.add_argument("--scope", choices=("finite", "recurring-paper", REFACTOR_SCOPE), default="finite")
     args = parser.parse_args()
     if args.kr_until is not None and args.kr_until.tzinfo is None:
@@ -1314,41 +1294,55 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / "supervisor.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        supervisor = Supervisor(
-            args.repo,
-            args.output,
-            args.codex,
-            args.inherited,
-            kr_until=args.kr_until.isoformat() if args.kr_until else None,
-            scope=args.scope,
-        )
-        if args.scope != REFACTOR_SCOPE and "trusted_live_commit" not in supervisor.state:
-            if command(["git", "status", "--porcelain"], args.repo):
-                raise RuntimeError("Initial trusted live checkout must be clean")
-            supervisor.state["trusted_live_commit"] = command(
-                ["git", "rev-parse", "HEAD"], args.repo
+        audit = RuntimeAudit(args.output / "runtime-audit.sqlite3", "engineering-supervisor")
+        with (
+            audit.capture_runtime_failures("engineering_handoff"),
+            audit.watching(),
+            audit.operation("engineering_handoff", "supervisor_failed"),
+        ):
+            supervisor = Supervisor(
+                args.repo,
+                args.output,
+                args.codex,
+                args.inherited,
+                kr_until=args.kr_until.isoformat() if args.kr_until else None,
+                scope=args.scope,
+                audit=audit,
+                local_validation=args.local_validation.resolve() if args.local_validation else None,
             )
-            supervisor.state["trusted_live_digest"] = tree_digest(args.repo)
-            supervisor.save()
-        metadata = read_metadata(
-            [str(args.codex), "app-server", "--listen", "stdio://", "-c", "mcp_servers={}"],
-            codex_environment(),
-        )
-        catalog = {item["model"]: item["efforts"] for item in metadata["models"]}
-        for role in ("implement", "review"):
-            model, effort = MODELS[role]
-            if effort not in catalog.get(model, []):
-                raise RuntimeError(f"Requested model/effort unavailable: {model}/{effort}")
-        atomic_json(args.output / "metadata.json", metadata)
-        try:
-            while supervisor.state["phase"] not in ("complete", "blocked"):
-                before = supervisor.state["phase"]
-                supervisor.step()
-                if supervisor.state["phase"] == before:
-                    time.sleep(2)
-        except Exception as error:
-            supervisor.transition("blocked", reason=f"{type(error).__name__}: {error}")
-            raise
+            terminal_phases = {"complete", "blocked", "pr_ready", "validation_pending"}
+            if supervisor.state["phase"] == "validation_pending" and args.local_validation:
+                supervisor.transition("publish")
+            if supervisor.state["phase"] in terminal_phases:
+                return
+            if args.scope != REFACTOR_SCOPE and "trusted_live_commit" not in supervisor.state:
+                if command(["git", "status", "--porcelain"], args.repo):
+                    raise RuntimeError("Initial trusted live checkout must be clean")
+                supervisor.state["trusted_live_commit"] = command(
+                    ["git", "rev-parse", "HEAD"], args.repo
+                )
+                supervisor.state["trusted_live_digest"] = tree_digest(args.repo)
+                supervisor.save()
+            if supervisor.state["phase"] not in ("publish", "pr_wait"):
+                metadata = read_metadata(
+                    [str(args.codex), "app-server", "--listen", "stdio://", "-c", "mcp_servers={}"],
+                    codex_environment(),
+                )
+                catalog = {item["model"]: item["efforts"] for item in metadata["models"]}
+                for role in ("implement", "review"):
+                    model, effort = MODELS[role]
+                    if effort not in catalog.get(model, []):
+                        raise RuntimeError(f"Requested model/effort unavailable: {model}/{effort}")
+                atomic_json(args.output / "metadata.json", metadata)
+            try:
+                while supervisor.state["phase"] not in terminal_phases:
+                    before = supervisor.state["phase"]
+                    supervisor.step()
+                    if supervisor.state["phase"] == before:
+                        time.sleep(2)
+            except Exception as error:
+                supervisor.transition("blocked", reason=type(error).__name__, failure_phase=before)
+                raise
 
 
 if __name__ == "__main__":

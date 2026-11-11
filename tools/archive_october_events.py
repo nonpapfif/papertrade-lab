@@ -23,6 +23,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from papertrade.api import NoRedirect
+from papertrade.clock import utc_iso
+from papertrade.jsonio import archive_json as encode
 
 HOSTS = frozenset(
     {"www.federalreserve.gov", "www.bls.gov", "www.bea.gov", "www.bok.or.kr", "api.nasdaq.com"}
@@ -61,10 +63,6 @@ CREATE TABLE IF NOT EXISTS extractions (
     missing_metrics TEXT NOT NULL, problem TEXT
 );
 """
-
-
-def encode(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def source_plan() -> list[dict[str, str]]:
@@ -624,7 +622,7 @@ def extract_results(db: sqlite3.Connection, output: Path) -> None:
 def status(db: sqlite3.Connection, output: Path, state: str, **extra: Any) -> None:
     record = {
         "state": state,
-        "updated_at": datetime.now(UTC).isoformat(),
+        "updated_at": utc_iso(),
         "pid": os.getpid(),
         "ai_calls": 0,
         "sources": dict(db.execute("SELECT state,COUNT(*) FROM sources GROUP BY state").fetchall()),
@@ -730,7 +728,7 @@ def run(output: Path, excerpts: Path | None = None, extract_only: bool = False) 
                             source["url"],
                             state,
                             http_status,
-                            datetime.now(UTC).isoformat(),
+                            utc_iso(),
                             digest,
                             gzip.compress(body, mtime=0),
                             content_type,

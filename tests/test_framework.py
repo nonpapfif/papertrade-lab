@@ -9,10 +9,13 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from decimal import Decimal
+from http.client import HTTPMessage
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from papertrade.__main__ import main
@@ -138,6 +141,7 @@ class BoundaryTests(BaseCase):
         )
         usage, text, actions = parse_codex_events(events)
         self.assertEqual(text, "{}")
+        assert usage is not None
         self.assertEqual(usage["input_tokens"], 100)
         self.assertEqual(actions, [])
 
@@ -178,7 +182,13 @@ class BoundaryTests(BaseCase):
             validate_request(method, path)
 
     def test_redirects_cannot_forward_credentials(self) -> None:
-        self.assertIsNone(NoRedirect().redirect_request(None, None, 302, "", {}, "https://x"))
+        handler: urllib.request.HTTPRedirectHandler = NoRedirect()
+        request = urllib.request.Request("https://fixture.invalid")
+        with io.BytesIO() as response:
+            redirect = handler.redirect_request(
+                request, response, 302, "", HTTPMessage(), "https://x"
+            )
+        self.assertIsNone(redirect)
 
     def test_secret_mode_and_symlink_checks(self) -> None:
         path = self.root / "secret"
@@ -355,7 +365,7 @@ class StrategyTests(BaseCase):
         )
 
     def test_tradeable_symbols_have_no_price_floor_or_leverage_exclusion(self) -> None:
-        stock = {
+        stock: dict[str, str | None] = {
             "status": "ACTIVE",
             "currency": "USD",
             "securityType": "ETF",
@@ -528,7 +538,9 @@ class UsageTests(BaseCase):
     def test_light_test_standard_review_and_complex_review_routes(self) -> None:
         row = candidate()
         row["entry_price"] = "100"
-        args = (self.catalog(), False, "auto", {})
+        args: tuple[list[dict[str, Any]], bool, str, dict[str, Any]] = (
+            self.catalog(), False, "auto", {}
+        )
         self.assertEqual(
             select_model([row], self.catalog(), True, "auto", {})["model"], "gpt-6-luna"
         )

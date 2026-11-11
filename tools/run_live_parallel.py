@@ -19,12 +19,17 @@ from pathlib import Path
 from typing import Any
 
 from papertrade.api import ApiError
+from papertrade.clock import now_utc
+from papertrade.clock import utc_iso as now
 from papertrade.core import Settings
+from papertrade.jsonio import canonical_json as encode
+from papertrade.jsonio import save_canonical_json as save
 from tools.combined_hedge import CombinedHedge
 from tools.live_execution import LiveWeekEngine
 from tools.live_feed import LiveFeed, SnapshotHistory
 from tools.run_week_experiment import long_policies
 from tools.search_portfolios import configurations, rank_frame, signals
+from tools.source_identity import file_digest as digest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (
@@ -37,6 +42,10 @@ SOURCES = (
     "tools/search_portfolios.py",
     "papertrade/api.py",
     "papertrade/core.py",
+    "papertrade/clock.py",
+    "papertrade/jsonio.py",
+    "tools/research_metadata.py",
+    "tools/source_identity.py",
 )
 COST_SOURCES = {
     "brokerage": "https://www.toss.market/service/securities",
@@ -44,24 +53,6 @@ COST_SOURCES = {
     "taf_holiday": "https://www.govinfo.gov/content/pkg/FR-2026-09-23/html/2026-19392.htm",
     "korean_capital_gains": "https://home-files.tossinvest.com/files/notice/8c287d57-0108-4a0a-987e-e91bcc90c8a1.pdf",
 }
-
-
-def encode(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def save(path: Path, value: Any) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(encode(value) + "\n")
-    temporary.replace(path)
 
 
 def live_design() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -288,7 +279,7 @@ def collect_books(
                     cooldown = True
         if cooldown:
             return
-        cutoff = datetime.now(UTC).timestamp()
+        cutoff = now_utc().timestamp()
         for symbol, book in frame["orderbooks"].items():
             stamp = book.get("timestamp")
             if stamp is None or cutoff - datetime.fromisoformat(stamp).timestamp() > 60:

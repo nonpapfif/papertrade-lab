@@ -7,12 +7,13 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from itertools import pairwise
 from queue import SimpleQueue
 from typing import Any
 
 from papertrade.api import SYMBOL, ApiError, MarketClient
+from papertrade.clock import utc_iso
 from papertrade.core import SafetyError, Settings, stamp
 from tools.paper_market import US, PaperMarket
 
@@ -134,7 +135,7 @@ class LiveFeed:
                 book = client.book(symbol)
             except ApiError as error:
                 return error
-            received = datetime.now(UTC).isoformat()
+            received = utc_iso()
             events.put(("orderbook", {"symbol": symbol, "result": book, "received_at": received}))
             return {**book, "received_at": received}
 

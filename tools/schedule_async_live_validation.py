@@ -15,10 +15,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from papertrade.jsonio import atomic_json, read_json
 from tools.adaptive_journal import read_status as read_journal_status
-from tools.autotest_jobs import ROOT, STOP_SECONDS, atomic_json, poll_job, start_job
-from tools.autotest_supervisor import command, read_json, tree_digest
+from tools.autotest_jobs import ROOT, STOP_SECONDS, poll_job, start_job
 from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
+from tools.source_identity import command, tree_digest
 
 CUTOFF_DRAIN_SECONDS = 60
 CAMPAIGN_RESTART_LIMIT = 3

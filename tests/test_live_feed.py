@@ -7,6 +7,7 @@ import pickle
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -66,7 +67,8 @@ class LiveFeedTests(unittest.TestCase):
 
         class Client:
             def __init__(
-                self, settings: object, primary: object, lock: object, audit: object
+                self, settings: object, primary: object, lock: object,
+                audit: Callable[[dict[str, Any]], None],
             ) -> None:
                 self.audit = audit
                 clients.append(self)
@@ -85,7 +87,7 @@ class LiveFeedTests(unittest.TestCase):
             result = self.feed.orderbook_batch(["A", "B", "A"])
         self.assertEqual(list(result), ["A", "B"])
         self.assertEqual(len(clients), 2)
-        self.assertTrue(all("received_at" in row for row in result.values()))
+        self.assertTrue(all(isinstance(row, dict) and "received_at" in row for row in result.values()))
         self.assertEqual(sum(k == "http" for k, _ in self.events), 2)
         self.assertEqual(sum(k == "orderbook" for k, _ in self.events), 2)
 
@@ -215,6 +217,7 @@ class SnapshotHistoryTests(unittest.TestCase):
         self.assertEqual((result["accepted"], result["rejected"]), (1, 1))
         self.assertEqual(result["issues"][0]["reason"], "future_source_time")
         self.assertEqual(len(history.rows["TEST"]), 2)
+        assert history.last_at is not None
         self.assertEqual(history.last_at.isoformat(), at(1))
         self.assertNotIn("FUTURE", history.rows)
         self.assertEqual(events[-1][1]["row"], future)

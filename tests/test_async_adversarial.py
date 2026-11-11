@@ -47,19 +47,19 @@ async def exercise(seed: int, steps: int = 150) -> dict:
 
 
 class AdversarialTests(unittest.IsolatedAsyncioTestCase):
-    async def account(self):
+    async def account(self) -> AsyncLayeredPaper:
         a = AsyncLayeredPaper(100)
         self.addAsyncCleanup(a.close)
         return a
 
-    async def test_malformed_feature_returns_error_instead_of_orphaning_waiter(self):
+    async def test_malformed_feature_returns_error_instead_of_orphaning_waiter(self) -> None:
         a = await self.account()
         with self.assertRaises(TypeError):
             await asyncio.wait_for(a.submit(event(feature={})), 0.2)
         await asyncio.wait_for(a.submit(event(at=1)), 0.2)
         self.assertEqual(len(a.pending), 1)
 
-    async def test_feature_for_other_symbol_cannot_create_a_request(self):
+    async def test_feature_for_other_symbol_cannot_create_a_request(self) -> None:
         a = await self.account()
         e = event()
         e["feature"] = replace(e["feature"], symbol=999)
@@ -67,7 +67,7 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
             await a.submit(e)
         self.assertEqual(a.intents, [])
 
-    async def test_nonfinite_feature_cannot_create_a_request(self):
+    async def test_nonfinite_feature_cannot_create_a_request(self) -> None:
         a = await self.account()
         e = event()
         e["feature"] = replace(e["feature"], r5=float("inf"))
@@ -75,7 +75,7 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
             await a.submit(e)
         self.assertEqual(a.intents, [])
 
-    async def test_fresh_held_quote_is_not_stale_merely_because_clock_advanced(self):
+    async def test_fresh_held_quote_is_not_stale_merely_because_clock_advanced(self) -> None:
         a = await self.account()
         await a.submit(event())
         await a.submit(event(at=2))
@@ -84,7 +84,7 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
         await a.advance(stamp(63))
         self.assertEqual(a.summary()["account"]["stale_open_positions"], 1)
 
-    async def test_equivalent_timezone_does_not_change_staleness(self):
+    async def test_equivalent_timezone_does_not_change_staleness(self) -> None:
         a = await self.account()
         await a.submit(event())
         e = event(at=2)
@@ -94,7 +94,7 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
         await a.submit(e)
         self.assertEqual(a.summary()["account"]["stale_open_positions"], 0)
 
-    async def test_cancelling_ack_wait_does_not_duplicate_accepted_event(self):
+    async def test_cancelling_ack_wait_does_not_duplicate_accepted_event(self) -> None:
         a = await self.account()
         future = a.enqueue(event())
         future.cancel()
@@ -103,14 +103,14 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
         await a.submit(event(at=2))
         self.assertEqual(a.book.opened, 1)
 
-    async def test_randomized_partial_fills_and_duplicate_delivery_reconcile(self):
+    async def test_randomized_partial_fills_and_duplicate_delivery_reconcile(self) -> None:
         for seed in range(5):
             await exercise(seed)
 
-    async def test_replaying_identical_seed_is_deterministic(self):
+    async def test_replaying_identical_seed_is_deterministic(self) -> None:
         self.assertEqual(await exercise(22), await exercise(22))
 
-    async def test_unexpected_worker_exception_reaches_caller_and_keeps_queue_alive(self):
+    async def test_unexpected_worker_exception_reaches_caller_and_keeps_queue_alive(self) -> None:
         a = await self.account()
         with (
             patch.object(a, "_process", side_effect=AttributeError("Unexpected failure")),
