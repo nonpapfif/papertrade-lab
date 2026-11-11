@@ -18,6 +18,13 @@ from typing import Any
 from papertrade.jsonio import atomic_json, read_json
 from tools.adaptive_journal import read_status as read_journal_status
 from tools.autotest_jobs import ROOT, STOP_SECONDS, poll_job, start_job
+from tools.session_update import (
+    HELD_NAME,
+    load_manifest,
+    load_ready,
+    validate_source,
+    validate_target,
+)
 from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
 from tools.source_identity import command, tree_digest
 
@@ -44,24 +51,71 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     recovery = spec.get("recover") is True
     dynamic_slots = spec.get("dynamic_slots") is True
     recurring = "initial_slots" in spec
+    update_capable = recurring and dynamic_slots and recovery
     journal = output / "journal.sqlite3"
     slot_spool = output / SPOOL_NAME
     restarts: list[dict[str, Any]] = []
+    source_root = ROOT
+    source_commit = spec.get("source_commit")
+    source_digest = spec.get("source_digest")
+    resume_update: Path | None = None
+    active_request: dict[str, Any] | None = None
+    transition_source: Path | None = None
 
     def paths(attempt: int) -> tuple[Path, Path]:
         base = output / "attempts" / str(attempt) if attempt > 1 else output
         return base / "job", base / "run"
 
+    def select_update(attempt: int, restart: dict[str, Any]) -> None:
+        nonlocal source_root, source_commit, source_digest, resume_update
+        nonlocal active_request, transition_source
+        job, run_output = paths(attempt)
+        directory = job.parent / "update"
+        ready = load_manifest(directory)
+        request = ready["request"]
+        evidence = ready["journal"]
+        run = read_json(run_output / "status.json")
+        if (
+            not update_capable
+            or ready != restart["update"]
+            or ready["journal_path"] != str(journal.resolve())
+            or (request["from_commit"], request["from_digest"]) != (source_commit, source_digest)
+            or evidence["records"] != restart.get("journal_records")
+            or evidence["cursor"] != restart["cursor"]
+            or evidence["chain_sha256"] != restart["journal_hash"]
+            or restart["job_exit"].get("returncode") != 0
+            or restart["job_exit"].get("cutoff_stop") is True
+            or not (job / "start.claim").exists()
+            or poll_job(job) != restart["job_exit"]
+            or run.get("state") != "handoff_ready"
+            or run.get("handoff") != ready
+        ):
+            raise RuntimeError("Saved source transition does not match the worker handoff")
+        transition_source = source_root
+        source_root = Path(request["target_root"])
+        source_commit = request["target_commit"]
+        source_digest = request["target_digest"]
+        resume_update = directory
+        active_request = request
+
     def save(state: str, **details: Any) -> None:
+        attempt = len(restarts) + 1
+        job, run_output = paths(attempt)
         if recovery:
             details["restarts"] = restarts
+        if update_capable:
+            details["update_source"] = {
+                "attempt": attempt,
+                "root": str(source_root.resolve()),
+                "commit": source_commit,
+                "digest": source_digest,
+                "directory": str((job.parent / "update").resolve()),
+            }
         if state in ("failed", "blocked", "incomplete"):
-            attempt = len(restarts) + 1
-            job, run_output = paths(attempt)
             details["failure_handoff"] = {
                 "attempt": attempt,
-                "source_commit": spec.get("source_commit"),
-                "source_digest": spec.get("source_digest"),
+                "source_commit": source_commit,
+                "source_digest": source_digest,
                 "evidence": {
                     label: str(path.relative_to(output)) if path.is_file() else None
                     for label, path in (
@@ -93,7 +147,7 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             if not isinstance(history, list):
                 raise RuntimeError("Saved schedule is missing restart evidence")
             cursor = -1
-            for restart in history:
+            for attempt, restart in enumerate(history, 1):
                 if (
                     not isinstance(restart, dict)
                     or type(restart.get("cursor")) is not int
@@ -103,6 +157,8 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                     or not isinstance(restart.get("job_exit"), dict)
                 ):
                     raise RuntimeError("Saved restart evidence is invalid")
+                if "update" in restart:
+                    select_update(attempt, restart)
                 cursor = restart["cursor"]
             restarts = history
         job, _ = paths(len(restarts) + 1)
@@ -118,7 +174,9 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
     poll_until = stop_after + 2 * STOP_SECONDS
     try:
         while True:
-            job, run_output = paths(len(restarts) + 1)
+            attempt = len(restarts) + 1
+            job, run_output = paths(attempt)
+            update_dir = job.parent / "update"
             result = None
             if not (job / "start.claim").exists():
                 if run_output.exists() or job.exists():
@@ -151,7 +209,12 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                         return 1
                     save("expired")
                     return 0
-                if (
+                if active_request is not None:
+                    assert resume_update is not None
+                    if load_ready(resume_update)["request"] != active_request:
+                        raise RuntimeError("Selected source handoff changed before launch")
+                    validate_target(active_request, source_root=transition_source)
+                elif (
                     command(["git", "rev-parse", "HEAD"], ROOT) != spec["source_commit"]
                     or tree_digest(ROOT) != spec["source_digest"]
                 ):
@@ -175,13 +238,17 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                         argv[argv.index("--output") + 1] = str(run_output)
                         argv.append("--resume")
                     argv.extend(["--journal", str(journal)])
+                if update_capable:
+                    argv.extend(["--update-dir", str(update_dir)])
+                    if resume_update is not None:
+                        argv.extend(["--resume-update", str(resume_update)])
                 if time.time() >= spec["end_epoch"]:
                     if restarts:
                         save("incomplete", reason="Approved window ended before restart")
                         return 1
                     save("expired")
                     return 0
-                start_job(job, argv, ROOT, stop_after=stop_after)
+                start_job(job, argv, source_root, stop_after=stop_after)
 
             save("running")
             # Wall time determines the approved cutoff. Monotonic time also bounds the wait
@@ -199,14 +266,55 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             if result.get("cutoff_stop") is True:
                 save("incomplete", job_exit=result, reason="Worker stopped after cutoff drain")
                 return 1
+            status_file = run_output / "status.json"
+            run = read_json(status_file) if status_file.exists() else {}
+            run_state = run.get("state")
+            if result["returncode"] == 0 and run_state == "handoff_ready":
+                if not update_capable:
+                    raise RuntimeError("Worker source handoff is outside an update-capable schedule")
+                ready = load_ready(update_dir)
+                verified = read_journal_status(journal)
+                identity = verified["identity"]
+                if (
+                    verified["state"] != "active"
+                    or ready["journal"] != {
+                        "records": verified["records"],
+                        "cursor": verified["cursor"],
+                        "chain_sha256": verified["hash"],
+                    }
+                    or identity.get("experiment") != "shared_feed_slots"
+                    or identity.get("slot_control") != str(slot_spool.resolve())
+                    or identity.get("end_epoch") != spec["end_epoch"]
+                ):
+                    raise RuntimeError("Journal does not match the completed worker handoff")
+                if not isinstance(source_commit, str) or not isinstance(source_digest, str):
+                    raise RuntimeError("Worker source identity is missing")
+                validate_source(source_root, source_commit, source_digest)
+                validate_target(ready["request"], source_root=source_root)
+                restart = {
+                    "cursor": verified["cursor"],
+                    "journal_hash": verified["hash"],
+                    "journal_records": verified["records"],
+                    "job_exit": result,
+                    "run_state": run_state,
+                    "update": ready,
+                    "at": time.time(),
+                }
+                select_update(attempt, restart)
+                restarts.append(restart)
+                save("restarting")
+                continue
+            if update_capable and (
+                (update_dir / "ready.json").exists()
+                or (update_dir / HELD_NAME).exists()
+                or run_state in ("holding", "handoff_ready")
+            ):
+                raise RuntimeError("Update request has no verified successful worker handoff")
             if result["returncode"] == 0:
                 break
             if not recovery:
                 save("failed", job_exit=result)
                 return 1
-            status_file = run_output / "status.json"
-            run = read_json(status_file) if status_file.exists() else {}
-            run_state = run.get("state")
             if not retryable_exit(result, run):
                 save("failed", job_exit=result, run_state=run_state)
                 return 1
@@ -220,12 +328,13 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
             if restarts and cursor <= restarts[-1]["cursor"] and not recurring:
                 save("failed", job_exit=result, reason="Journal cursor did not advance")
                 return 1
-            if recurring and len(restarts) >= CAMPAIGN_RESTART_LIMIT:
+            fault_count = sum("update" not in restart for restart in restarts)
+            if recurring and fault_count >= CAMPAIGN_RESTART_LIMIT:
                 save("failed", job_exit=result, reason="Recurring restart limit reached")
                 return 1
             retry_at = run.get("api_retry_at")
             if recurring:
-                retry_at = max(retry_at or 0, time.time() + 5 * 2 ** len(restarts))
+                retry_at = max(retry_at or 0, time.time() + 5 * 2 ** fault_count)
             restarts.append(
                 {
                     "cursor": cursor,
@@ -280,7 +389,11 @@ def run_schedule(output: Path, spec: dict[str, Any]) -> int:
                 )
             ):
                 raise RuntimeError("Run status does not confirm a completed comparison")
-        if tree_digest(ROOT) != spec["source_digest"]:
+        if active_request is not None:
+            validate_source(
+                source_root, active_request["target_commit"], active_request["target_digest"]
+            )
+        elif tree_digest(source_root) != source_digest:
             save("incomplete", job_exit=result, reason="Approved source changed during the run")
             return 1
         if dynamic_slots:

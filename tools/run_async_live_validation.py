@@ -20,13 +20,13 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, TextIO, TypeVar
 
 from papertrade.api import ApiError, MarketClient
 from papertrade.clock import utc_iso as now
 from papertrade.core import SafetyError, Settings
+from papertrade.jsonio import atomic_json, private_json
 from papertrade.jsonio import journal_json as encode
-from papertrade.jsonio import private_json
 from tools.account_executor import AccountAction, AccountExecutor, AccountResult
 from tools.adaptive_journal import AdaptiveJournal, JournalError, digest
 from tools.async_layered_paper import (
@@ -59,6 +59,20 @@ from tools.probe_toss_websocket import (
     read_spec,
 )
 from tools.runtime_audit import DISPATCH_BACKLOG_TIMEOUT, DISPATCH_TIMEOUT, RuntimeAudit
+from tools.session_update import (
+    HELD_NAME,
+    UPDATE_SCHEMA,
+    cut_marker,
+    economic_digest,
+    held_identity,
+    held_inputs,
+    load_manifest,
+    load_request,
+    source_marker,
+    validate_source,
+    validate_target,
+    verify_resume,
+)
 from tools.shared_feed_slots import SharedFeedSlots, validate_session_seeds
 from tools.slot_control import SlotControl
 from tools.source_identity import file_digest
@@ -84,6 +98,7 @@ SOURCES = (
     "tools/layered_paper.py",
     "tools/live_execution.py",
     "tools/live_feed.py",
+    "tools/local_validation.py",
     "tools/market_data_adapter.py",
     "tools/market_data_gateway.py",
     "tools/market_data_repository.py",
@@ -92,6 +107,7 @@ SOURCES = (
     "tools/replay_market_day.py",
     "tools/research_metadata.py",
     "tools/runtime_audit.py",
+    "tools/session_update.py",
     "tools/search_portfolios.py",
     "tools/shared_feed_slots.py",
     "tools/slot_control.py",
@@ -102,6 +118,7 @@ SOURCES = (
     "tools/week_hypotheses.py",
 )
 HELD_QUOTE_RETRY_SECONDS = 5.0
+_ReadResult = TypeVar("_ReadResult")
 
 MARKET_CAPABILITY_SNAPSHOT = {
     "source": "https://openapi.tossinvest.com/openapi-docs/latest/openapi.json",
@@ -1681,6 +1698,7 @@ def journal_identity(
         "experiment": "adaptive_exploration" if slot_control is None else "shared_feed_slots",
         **({"slot_control": str(slot_control.resolve())} if slot_control is not None else {}),
         **({"campaign_seeds": campaign_seeds} if campaign_seeds is not None else {}),
+        **({"economic_sha256": economic_digest(ROOT)} if campaign_seeds is not None else {}),
         "market": market.code,
         "currency": market.currency,
         "capital": float(capital),
@@ -1690,6 +1708,89 @@ def journal_identity(
         },
         "settings_sha256": file_digest(ROOT / "settings.toml"),
     }
+
+
+def validate_update_request(directory: Path) -> dict[str, Any]:
+    request = load_request(directory)
+    validate_source(ROOT, request["from_commit"], request["from_digest"])
+    validate_target(request, source_root=ROOT)
+    return request
+
+
+async def drain_queue(
+    queue: asyncio.Queue, consumer: asyncio.Task, *, deadline: float | None = None
+) -> None:
+    drain = asyncio.create_task(queue.join())
+    try:
+        done, _ = await asyncio.wait(
+            {consumer, drain},
+            timeout=None if deadline is None else max(0, deadline - time.monotonic()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if consumer in done:
+            if not consumer.cancelled():
+                consumer.result()
+            raise RuntimeError("Consumer stopped while draining the queue")
+        if drain not in done:
+            raise CampaignCutoff("Campaign cutoff reached while draining for update")
+        await drain
+    finally:
+        if not drain.done():
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+
+async def hold_for_update(
+    slots: SharedFeedSlots,
+    consumer: asyncio.Task,
+    producers: tuple[asyncio.Task, asyncio.Task],
+    request: dict[str, Any],
+    update_dir: Path,
+    journal_path: Path,
+    output: Path,
+    stats: dict[str, Any],
+    deadline: float,
+) -> dict[str, Any]:
+    with AdaptiveJournal.open(
+        update_dir / HELD_NAME, held_identity(request, journal_path), resume=False,
+    ) as held:
+        slots.begin_hold(held, request)
+        atomic_json(
+            output / "status.json",
+            {**stats, "state": "holding", "at": now(), "request": request},
+        )
+        await drain_queue(slots.queue, consumer, deadline=deadline)
+        for producer in producers:
+            if not producer.done():
+                producer.cancel()
+        for result in await asyncio.gather(*producers, return_exceptions=True):
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                raise result
+        if consumer.done():
+            if not consumer.cancelled():
+                consumer.result()
+            raise JournalError("Consumer stopped before handoff cut")
+        consumer.cancel()
+        (result,) = await asyncio.gather(consumer, return_exceptions=True)
+        if not isinstance(result, asyncio.CancelledError):
+            if isinstance(result, BaseException):
+                raise result
+            raise JournalError("Consumer returned before handoff cut")
+        held.complete()
+        handoff: dict[str, Any] = {
+            "schema": UPDATE_SCHEMA,
+            "request": request,
+            "journal_path": str(journal_path),
+            "sequence": slots.consumed,
+            "held": held.evidence(),
+        }
+        if slots.sequence != slots.consumed + handoff["held"]["records"]:
+            raise JournalError("Held inputs do not account for published order")
+        slots.append_update_marker(cut_marker(handoff))
+        handoff["journal"] = slots.journal.evidence()
+        return handoff
 
 
 async def campaign(
@@ -1706,6 +1807,8 @@ async def campaign(
     resume: bool = False,
     market: PaperMarket = US,
     campaign_seeds: dict[str, Any] | None = None,
+    update_dir: Path | None = None,
+    resume_update: Path | None = None,
 ) -> None:
     if market is KR and profile != "broker-constrained":
         raise ValueError("KR requires the broker-constrained profile")
@@ -1717,6 +1820,10 @@ async def campaign(
         validate_session_seeds(campaign_seeds)
     if resume and journal_path is None:
         raise ValueError("Recovery requires an existing journal")
+    if (update_dir is not None or resume_update is not None) and (
+        campaign_seeds is None or journal_path is None or (resume_update is not None and not resume)
+    ):
+        raise ValueError("Session updates require a recurring shared-slot campaign and journal")
     if journal_path is None:
         await _campaign(
             output,
@@ -1738,25 +1845,69 @@ async def campaign(
     identity = journal_identity(
         capital, end_epoch, market, slot_control=slot_control, campaign_seeds=campaign_seeds
     )
-    with ExitStack() as contexts:
-        journal = contexts.enter_context(
-            AdaptiveJournal.open(journal_path, identity, resume=resume)
-        )
-        control = contexts.enter_context(SlotControl.open(slot_control)) if slot_control else None
-        await _campaign(
-            output,
-            duration,
-            capital,
-            candidate_policy=candidate_policy,
-            profile=profile,
-            adaptive=adaptive,
-            end_epoch=end_epoch,
-            journal=journal,
-            control=control,
-            resume=resume,
-            market=market,
-            campaign_seeds=campaign_seeds,
-        )
+    try:
+        ready = None
+        with ExitStack() as contexts:
+            opened_identity = identity
+            if resume_update is not None:
+                ready = load_manifest(resume_update)
+                request = ready["request"]
+                if (
+                    Path(ready["journal_path"]) != journal_path.resolve()
+                    or Path(request["target_root"]).resolve() != ROOT.resolve()
+                ):
+                    raise JournalError("Session update target or journal path does not match")
+                validate_target(request)
+                with AdaptiveJournal.read_active(journal_path) as snapshot:
+                    opened_identity = snapshot.identity
+                    if {
+                        **opened_identity, "source_sha256": identity["source_sha256"]
+                    } != identity:
+                        raise JournalError("Session update changed campaign identity or settings")
+            journal = contexts.enter_context(
+                AdaptiveJournal.open(journal_path, opened_identity, resume=resume)
+            )
+            control = (
+                contexts.enter_context(SlotControl.open(slot_control)) if slot_control else None
+            )
+            handoff = await _campaign(
+                output,
+                duration,
+                capital,
+                candidate_policy=candidate_policy,
+                profile=profile,
+                adaptive=adaptive,
+                end_epoch=end_epoch,
+                journal=journal,
+                control=control,
+                resume=resume,
+                market=market,
+                campaign_seeds=campaign_seeds,
+                update_dir=update_dir,
+                resume_update=resume_update,
+                ready=ready,
+                expected_identity=identity,
+                journal_path=journal_path.resolve(),
+            )
+        if handoff is not None:
+            assert update_dir is not None
+            if validate_update_request(update_dir) != handoff["request"]:
+                raise JournalError("Session update request changed after the cut")
+            if time.time() >= end_epoch:
+                raise JournalError("Campaign cutoff reached before handoff publication")
+            atomic_json(update_dir / "ready.json", handoff)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        if update_dir is not None or resume_update is not None:
+            status_path = output / "status.json"
+            status = {}
+            if status_path.exists():
+                status = json.loads(status_path.read_text())
+            if status.get("state") != "failed":
+                atomic_json(
+                    status_path,
+                    {**status, "state": "failed", "at": now(), **error_details(error, "")},
+                )
+        raise
 
 
 async def _campaign(
@@ -1773,7 +1924,12 @@ async def _campaign(
     resume: bool = False,
     market: PaperMarket = US,
     campaign_seeds: dict[str, Any] | None = None,
-) -> None:
+    update_dir: Path | None = None,
+    resume_update: Path | None = None,
+    ready: dict[str, Any] | None = None,
+    expected_identity: dict[str, Any] | None = None,
+    journal_path: Path | None = None,
+) -> dict[str, Any] | None:
     if adaptive and (
         profile != "broker-constrained"
         or candidate_policy is not None
@@ -1857,6 +2013,14 @@ async def _campaign(
     monitor.enter_context(audit.watching())
     try:
         if slots is not None:
+            marker = False
+            applied = 0
+            if resume_update is not None:
+                assert ready is not None and expected_identity is not None
+                marker, applied = verify_resume(
+                    slots.journal, resume_update, ready,
+                    source_sha256=expected_identity["source_sha256"],
+                )
             await slots.load_predecessors(make_runtime)
             if resume:
                 await slots.restore()
@@ -1864,7 +2028,37 @@ async def _campaign(
                 recovered_at = now()
                 if end_epoch is None or seconds(recovered_at) >= end_epoch:
                     raise CampaignCutoff("Campaign cutoff reached during replay")
-                await slots.marker("recovery_gap", recovered_at)
+                if resume_update is not None:
+                    assert ready is not None and expected_identity is not None
+                    request = ready["request"]
+                    validate_target(request)
+                    if load_manifest(resume_update) != ready:
+                        raise JournalError("Session update evidence changed during replay")
+                    slots.update_cutoff = end_epoch
+                    if marker:
+                        if slots.update_pending is not None or slots.source_handoff != ready:
+                            raise JournalError("Session update marker does not match replay")
+                    else:
+                        if slots.update_pending != request:
+                            raise JournalError("Session update is missing its hold marker")
+                        source = expected_identity["source_sha256"]
+                        slots.append_update_marker(source_marker(ready, source))
+                        slots.source_sha256 = source
+                        slots.source_handoff = ready
+                        slots.update_pending = None
+                    for offset, entry in enumerate(held_inputs(resume_update, ready)):
+                        if offset >= applied:
+                            await slots.apply_held(entry)
+                    slots.update_cutoff = None
+                    stats["session_update"] = {
+                        "handoff": ready,
+                        "source_sha256": slots.source_sha256,
+                        "recovered_held": applied,
+                    }
+                else:
+                    if slots.update_pending is not None or slots.source_handoff is not None:
+                        raise JournalError("Session recovery requires its update handoff evidence")
+                    await slots.marker("recovery_gap", recovered_at)
         elif journal is not None:
             assert isinstance(runtime, Runtime)
             if resume:
@@ -1889,7 +2083,7 @@ async def _campaign(
                 slot_control=Path(journal.identity["slot_control"]) if slots is not None else None,
                 campaign_seeds=campaign_seeds,
             )
-            != journal.identity
+            != (expected_identity or journal.identity)
         ):
             raise JournalError("Campaign source or settings changed during initialization")
         if slots is not None:
@@ -1968,10 +2162,13 @@ async def _campaign(
                     else {}
                 ),
                 "source_sha256": (
-                    journal.identity["source_sha256"]
+                    slots.source_sha256
+                    if slots is not None
+                    else journal.identity["source_sha256"]
                     if journal is not None
                     else {p: file_digest(ROOT / p) for p in SOURCES}
                 ),
+                **({"session_update": stats["session_update"]} if "session_update" in stats else {}),
                 "selection": (
                     "Absolute change between consecutive fresh minute scans; "
                     f"{market.currency} common shares"
@@ -2034,6 +2231,16 @@ async def _campaign(
             repairs: dict[str, float] = {}
             progress = 0
 
+            async def read(operation: Callable[..., _ReadResult], *args: Any) -> _ReadResult:
+                if update_dir is None:
+                    return await asyncio.to_thread(adapter.read, operation, *args)
+                request = asyncio.create_task(asyncio.to_thread(adapter.read, operation, *args))
+                try:
+                    return await asyncio.shield(request)
+                except asyncio.CancelledError:
+                    await request
+                    raise
+
             def collector_progress(*, waiting: bool = False) -> None:
                 nonlocal progress
                 if waiting:
@@ -2080,7 +2287,7 @@ async def _campaign(
                     break
                 day = market.trading_date(datetime.fromisoformat(now()))
                 if constrained and day != calendar_day:
-                    calendar = await asyncio.to_thread(adapter.read, client.calendar, market.code, day)
+                    calendar = await read(client.calendar, market.code, day)
                     raw.write(
                         json.dumps({"kind": "calendar", "date": day, "result": calendar}) + "\n"
                     )
@@ -2089,7 +2296,7 @@ async def _campaign(
                     if market is KR:
                         previous.clear()
                         metadata.clear()
-                        universe = await asyncio.to_thread(adapter.read, feed.universe)
+                        universe = await read(feed.universe)
                 if not adaptive and cycle == 2:
                     prior_book_count = runtime.counts["book_events"]
                     record("rest_delay_start", seconds=5)
@@ -2172,7 +2379,7 @@ async def _campaign(
                         await recover_held()
                         if time.monotonic() >= deadline:
                             return
-                        for row in await asyncio.to_thread(adapter.read, client.stocks, missing):
+                        for row in await read(client.stocks, missing):
                             metadata[row["symbol"]] = row
                             raw.write(
                                 json.dumps({"kind": "stock_info", "received_at": now(), "row": row})
@@ -2186,7 +2393,7 @@ async def _campaign(
                     await recover_held()
                     if time.monotonic() >= deadline:
                         return
-                    fx = await asyncio.to_thread(adapter.read, feed.fx)
+                    fx = await read(feed.fx)
                     raw.write(json.dumps({"kind": "fx", "received_at": now(), "result": fx}) + "\n")
                     runtime.publish("fx", fx)
                 watch = subscription_set(chosen[:50], runtime.protected())
@@ -2444,9 +2651,43 @@ async def _campaign(
         collector = asyncio.create_task(collect_until_cutoff() if adaptive else collect())
         streamer = asyncio.create_task(stream())
         tasks = [consumer, collector, streamer]
+        update_rejected = False
         while time.monotonic() < deadline:
             if slots is not None:
                 slots.check_reviews()
+                if (
+                    update_dir is not None
+                    and not update_rejected
+                    and (update_dir / "request.json").exists()
+                ):
+                    request = None
+                    try:
+                        request = await asyncio.to_thread(validate_update_request, update_dir)
+                        if load_request(update_dir) != request:
+                            raise JournalError("Session update request changed during validation")
+                        if slots.source_handoff is not None:
+                            current = slots.source_handoff["request"]
+                            if (
+                                current["target_commit"] != request["from_commit"]
+                                or current["target_digest"] != request["from_digest"]
+                            ):
+                                raise JournalError("Session update does not follow current source")
+                    except JournalError as error:
+                        update_rejected = True
+                        request = None
+                        rejection = {"state": "rejected", "at": now(), **error_details(error, "")}
+                        atomic_json(update_dir / "rejected.json", rejection)
+                        record("session_update_rejected", **rejection)
+                    if request is not None and time.monotonic() < deadline:
+                        assert journal_path is not None
+                        handoff = await hold_for_update(
+                            slots, consumer, (collector, streamer), request,
+                            update_dir, journal_path, output, stats, deadline,
+                        )
+                        at = now()
+                        slots.control.snapshot(slots.status(at)["shared_slots"])
+                        stats.update(state="handoff_ready", at=at, ended_at=at, handoff=handoff)
+                        return handoff
                 slots.poll_controls()
             elif (
                 isinstance(runtime, Runtime)
@@ -2494,13 +2735,7 @@ async def _campaign(
                 raise producer_result
         if consumer.done():
             consumer.result()
-        drain = asyncio.create_task(runtime.queue.join())
-        done, _ = await asyncio.wait({consumer, drain}, return_when=asyncio.FIRST_COMPLETED)
-        if consumer in done:
-            drain.cancel()
-            await asyncio.gather(drain, return_exceptions=True)
-            consumer.result()
-        await drain
+        await drain_queue(runtime.queue, consumer)
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
         at = now()
@@ -2591,7 +2826,7 @@ async def _campaign(
             finally:
                 with audit.cleanup("campaign_runner", "account_cleanup_failed"):
                     await runtime.close()
-            if stats.get("state") not in ("complete", "failed", "interrupted"):
+            if stats.get("state") not in ("complete", "failed", "interrupted", "handoff_ready"):
                 stats.update(state="interrupted", ended_at=now())
             elif stats.get("state") == "complete":
                 stats.setdefault("ended_at", stats.get("at", now()))
@@ -2614,7 +2849,7 @@ async def _campaign(
                 source_unchanged = all(
                     (ROOT / name).is_file()
                     and file_digest(ROOT / name) == expected
-                    for name, expected in journal.identity["source_sha256"].items()
+                    for name, expected in slots.source_sha256.items()
                 )
                 stats["shared_feed"] = {
                     "complete": stats["state"] == "complete" and source_unchanged,
@@ -2624,6 +2859,8 @@ async def _campaign(
                     slots.control.snapshot(stats["shared_slots"])
                     if not source_unchanged:
                         stats.update(state="failed", result="inconclusive")
+                if stats["state"] == "handoff_ready" and (not source_unchanged or not audit.healthy):
+                    raise JournalError("Session source or audit changed before handoff")
             if comparison is not None:
                 stats.update(
                     state=comparison["state"],
@@ -2644,6 +2881,7 @@ async def _campaign(
                     files.close()
             finally:
                 monitor.close()
+    return None
 
 
 def main() -> None:
@@ -2668,6 +2906,8 @@ def main() -> None:
     parser.add_argument(
         "--resume", action="store_true", help="Recover an existing campaign journal"
     )
+    parser.add_argument("--update-dir", type=Path, help="Watch this attempt for an update request")
+    parser.add_argument("--resume-update", type=Path, help="Resume a sealed session handoff")
     args = parser.parse_args()
     if args.slot_control is not None and (args.journal is None or not args.adaptive):
         parser.error("--slot-control requires --adaptive and --journal")
@@ -2680,6 +2920,10 @@ def main() -> None:
             validate_session_seeds(campaign_seeds)
         except (OSError, TypeError, ValueError) as error:
             parser.error(str(error))
+    if (args.update_dir is not None or args.resume_update is not None) and campaign_seeds is None:
+        parser.error("Session updates require --campaign-seeds")
+    if args.resume_update is not None and not args.resume:
+        parser.error("--resume-update requires --resume")
     if args.market == "KR" and args.profile != "broker-constrained":
         parser.error("--market KR requires --profile broker-constrained")
     if (args.journal is not None and not args.adaptive) or (args.resume and args.journal is None):
@@ -2725,6 +2969,8 @@ def main() -> None:
                 resume=args.resume,
                 market=MARKETS[args.market],
                 campaign_seeds=campaign_seeds,
+                update_dir=args.update_dir.resolve() if args.update_dir else None,
+                resume_update=args.resume_update.resolve() if args.resume_update else None,
             )
         finally:
             if args.adaptive:

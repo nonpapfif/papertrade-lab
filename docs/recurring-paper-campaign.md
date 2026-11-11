@@ -169,6 +169,47 @@ scheduler/worker identities, a sealed journal, model evidence/results and failur
 Inspect these with the actual service and child identities. A saved phase alone is not proof
 that a process is running. Keep journals on approved storage and preserve all losses/history.
 
+### Update a running session
+
+Use a separate frozen worktree of the same repository at the approved release commit. Run the
+local validation gate from the new source, with output outside both frozen worktrees:
+
+```sh
+python -m tools.local_validation --repo /absolute/new-worktree \
+  --output /absolute/update-validation
+python -m tools.request_session_update --schedule /absolute/session/schedule \
+  --target-root /absolute/new-worktree --target-commit <full-commit> \
+  --target-digest <source-sha256> \
+  --validation-report /absolute/update-validation/validation.json
+```
+
+Use the report's `source_digest` after reviewing and approving the release. A successful
+submission prints the claimed request path, attempt number and target digest. The request is
+specific to the observed worker and expires with its attempt. Submission alone does not prove
+activation. Confirm a source transition in the schedule's `status.json` under `restarts`, then
+check `update_source` and the successor worker status. Keep the frozen worktrees and the
+validation report with its log files available until the session finishes.
+
+The predecessor stores newly accepted inputs in a separate durable journal while it drains the
+existing dispatch queue. It then stops its producers, seals the held inputs and leaves the
+original journal active for recovery. The scheduler verifies process exit and the committed cut
+before starting the successor. The successor verifies and replays the same journal, then applies
+held inputs in order before reconnecting. A restart verifies any already committed held inputs
+before skipping them. The original receipt times, slot command spool and session cutoff carry
+forward. Provider observations during the disconnect remain unobserved.
+
+This path supports runtime updates that preserve the frozen trading calculations. It checks
+account, strategy, execution and fee sources as well as selected runtime definitions before
+holding starts. A transient fault after activation retries the selected release. Each later
+release requires a new request for the current attempt. A rejected request is recorded in that
+attempt's `update/rejected.json`. A missing or inconsistent handoff after holding starts leaves
+the session blocked with its journals and request intact.
+
+Workers launched by releases without the update protocol cannot accept a request. Let those
+sessions reach their existing boundary. After an updated session closes, the older campaign
+controller blocks further carryover under its old source. Reconcile the sealed journal and
+controller source and capacity evidence before scheduling the next session from that state.
+
 Manual branch requests use the existing slot command interface:
 
 ```sh

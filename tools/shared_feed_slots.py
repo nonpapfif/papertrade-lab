@@ -19,6 +19,7 @@ from papertrade.jsonio import journal_json as encode
 from tools.adaptive_journal import AdaptiveJournal, JournalError
 from tools.async_layered_paper import ProcessingClock
 from tools.runtime_audit import DISPATCH_BACKLOG_TIMEOUT, DISPATCH_TIMEOUT, RuntimeAudit
+from tools.session_update import CUT_EVENT, HOLD_EVENT, SOURCE_EVENT, cut_marker, marker_source
 from tools.slot_control import IDENTIFIER, SlotCommand, SlotControl
 from tools.strategy_catalog import ENTRY_OPTIONS
 
@@ -108,6 +109,11 @@ class SharedFeedSlots:
         self.candidates: list[str] = []
         self.seed: dict[str, dict[str, Any]] = {}
         self.feature_seed: dict[str, dict[str, Any]] = {}
+        self.held: AdaptiveJournal | None = None
+        self.update_cutoff: float | None = None
+        self.update_pending: dict[str, Any] | None = None
+        self.source_handoff: dict[str, Any] | None = None
+        self.source_sha256: dict[str, str] = journal.identity.get("source_sha256", {})
 
     def active(self) -> list[tuple[str, Slot]]:
         return [(key, slot) for key, slot in self.slots.items() if slot.state == "active"]
@@ -130,7 +136,6 @@ class SharedFeedSlots:
                                 "experiment",
                                 "market",
                                 "profile",
-                                "source_sha256",
                                 "settings_sha256",
                             )
                         )
@@ -159,8 +164,12 @@ class SharedFeedSlots:
                     try:
                         await prior.load_predecessors(make_runtime_at)
                         await prior.restore()
-                        if not prior.session_closed:
-                            raise JournalError("Predecessor has no session close event")
+                        if (
+                            not prior.session_closed
+                            or prior.update_pending is not None
+                            or prior.source_sha256 != self.source_sha256
+                        ):
+                            raise JournalError("Predecessor source or session close is incompatible")
                         journals[source] = {
                             name: slot
                             for name, slot in prior.slots.items()
@@ -194,20 +203,40 @@ class SharedFeedSlots:
 
     def publish(self, kind: str, payload: Any, *, received: str | None = None) -> None:
         self.sequence += 1
-        self.queue.put_nowait(
-            (
-                {
-                    "sequence": self.sequence,
-                    "kind": kind,
-                    "payload": copy.deepcopy(payload),
-                    "received": received or now(),
-                },
-                time.monotonic(),
-            )
-        )
+        entry = {
+            "sequence": self.sequence,
+            "kind": kind,
+            "payload": copy.deepcopy(payload),
+            "received": received or now(),
+        }
+        if self.held is not None:
+            self._check_update_cutoff()
+            self.held.append(entry)
+            return
+        self.queue.put_nowait((entry, time.monotonic()))
         self.max_queue = max(self.max_queue, self.queue.qsize())
 
+    def _check_update_cutoff(self) -> None:
+        if self.update_cutoff is not None and time.time() >= self.update_cutoff:
+            raise JournalError("Campaign cutoff reached during session update")
+
+    def begin_hold(self, held: AdaptiveJournal, request: dict[str, Any]) -> None:
+        self.update_cutoff = self.journal.identity["end_epoch"]
+        self.append_update_marker({"kind": HOLD_EVENT, "request": request})
+        self.held = held
+
+    def append_update_marker(self, marker: dict[str, Any]) -> None:
+        self._check_update_cutoff()
+        with self.audit.publication_guard() if self.audit is not None else nullcontext():
+            self.journal.append(marker)
+
+    async def apply_held(self, entry: dict[str, Any]) -> None:
+        self.sequence += 1
+        await self._apply(entry, 0)
+
     def poll_controls(self) -> None:
+        if self.held is not None:
+            return
         for command in self.control.pending():
             prior = self.commands.get(command.id)
             if prior is not None:
@@ -415,6 +444,8 @@ class SharedFeedSlots:
     ) -> None:
         if self._failed_cut:
             raise JournalError("Shared slots require a fresh journal replay")
+        if saved is None:
+            self._check_update_cutoff()
         self._committed_protection = self._slot_protection()
         try:
             if self.audit is not None:
@@ -443,6 +474,7 @@ class SharedFeedSlots:
                     )
                 try:
                     with self.audit.publication_guard() if self.audit is not None else nullcontext():
+                        self._check_update_cutoff()
                         self.journal.append(entry)
                 except JournalError as error:
                     if self.audit is not None:
@@ -712,9 +744,42 @@ class SharedFeedSlots:
     async def restore(self) -> None:
         original_record = self.record
         self.record = lambda *_args, **_kwargs: None
+        update_cut = None
         try:
             for saved in self.journal.events():
-                if saved["kind"] == "slot_review_call":
+                kind = saved["kind"]
+                if kind in (HOLD_EVENT, CUT_EVENT, SOURCE_EVENT):
+                    if self.session_seeds is None or self.session_closed:
+                        raise JournalError("Unexpected recurring session update marker")
+                    if kind == HOLD_EVENT:
+                        if self.update_pending is not None or not isinstance(
+                            saved.get("request"), dict
+                        ):
+                            raise JournalError("Invalid session update hold marker")
+                        self.update_pending = saved["request"]
+                    elif kind == CUT_EVENT:
+                        if (
+                            self.update_pending is None
+                            or self.update_pending != saved.get("request")
+                            or update_cut is not None
+                            or self.consumed != saved.get("sequence")
+                        ):
+                            raise JournalError("Invalid session update cut marker")
+                        update_cut = {key: value for key, value in saved.items() if key != "index"}
+                    else:
+                        source = marker_source(saved)
+                        handoff = saved["handoff"]
+                        if update_cut is None or update_cut != cut_marker(handoff):
+                            raise JournalError("Session update source has no matching cut")
+                        self.source_sha256 = source
+                        self.source_handoff = handoff
+                        self.update_pending = update_cut = None
+                    continue
+                if update_cut is not None or (
+                    kind == "session_close" and self.update_pending is not None
+                ):
+                    raise JournalError("Unresolved session update cut")
+                if kind == "slot_review_call":
                     if self.session_seeds is not None:
                         raise JournalError("Recurring session contains an adaptive review")
                     slot = self.slots[saved["slot_id"]]
