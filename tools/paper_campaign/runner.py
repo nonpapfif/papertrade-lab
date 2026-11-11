@@ -61,6 +61,15 @@ class SessionRunner:
         worker = schedule
         if restarts := status.get("restarts"):
             worker = schedule / "attempts" / str(len(restarts) + 1)
+            if any("update" in restart for restart in restarts):
+                source = status.get("update_source") or {}
+                if (source.get("commit"), source.get("digest")) != (
+                    self.source_commit, self.source_digest
+                ):
+                    return {
+                        "state": "blocked",
+                        "reason": "updated_session_requires_controller_source_reconciliation",
+                    }
         summary = read_json(worker / "run" / "status.json")
         with SlotControl.open(schedule / SPOOL_NAME) as control:
             commands = control.report()["commands"]
