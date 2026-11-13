@@ -40,3 +40,41 @@ checkpoints let callers compare branch outcomes with the exact parent baseline.
   their original fees through the same account transition. That verifies the
   recorded economics without rerunning historical quote execution under a
   different fill policy.
+
+## Offline orderbook intake
+
+`feed.books.Books` owns the latest orderbooks for all configured markets on one
+event loop. Each request supplies its own freshness window. Concurrent misses
+for a market and symbol share one provider request. Mark requests for held or
+pending symbols as protected to give them priority over queued candidate reads.
+An active provider read completes before the next request starts. Both markets
+share the same read-only provider owner.
+
+`feed.toss.TossBooks` uses the existing allowlisted `MarketClient.book` operation,
+one symbol per call. It serializes the shared market-data group at the documented
+15 book-operation starts per second or slower and carries the client cooldown across
+markets. `TossStream` handles recorded or injected frames for one market. A
+declaration requires a complete, matching acknowledgement before quotes can
+enter the cache. Malformed market frames produce individual rejections. Locked,
+crossed, and insufficient-depth books are unusable under the paper fill policy. Invalid
+acknowledgements require disconnecting the old generation and opening a new
+one. Quote identity uses the provider, market, symbol, source timestamp and
+canonical book content. Equivalent REST and stream observations share that
+identity and retain the first accepted availability time.
+
+`feed.session_adapter.commit_next` takes the next quote in receipt order and an
+explicit decision timestamp. A live caller must use its processing clock. A
+recorded replay can supply the recorded decision time. Only the session writes
+the journal and applies Phase 1 execution rules. An acknowledged duplicate
+after reopen must match the recorded observation. Reconstructing an older
+duplicate's receipt reads its journal prefix. This slice has no measured
+throughput target. `protected_symbols` reads the union of committed held and
+pending symbols for the caller's quote requests.
+
+Offline tests use injected frames and a fake REST client. They cover malformed
+frames between valid quotes on one generation, one cut per observation,
+generation recovery, 429 cooldown, queue priority, concurrent reads and
+per-caller freshness, stale queued inputs and idempotency after reopen.
+Remaining Phase 2 work includes WebSocket transport, application PING and timed reconnects, REST
+snapshot resync, automatic protection of stream subscriptions, broad price
+batching, overload handling and measured backlog/latency with recorded load.

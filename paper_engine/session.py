@@ -86,6 +86,22 @@ class Session:
         require_time(sequence)
         return self._journal.checkpoint(sequence)
 
+    def quote_receipt(self, cut_id: str, quote: Quote) -> Commit | None:
+        recorded = self._journal.recorded_cut(cut_id)
+        if recorded is None:
+            return None
+        cut, commit = recorded
+        if (
+            len(cut.quotes) != 1
+            or cut.accounts
+            or cut.branches
+            or cut.at < cut.quotes[0].available_at
+            or cut.quotes[0] != replace(quote, available_at=cut.quotes[0].available_at)
+        ):
+            raise Conflict("Quote receipt conflicts with the recorded cut")
+        self._published = self._journal.refresh(self._published)
+        return commit
+
     def close(self) -> None:
         self._journal.close()
 
