@@ -241,6 +241,16 @@ class Journal:
             ).fetchone() is not None
         )
 
+    def recorded_cut(self, cut_id: str) -> tuple[Cut, Commit] | None:
+        with self._transaction():
+            row = self._db.execute(
+                "SELECT sequence, input FROM cuts WHERE cut_id = ?", (cut_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            sequence, raw_cut = row
+            return decode(raw_cut, Cut), self._read(sequence)[1]
+
     def receipt(self, cut: Cut) -> Commit | None:
         with self._transaction():
             return self._receipt(cut)
