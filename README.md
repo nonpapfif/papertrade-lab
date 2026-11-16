@@ -22,6 +22,8 @@ failed hypotheses, and losing a ledger are allowed. New starting capital is not 
 
 ## Offline research workflow
 
+[Compare existing and TossTradingLab research selection](docs/research-selection-comparison.md) on one recorded US stream using independent paper accounts.
+
 Run commands from the repository root. Downloading uses the authenticated market-data client.
 Replays and rule searches use the saved dataset and make no AI or market-data requests.
 

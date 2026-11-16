@@ -9,6 +9,8 @@ import gzip
 import hashlib
 import json
 import time
+from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from dataclasses import asdict, replace
 from datetime import datetime
 from itertools import product
@@ -91,6 +93,9 @@ async def replay_case(
     fx_times: list[float],
     eligible: set[int],
     start: float,
+    *,
+    selection_at: Callable[[float], AbstractSet[int]] | None = None,
+    fees: dict[str, float] | None = None,
 ) -> AsyncLayeredPaper:
     account = AsyncLayeredPaper(
         capital,
@@ -98,6 +103,7 @@ async def replay_case(
         selection=config["selection"],
         allocation=config["allocation"],
         delay=config["delay"],
+        fees=fees,
     )
     events = sorted(
         (parse(row["received_at"]), symbol, index, row)
@@ -136,8 +142,9 @@ async def replay_case(
             slot = int(tick // cadence) if cadence else tick
             entries = slots.get(symbol) != slot
             slots[symbol] = slot
+            admitted = eligible & selection_at(tick) if selection_at is not None else eligible
             candidates = []
-            for candidate in sorted(eligible):
+            for candidate in sorted(admitted):
                 f = current_feature(candidate, tick)
                 if (
                     f is not None
@@ -169,7 +176,7 @@ async def replay_case(
                     "received_at": row["received_at"],
                     "book": quote,
                     "feature": current_feature(symbol, tick),
-                    "eligible": symbol in eligible,
+                    "eligible": symbol in admitted,
                     "entries": entries,
                     "candidate_count": max(1, len(candidates)),
                     "fx": float(fx["result"]["midRate"]) if fx else 0,
