@@ -208,7 +208,8 @@ class AsyncLayeredPaper(LayeredPaper):
 
     async def advance(self, at: str) -> None:
         """Expire pending intents even when their symbols receive no further quotes."""
-        await asyncio.gather(*(q.join() for q in self._queues.values()))
+        if self._submitted != self._completed:
+            await asyncio.gather(*(q.join() for q in self._queues.values()))
         async with self._lock:
             if seconds(at) < self._last_enqueued:
                 raise ValueError("Cannot rewind account clock")
@@ -250,9 +251,14 @@ class AsyncLayeredPaper(LayeredPaper):
         self._expire(at)
         quote = event["book"]
         source = seconds(quote["timestamp"])
+        received = seconds(event.get("source_received_at", at))
         self._processed.add(event_id)
         self._receipts[symbol] = tick
-        if not 0 <= tick - source <= 60 or quote.get("currency") != self.context.market.currency:
+        if (
+            not source <= received <= tick
+            or not 0 <= tick - source <= 60
+            or quote.get("currency") != self.context.market.currency
+        ):
             return
         previous_source = self._source_times.get(symbol, -math.inf)
         if source < previous_source:
@@ -310,7 +316,7 @@ class AsyncLayeredPaper(LayeredPaper):
         if (
             not duplicate_quote
             and intent
-            and tick - seconds(intent.decision_at) >= self.delay
+            and received - seconds(intent.decision_at) >= self.delay
             and source > seconds(intent.decision_at)
         ):
             self._confirm(intent, quote, event)
@@ -430,7 +436,7 @@ class AsyncLayeredPaper(LayeredPaper):
             "decision_orderbooks": {symbol: intent.initial},
             "order_limits": {symbol: intent.limit},
             "orderbooks": {symbol: quote},
-            "confirmation_received_at": {symbol: at},
+            "confirmation_received_at": {symbol: event.get("source_received_at", at)},
             "fx": event.get("fx", 0),
             "fx_at": event.get("fx_at", at),
             "fx_valid_from": event.get("fx_valid_from"),

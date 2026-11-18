@@ -74,6 +74,7 @@ class SharedFeedSlots:
         session_seeds: dict[str, Any] | None = None,
         concurrent_accounts: bool = False,
         audit: RuntimeAudit | None = None,
+        research_capital: float | None = None,
     ) -> None:
         self.make_runtime = make_runtime
         self.subscribe = subscribe
@@ -83,6 +84,8 @@ class SharedFeedSlots:
         self.session_seeds = session_seeds
         self.concurrent_accounts = concurrent_accounts
         self.audit = audit
+        self.research_capital = research_capital
+        self.research_protected: set[str] = set()
         self._failed_cut = False
         self._committed_protection: set[str] | None = None
         self._account_execution: dict[str, Any] = {
@@ -177,13 +180,19 @@ class SharedFeedSlots:
     @property
     def capital(self) -> float:
         return max(
-            (slot.runtime.account.book.initial_equity for _, slot in self.active()), default=0.0
+            (slot.runtime.account.book.initial_equity for _, slot in self.active()),
+            default=self.research_capital or 0.0,
         )
 
     def protected(self) -> set[str]:
         if self._committed_protection is not None:
-            return self._committed_protection.copy()
-        return self._slot_protection()
+            return self._committed_protection | self.research_protected
+        return self._slot_protection() | self.research_protected
+
+    def protect_research(self, symbols: set[str]) -> None:
+        desired = self.subscribe(self.candidates, self._slot_protection() | symbols)
+        self.research_protected = symbols.copy()
+        self.desired = desired
 
     def _slot_protection(self) -> set[str]:
         return {symbol for _, slot in self.active() for symbol in slot.runtime.protected()}
@@ -612,6 +621,10 @@ class SharedFeedSlots:
         if kind == "slot_command":
             command_result = await self._command(entry)
             entry["disposition"], entry["detail"] = command_result[1:]
+        elif kind == "research_protection":
+            if self.research_capital is None:
+                raise JournalError("Research protection requires a research feed")
+            self.protect_research(set(payload))
         elif kind == "final_advance":
             stopped = await asyncio.gather(
                 *(self._stop(slot, entry, "completed") for _, slot in self.active()),
@@ -672,8 +685,11 @@ class SharedFeedSlots:
                 if isinstance(result, BaseException):
                     raise result
                 outputs[slot_id] = result
-        protected = self._slot_protection()
-        self.desired = self.subscribe(self.candidates, protected) if self.active() else []
+        protected = self._slot_protection() | self.research_protected
+        self.desired = (
+            self.subscribe(self.candidates, protected)
+            if self.active() or self.research_capital is not None else []
+        )
         if self.concurrent_accounts and kind in ("slot_command", "final_advance"):
             entry["account_results"] = {
                 slot_id: slot.runtime.account_evidence()

@@ -32,7 +32,7 @@ class RecurringSupervisorTests(unittest.TestCase):
         modules = sorted(PARTITIONED_TEST_MODULES)
         all_ids = set(test_ids(unittest.TestLoader().loadTestsFromNames(modules)))
         offline, host_only = partition_recurring_tests(modules)
-        self.assertEqual(len(offline), 14)
+        self.assertEqual(len(offline), 18)
         self.assertEqual(len(host_only), 7)
         self.assertEqual(set(host_only), HOST_ONLY_TEST_IDS)
         self.assertFalse(set(offline) & set(host_only))

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -17,6 +18,27 @@ from tools.slot_control import SPOOL_NAME, SlotCommand, SlotControl
 
 
 class ScheduleTest(unittest.TestCase):
+    def test_research_schedule_freezes_protection_path_without_initial_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            protection = Path(directory) / "protection.json"
+            argv = [
+                "schedule", "--market", "US", "--start-at", "2026-11-18T23:30:00+09:00",
+                "--end-at", "2026-11-19T06:00:00+09:00", "--capital", "1000",
+                "--source-digest", "a" * 64, "--output", directory, "--recover",
+                "--dynamic-slots", "--research-protection", str(protection),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(schedule, "command", return_value="approved"),
+                patch.object(schedule, "run_schedule", return_value=0) as run,
+            ):
+                self.assertEqual(schedule.main(), 0)
+            spec = run.call_args.args[1]
+            self.assertEqual(spec["research_protection"], str(protection.resolve()))
+            self.assertEqual(spec["argv"][-2:], ["--research-protection", str(protection.resolve())])
+            self.assertNotIn("initial_slots", spec)
+            self.assertNotIn("--campaign-seeds", spec["argv"])
+
     def test_kr_schedule_freezes_market_in_worker_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -201,6 +223,7 @@ class RecoveryScheduleTest(unittest.TestCase):
         sleep = time.sleep
         self.enterContext(patch.object(schedule, "command", return_value="approved"))
         self.enterContext(patch.object(schedule, "tree_digest", return_value="expected"))
+        self.enterContext(patch.object(schedule, "RECOVERY_RETRY_SECONDS", 0, create=True))
         self.enterContext(patch.object(schedule.time, "sleep", side_effect=lambda _: sleep(0.02)))
 
     def status(self) -> dict[str, Any]:
@@ -483,3 +506,115 @@ class RecoveryScheduleTest(unittest.TestCase):
             report = control.report()
             self.assertTrue(report["closed"])
             self.assertEqual(report["commands"][0]["disposition"], "rejected")
+
+    def test_research_transport_failures_with_zero_progress_back_off_until_cutoff(self) -> None:
+        self.spec["dynamic_slots"] = True
+        self.spec["research_protection"] = str(self.output / "protection.json")
+        self.spec["end_epoch"] = time.time() + 1000
+        wall = [time.time()]
+        starts: list[float] = []
+        spool = self.output / SPOOL_NAME
+
+        def start(job: Path, argv: list[str], _cwd: Path, *, stop_after: float) -> None:
+            starts.append(wall[0])
+            self.assertLessEqual(len(starts), 9, "Recovery must respect the session cutoff")
+            job.mkdir(parents=True)
+            (job / "start.claim").touch()
+            self.assertEqual(argv[argv.index("--slot-control") + 1], str(spool))
+            self.assertEqual(argv.count("--resume"), int(len(starts) > 1))
+            run = Path(argv[argv.index("--output") + 1])
+            run.mkdir(parents=True)
+            with AdaptiveJournal.open(
+                self.output / "journal.sqlite3", {"account": "original"},
+                resume="--resume" in argv,
+            ) as journal:
+                journal.append({"kind": "clock"})
+            schedule.atomic_json(run / "status.json", {
+                "state": "failed", "error_type": "ApiError", "api_code": "transport_error",
+            })
+            schedule.atomic_json(job / "exit.json", {"returncode": 1})
+
+        def sleep(seconds: float) -> None:
+            wall[0] += seconds
+
+        with (
+            patch.object(schedule, "start_job", side_effect=start),
+            patch.object(schedule.time, "time", side_effect=lambda: wall[0]),
+            patch.object(schedule.time, "sleep", side_effect=sleep),
+            patch.object(schedule, "RECOVERY_RETRY_SECONDS", 5, create=True),
+        ):
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+        status = self.status()
+        self.assertEqual(status["state"], "incomplete")
+        self.assertEqual(status["reason"], "API cooldown extends past approved window")
+        self.assertEqual(len(starts), 9)
+        self.assertEqual(
+            [b - a for a, b in pairwise(starts)],
+            [5, 10, 20, 40, 80, 160, 300, 300],
+        )
+        self.assertEqual(len(status["restarts"]), 9)
+        self.assertTrue(all(restart["cursor"] == 0 for restart in status["restarts"]))
+        self.assertEqual(status["failure_handoff"]["attempt"], 9)
+        self.assertEqual(
+            status["failure_handoff"]["evidence"]["worker_status"],
+            "attempts/9/run/status.json",
+        )
+        self.assertTrue((self.output / "run/status.json").is_file())
+        for attempt in range(2, 10):
+            self.assertTrue((self.output / f"attempts/{attempt}/run/status.json").is_file())
+        self.assertFalse((self.output / "attempts/10").exists())
+
+    def test_invalid_provider_retry_time_blocks_without_another_attempt(self) -> None:
+        job, run = self.output / "job", self.output / "run"
+        job.mkdir()
+        run.mkdir()
+        (job / "start.claim").touch()
+        schedule.atomic_json(job / "exit.json", {"returncode": 1})
+        schedule.atomic_json(run / "status.json", {
+            "state": "failed", "error_type": "ApiError", "api_code": "transport_error",
+            "api_retry_at": "invalid",
+        })
+        with AdaptiveJournal.open(
+            self.output / "journal.sqlite3", {"account": "original"}, resume=False,
+        ) as journal:
+            journal.append({"kind": "clock"})
+        with patch.object(schedule, "start_job") as start:
+            self.assertEqual(schedule.run_schedule(self.output, self.spec), 1)
+            start.assert_not_called()
+        self.assertEqual(self.status()["state"], "blocked")
+        self.assertEqual(self.status()["reason"], "Saved API retry time is invalid")
+
+    def test_research_controller_reopens_multiple_zero_cursor_restarts(self) -> None:
+        self.spec["dynamic_slots"] = True
+        self.spec["research_protection"] = str(self.output / "protection.json")
+        restarts = []
+        with SlotControl.open(self.output / SPOOL_NAME, initialize=True):
+            pass
+        for attempt in (1, 2):
+            base = self.output if attempt == 1 else self.output / "attempts" / str(attempt)
+            job = base / "job"
+            job.mkdir(parents=True)
+            (job / "start.claim").touch()
+            result = {"returncode": 1}
+            schedule.atomic_json(job / "exit.json", result)
+            with AdaptiveJournal.open(
+                self.output / "journal.sqlite3", {"account": "original"}, resume=attempt > 1,
+            ) as journal:
+                journal.append({"kind": "clock"})
+                evidence = journal.evidence()
+            restarts.append({
+                "cursor": evidence["cursor"], "journal_hash": evidence["chain_sha256"],
+                "job_exit": result, "retry_at": time.time(),
+            })
+        schedule.atomic_json(self.output / "status.json", {
+            "schedule": self.spec, "state": "restarting", "restarts": restarts,
+        })
+        with (
+            patch.object(schedule, "start_job", side_effect=KeyboardInterrupt) as start,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            schedule.run_schedule(self.output, self.spec)
+        self.assertEqual(start.call_args.args[0], self.output / "attempts/3/job")
+        argv = start.call_args.args[1]
+        self.assertIn("--resume", argv)
+        self.assertEqual(self.status()["restarts"], restarts)

@@ -21,11 +21,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
-from papertrade.api import ApiError, MarketClient
+from papertrade.api import SYMBOL, ApiError, MarketClient
 from papertrade.clock import utc_iso as now
 from papertrade.core import SafetyError, Settings
 from papertrade.jsonio import journal_json as encode
-from papertrade.jsonio import private_json
+from papertrade.jsonio import private_json, read_json
 from tools.account_executor import AccountAction, AccountExecutor, AccountResult
 from tools.adaptive_journal import AdaptiveJournal, JournalError, digest
 from tools.async_layered_paper import (
@@ -191,6 +191,40 @@ def latency_summary(values: list[float]) -> dict[str, float | int]:
 
 class CampaignCutoff(Exception):
     """The absolute adaptive deadline prevented another REST request."""
+
+
+def read_research_protection(path: Path, market: PaperMarket) -> set[str]:
+    payload = read_json(path)
+    symbols = payload.get("symbols")
+    pattern = KR_SYMBOL if market is KR else SYMBOL
+    if (
+        set(payload) != {"market", "symbols"}
+        or payload["market"] != market.code
+        or not isinstance(symbols, list)
+        or any(not isinstance(symbol, str) or not pattern.fullmatch(symbol) for symbol in symbols)
+        or len(symbols) != len(set(symbols))
+    ):
+        raise ValueError("Invalid research protection file")
+    protected = set(symbols)
+    subscription_set([], protected)
+    return protected
+
+
+def read_research_calendar(
+    protection: Path, market: PaperMarket, day: str, end_epoch: float,
+) -> dict[str, Any]:
+    plan = read_json(protection.with_name("session.json"))
+    if plan["market"] != market.code or plan["day"] != day:
+        raise ValueError("Frozen research calendar differs from the requested market or day")
+    calendar = plan["calendar"]
+    start, end = market.session(calendar, day)
+    if (
+        datetime.fromisoformat(plan["start"]) != start
+        or datetime.fromisoformat(plan["end"]) != end
+        or end.timestamp() != end_epoch
+    ):
+        raise ValueError("Frozen research calendar differs from the approved session window")
+    return calendar
 
 
 class DeadlineMarketClient(CachedTokenClient):
@@ -1794,7 +1828,10 @@ async def campaign(
     market: PaperMarket = US,
     campaign_seeds: dict[str, Any] | None = None,
     repair_anchor: dict[str, Any] | None = None,
+    research_protection: Path | None = None,
 ) -> None:
+    if research_protection is not None and slot_control is None:
+        raise ValueError("Research protection requires shared slots")
     if market is KR and profile != "broker-constrained":
         raise ValueError("KR requires the broker-constrained profile")
     if slot_control is not None and journal_path is None:
@@ -1846,6 +1883,7 @@ async def campaign(
             resume=resume,
             market=market,
             campaign_seeds=campaign_seeds,
+            research_protection=research_protection,
         )
 
 
@@ -1863,6 +1901,7 @@ async def _campaign(
     resume: bool = False,
     market: PaperMarket = US,
     campaign_seeds: dict[str, Any] | None = None,
+    research_protection: Path | None = None,
 ) -> None:
     if adaptive and (
         profile != "broker-constrained"
@@ -1894,7 +1933,8 @@ async def _campaign(
 
     def record_feed(kind: str, payload: dict[str, Any]) -> None:
         if kind == "http":
-            http_audit.append(payload)
+            if research_protection is None or payload.get("status", 0) >= 400:
+                http_audit.append(payload)
         elif market is KR and kind in ("listings", "prices"):
             raw.write(json.dumps({"kind": kind, "received_at": now(), **payload}) + "\n")
 
@@ -1920,6 +1960,7 @@ async def _campaign(
         slots = SharedFeedSlots(
             make_runtime, subscription_set, record, journal, control,
             session_seeds=campaign_seeds, audit=audit, concurrent_accounts=True,
+            research_capital=capital if research_protection is not None else None,
         )
         runtime = slots
     else:
@@ -1990,7 +2031,10 @@ async def _campaign(
         data["limits"]["minimum_request_interval"] = 0.08
         market_settings = Settings(ROOT, data)
         client = (
-            DeadlineMarketClient(market_settings, end_epoch, recurring=campaign_seeds is not None)
+            DeadlineMarketClient(
+                market_settings, end_epoch,
+                recurring=campaign_seeds is not None or research_protection is not None,
+            )
             if adaptive and end_epoch is not None
             else CachedTokenClient(market_settings)
         )
@@ -2028,7 +2072,15 @@ async def _campaign(
         calendar_day = (
             market.trading_date(datetime.fromisoformat(now())) if constrained else now()[:10]
         )
-        calendar = await asyncio.to_thread(adapter.read, client.calendar, market.code, calendar_day)
+        if research_protection is not None:
+            assert end_epoch is not None
+            calendar = await asyncio.to_thread(
+                read_research_calendar, research_protection, market, calendar_day, end_epoch,
+            )
+        else:
+            calendar = await asyncio.to_thread(
+                adapter.read, client.calendar, market.code, calendar_day,
+            )
         if constrained:
             runtime.publish("calendar", (calendar_day, calendar))
         private_json(
@@ -2051,6 +2103,10 @@ async def _campaign(
                         "ai_reasoning_effort": "medium",
                         "durable_journal": journal is not None,
                         "resumed": resume,
+                        **(
+                            {"research_protection": str(research_protection)}
+                            if research_protection is not None else {}
+                        ),
                     }
                     if adaptive
                     else {}
@@ -2122,6 +2178,7 @@ async def _campaign(
             repairs: dict[str, float] = {}
             stale_books: dict[str, float] = {}
             progress = 0
+            protection_checked = -math.inf
 
             def collector_progress(*, waiting: bool = False) -> None:
                 nonlocal progress
@@ -2169,6 +2226,20 @@ async def _campaign(
                 )
 
             async def recover_held() -> None:
+                nonlocal protection_checked
+                if (
+                    research_protection is not None and slots is not None
+                    and time.monotonic() - protection_checked >= 1
+                ):
+                    protected = await asyncio.to_thread(
+                        read_research_protection, research_protection, market,
+                    )
+                    if protected != slots.research_protected:
+                        runtime.publish("research_protection", sorted(protected))
+                        await runtime.queue.join()
+                        record("research_protection", symbols=sorted(protected))
+                        resync.set()
+                    protection_checked = time.monotonic()
                 collector_progress()
                 await recover_held_quotes(
                     runtime, repair_book, repairs, deadline, gateway=shared_gateway, market=market,
@@ -2491,11 +2562,13 @@ async def _campaign(
                 del checks[key]
             if slots is not None:
                 rows = stats["shared_slots"]
-                checks["matched_inputs"] = bool(rows) and all(
+                checks["matched_inputs"] = (bool(rows) or research_protection is not None) and all(
                     row["comparison"]["inputs_aligned"] for row in rows
                 )
             else:
                 checks["matched_inputs"] = stats["comparison"]["inputs_aligned"]
+            if research_protection is not None:
+                checks["accepted_books_observed"] = runtime.counts["book"] > 0
         stats.update(checks=checks, result="passed" if all(checks.values()) else "inconclusive")
     except (
         OSError,
@@ -2597,6 +2670,7 @@ def main() -> None:
     parser.add_argument("--profile", choices=("legacy", "broker-constrained"), default="legacy")
     parser.add_argument("--market", choices=MARKETS, default="US")
     parser.add_argument("--adaptive", action="store_true")
+    parser.add_argument("--research-protection", type=Path)
     parser.add_argument("--end-at", help="Absolute adaptive experiment cutoff with UTC offset")
     parser.add_argument("--repair-approval", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--journal", type=Path, help="Durable journal for an adaptive campaign")
@@ -2614,6 +2688,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.slot_control is not None and (args.journal is None or not args.adaptive):
         parser.error("--slot-control requires --adaptive and --journal")
+    if args.research_protection is not None and args.slot_control is None:
+        parser.error("--research-protection requires --slot-control")
     campaign_seeds = None
     if args.campaign_seeds is not None:
         try:
@@ -2669,6 +2745,9 @@ def main() -> None:
                 resume=args.resume,
                 market=MARKETS[args.market],
                 campaign_seeds=campaign_seeds,
+                research_protection=(
+                    args.research_protection.resolve() if args.research_protection else None
+                ),
             )
         finally:
             if args.adaptive:

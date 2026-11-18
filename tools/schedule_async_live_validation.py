@@ -25,6 +25,7 @@ from tools.source_identity import command, tree_digest
 
 CUTOFF_DRAIN_SECONDS = 60
 CAMPAIGN_RESTART_LIMIT = 3
+RECOVERY_RETRY_SECONDS = 5
 
 
 def retryable_exit(result: dict[str, Any], run: dict[str, Any]) -> bool:
@@ -76,6 +77,12 @@ def run_schedule(
         if state in ("failed", "blocked", "incomplete"):
             attempt = len(restarts) + 1
             job, run_output = paths(attempt)
+            if (
+                spec.get("research_protection") and attempt > 1
+                and not (job / "start.claim").exists()
+            ):
+                attempt -= 1
+                job, run_output = paths(attempt)
             details["failure_handoff"] = {
                 "attempt": attempt,
                 "source_commit": spec.get("source_commit"),
@@ -119,7 +126,10 @@ def run_schedule(
                     not isinstance(restart, dict)
                     or type(restart.get("cursor")) is not int
                     or restart["cursor"] < cursor
-                    or (not recurring and restart["cursor"] == cursor)
+                    or (
+                        not recurring and not spec.get("research_protection")
+                        and restart["cursor"] == cursor
+                    )
                     or not isinstance(restart.get("journal_hash"), str)
                     or not isinstance(restart.get("job_exit"), dict)
                 ):
@@ -264,15 +274,25 @@ def run_schedule(
             cursor = verified["cursor"]
             if verified["state"] != "active" or type(cursor) is not int or cursor < 0:
                 raise RuntimeError("Journal does not contain a recoverable account")
-            if restarts and cursor <= restarts[-1]["cursor"] and not recurring:
+            if (
+                restarts and cursor <= restarts[-1]["cursor"]
+                and not recurring and not spec.get("research_protection")
+            ):
                 save("failed", job_exit=result, reason="Journal cursor did not advance")
                 return 1
             if recurring and len(restarts) >= CAMPAIGN_RESTART_LIMIT:
                 save("failed", job_exit=result, reason="Recurring restart limit reached")
                 return 1
             retry_at = run.get("api_retry_at")
-            if recurring:
-                retry_at = max(retry_at or 0, time.time() + 5 * 2 ** len(restarts))
+            if retry_at is not None and (
+                type(retry_at) not in (int, float) or not math.isfinite(retry_at)
+            ):
+                raise RuntimeError("Saved API retry time is invalid")
+            if recurring or spec.get("research_protection"):
+                retry_at = max(
+                    retry_at or 0,
+                    time.time() + min(300, RECOVERY_RETRY_SECONDS * 2 ** min(len(restarts), 6)),
+                )
             restarts.append(
                 {
                     "cursor": cursor,
@@ -370,6 +390,7 @@ def main() -> int:
         "--campaign-plan", type=Path, help="Frozen recurring campaign plan and carryover seeds"
     )
     parser.add_argument("--repair", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--research-protection", type=Path)
     args = parser.parse_args()
     if args.repair is not None:
         output = args.output.resolve()
@@ -387,6 +408,8 @@ def main() -> int:
         parser.error("Capital must be positive and finite")
     if args.dynamic_slots and not args.recover:
         parser.error("Dynamic slots require --recover")
+    if args.research_protection is not None and not args.dynamic_slots:
+        parser.error("--research-protection requires --dynamic-slots")
     if len(args.source_digest) != 64 or any(
         char not in "0123456789abcdef" for char in args.source_digest
     ):
@@ -410,6 +433,8 @@ def main() -> int:
     ]
     if args.market == "KR":
         argv.extend(["--market", "KR"])
+    if args.research_protection is not None:
+        argv.extend(["--research-protection", str(args.research_protection.resolve())])
     campaign = {}
     if args.campaign_plan is not None:
         if not args.dynamic_slots:
@@ -436,6 +461,10 @@ def main() -> int:
                 "argv": argv,
                 **({"recover": True} if args.recover else {}),
                 **({"dynamic_slots": True} if args.dynamic_slots else {}),
+                **(
+                    {"research_protection": str(args.research_protection.resolve())}
+                    if args.research_protection is not None else {}
+                ),
                 **({"initial_slots": campaign["initial_slots"]} if campaign else {}),
             },
         )
