@@ -67,6 +67,7 @@ HOST_ONLY_TEST_IDS = frozenset(
     }
 )
 _OFFLINE_TEST_IDS = (
+    _SCHEDULER + ".test_research_schedule_freezes_protection_path_without_initial_slots",
     _SCHEDULER + ".test_kr_schedule_freezes_market_in_worker_command",
     _SCHEDULER + ".test_expired_schedule_never_claims_job",
     _SCHEDULER + ".test_source_drift_blocks_launch",
@@ -81,6 +82,9 @@ _OFFLINE_TEST_IDS = (
     _RECOVERY + ".test_provider_cooldown_past_deadline_prevents_restart",
     _RECOVERY + ".test_journal_change_at_same_cursor_invalidates_saved_restart",
     _RECOVERY + ".test_dynamic_attempts_reuse_the_same_spool_and_keep_prior_evidence",
+    _RECOVERY + ".test_research_transport_failures_with_zero_progress_back_off_until_cutoff",
+    _RECOVERY + ".test_invalid_provider_retry_time_blocks_without_another_attempt",
+    _RECOVERY + ".test_research_controller_reopens_multiple_zero_cursor_restarts",
 )
 _REPAIR_HOST = _REPAIR_FIXTURE + ".test_detached_repaired_worker_replays_and_appends_once"
 _REPAIR_OFFLINE = (

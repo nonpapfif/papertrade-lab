@@ -50,6 +50,17 @@ class AsyncLayerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(a.close)
         return a
 
+    async def test_advance_drains_enqueued_work_before_expiry(self) -> None:
+        account = await self.account()
+        first = account.enqueue(event())
+        second = account.enqueue(event(at=2))
+        await account.advance(stamp(3))
+        self.assertTrue(first.done())
+        self.assertTrue(second.done())
+        self.assertEqual(account._submitted, account._completed)
+        self.assertTrue(account.book.positions)
+        self.assertEqual(account.last_at, stamp(3))
+
     async def test_held_quote_health_uses_provider_age_and_preserves_missing_marks(self) -> None:
         account = await self.account()
         self.assertTrue(account.quote_health(stamp(0))["comparison_eligible"])

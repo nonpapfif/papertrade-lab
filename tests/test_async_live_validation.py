@@ -15,22 +15,82 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from papertrade.api import ApiError
+from tools.adaptive_journal import read_status
 from tools.layered_paper import Feature
 from tools.market_stream import websocket_retry_at
-from tools.paper_market import KR
+from tools.paper_market import KR, US
 from tools.run_async_live_validation import (
     SOURCES,
     Runtime,
     campaign,
     latency_summary,
     rank_candidates,
+    read_research_calendar,
+    read_research_protection,
     subscription_set,
     wait_for_rest_cooldown,
     write_comparison,
 )
+from tools.slot_control import SlotControl
 
 
 class SelectionTests(unittest.TestCase):
+    def test_research_calendar_reuses_only_the_matching_frozen_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for market in (US, KR):
+                day = "2026-11-18"
+                start = datetime(2026, 11, 18, 9, tzinfo=market.timezone)
+                cutoff = start + timedelta(hours=6)
+                regular = {
+                    "startTime": start.isoformat(), "endTime": cutoff.isoformat(),
+                    market.cutoff_field: cutoff.isoformat(),
+                }
+                today: dict[str, Any] = {"date": day}
+                nested = today
+                for key in market.calendar_path[:-1]:
+                    nested[key] = {}
+                    nested = nested[key]
+                nested[market.calendar_path[-1]] = regular
+                calendar = {"today": today}
+                plan = {
+                    "market": market.code, "day": day, "calendar": calendar,
+                    "start": start.isoformat(), "end": cutoff.isoformat(),
+                }
+                (root / "session.json").write_text(json.dumps(plan))
+                self.assertEqual(
+                    read_research_calendar(root / "protected.json", market, day, cutoff.timestamp()),
+                    calendar,
+                )
+                for field, value in (
+                    ("market", "KR" if market is US else "US"),
+                    ("day", "2026-11-19"),
+                    ("start", (start + timedelta(minutes=1)).isoformat()),
+                    ("end", (cutoff - timedelta(minutes=1)).isoformat()),
+                ):
+                    (root / "session.json").write_text(json.dumps({**plan, field: value}))
+                    with self.assertRaises(ValueError):
+                        read_research_calendar(root / "protected.json", market, day, cutoff.timestamp())
+                (root / "session.json").write_text(json.dumps(plan))
+                with self.assertRaises(ValueError):
+                    read_research_calendar(root / "protected.json", market, day, cutoff.timestamp() - 1)
+
+    def test_research_protection_rejects_wrong_market_symbols_and_over_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "protection.json"
+            path.write_text(json.dumps({"market": "KR", "symbols": ["005930"]}))
+            self.assertEqual(read_research_protection(path, KR), {"005930"})
+            for payload in (
+                {"market": "US", "symbols": ["005930"]},
+                {"market": "KR", "symbols": ["../bad"]},
+                {"market": "KR", "symbols": ["005930", "005930"]},
+                {"market": "KR", "symbols": "005930"},
+                {"market": "KR", "symbols": [f"{i:06d}" for i in range(51)]},
+            ):
+                path.write_text(json.dumps(payload))
+                with self.assertRaises(ValueError):
+                    read_research_protection(path, KR)
+
     def test_websocket_retry_time_honors_valid_delay_and_http_date(self) -> None:
         self.assertEqual(websocket_retry_at(["8"], 100), 108)
         self.assertEqual(websocket_retry_at(["Thu, 01 Jan 1970 00:02:00 GMT"], 100), 120)
@@ -138,6 +198,100 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ComparisonTests(RuntimeTests):
+    @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
+    async def test_research_first_batch_transport_failure_closes_stream_with_zero_progress(self) -> None:
+        runner = "tools.run_async_live_validation"
+        closed = asyncio.Event()
+
+        async def stream(*_args: Any, **_kwargs: Any) -> None:
+            try:
+                await asyncio.Future()
+            finally:
+                closed.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spool, journal = root / "control.sqlite3", root / "journal.sqlite3"
+            protection = root / "protection.json"
+            protection.write_text(json.dumps({"market": "KR", "symbols": []}))
+            cutoff = datetime.fromtimestamp(time.time() + 10, UTC)
+            start = datetime.now(KR.timezone).replace(hour=0, minute=0, second=0, microsecond=0)
+            day = KR.trading_date(start)
+            calendar = {"today": {"date": day, "integrated": {"regularMarket": {
+                "startTime": start.isoformat(), "endTime": cutoff.isoformat(),
+                "singlePriceAuctionStartTime": cutoff.isoformat(),
+            }}}}
+            (root / "session.json").write_text(json.dumps({
+                "market": "KR", "day": day, "calendar": calendar,
+                "start": start.isoformat(), "end": cutoff.isoformat(),
+            }))
+            with SlotControl.open(spool, initialize=True):
+                pass
+            with (
+                patch(f"{runner}.DeadlineMarketClient") as client,
+                patch(f"{runner}.LiveFeed") as feed,
+                patch(f"{runner}.read_spec", return_value=b"{}"),
+                patch(f"{runner}.receive_market_stream", side_effect=stream),
+                patch(
+                    f"{runner}.MarketDataGateway.prices",
+                    new=AsyncMock(side_effect=ApiError("fixture", code="transport_error")),
+                ) as prices,
+                self.assertRaisesRegex(SystemExit, "Live validation failed"),
+            ):
+                client.return_value.access_token.return_value = "fixture-token"
+                client.return_value.calendar.return_value = {}
+
+                def universe() -> list[str]:
+                    record_feed = feed.call_args.args[1]
+                    record_feed("http", {"status": 200})
+                    record_feed("http", {"status": 503})
+                    return ["005930"]
+
+                feed.return_value.universe.side_effect = universe
+                await asyncio.wait_for(campaign(
+                    root / "run", 10, 1_000_000, profile="broker-constrained", adaptive=True,
+                    end_epoch=cutoff.timestamp(), market=KR, journal_path=journal,
+                    slot_control=spool, research_protection=protection,
+                ), 3)
+            prices.assert_awaited_once_with("KR", ["005930"])
+            client.return_value.calendar.assert_not_called()
+            self.assertTrue(closed.is_set())
+            status = json.loads((root / "run/status.json").read_text())
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["error_type"], "ApiError")
+            self.assertEqual(status["api_code"], "transport_error")
+            self.assertEqual(status["shared_slots"], [])
+            self.assertEqual(status["ai_calls"], 0)
+            self.assertEqual(read_status(journal)["cursor"], 0)
+            self.assertEqual(read_status(journal)["state"], "active")
+            self.assertEqual(
+                json.loads((root / "run/http-audit.json").read_text()),
+                {"requests": [{"status": 503}]},
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("websockets"), "Optional WebSocket dependency")
+    async def test_nonresearch_http_audit_keeps_success_and_error_responses(self) -> None:
+        runner = "tools.run_async_live_validation"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with (
+                patch(f"{runner}.CachedTokenClient") as client,
+                patch(f"{runner}.LiveFeed") as feed,
+                self.assertRaisesRegex(SystemExit, "Live validation failed"),
+            ):
+                def failed_token() -> str:
+                    record_feed = feed.call_args.args[1]
+                    record_feed("http", {"status": 200})
+                    record_feed("http", {"status": 503})
+                    raise RuntimeError("fixture")
+
+                client.return_value.access_token.side_effect = failed_token
+                await campaign(output, 360, 100)
+            self.assertEqual(
+                json.loads((output / "http-audit.json").read_text()),
+                {"requests": [{"status": 200}, {"status": 503}]},
+            )
+
     async def asyncSetUp(self) -> None:
         self.events: list[dict[str, Any]] = []
         self.runtime = Runtime(

@@ -20,6 +20,11 @@ its ledger history. Historical v1/v2 implementations remain for comparison.
 The objective is virtual profit through active experiments. Concentration, frequent trades,
 failed hypotheses, and losing a ledger are allowed. New starting capital is not profit.
 
+## Shared-feed research sessions
+
+[Run, recover, or replay a KR or US research session](docs/research-session.md). One Toss
+feed supplies three independent paper accounts. Each research publication retains role reports.
+
 ## Offline research workflow
 
 [Compare existing and TossTradingLab research selection](docs/research-selection-comparison.md) on one recorded US stream using independent paper accounts.

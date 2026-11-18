@@ -84,6 +84,60 @@ class SharedFeedSlotTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
+    async def test_research_feed_selects_without_slots_and_protects_external_exposure(self) -> None:
+        self.slots.research_capital = 1000
+        self.assertEqual(self.slots.capital, 1000)
+        await self.feed("selection", [f"S{i}" for i in range(50)])
+        self.assertEqual(len(self.slots.desired), 50)
+        await self.feed("research_protection", ["HELD", "PENDING"])
+        self.assertEqual(self.slots.protected(), {"HELD", "PENDING"})
+        self.assertTrue({"HELD", "PENDING"} <= set(self.slots.desired))
+        self.assertEqual(len(self.slots.desired), 50)
+        await self.feed("clock", None, 1)
+        self.assertTrue({"HELD", "PENDING"} <= set(self.slots.desired))
+        fetch = AsyncMock()
+        gateway = Mock()
+        gateway.cached.return_value = {}
+        await recover_held_quotes(
+            self.slots, fetch, {}, time.monotonic() + 10, gateway=gateway,
+        )
+        self.assertCountEqual(fetch.await_args_list, [call("HELD"), call("PENDING")])
+        self.assertEqual(self.slots.status()["ai_calls"], 0)
+        with self.assertRaisesRegex(ValueError, "connection capacity"):
+            self.slots.protect_research({f"S{i}" for i in range(51)})
+        self.assertEqual(self.slots.protected(), {"HELD", "PENDING"})
+        restored = self.coordinator(self.journal)
+        restored.research_capital = 1000
+        self.addAsyncCleanup(restored.close)
+        await restored.restore()
+        self.assertEqual(restored.protected(), {"HELD", "PENDING"})
+        self.assertEqual(restored.desired, self.slots.desired)
+        await self.feed("research_protection", [])
+        self.assertEqual(self.slots.protected(), set())
+        self.assertEqual(self.slots.desired, [f"S{i}" for i in range(50)])
+
+    async def test_research_protection_replay_preserves_historical_account_watch(self) -> None:
+        self.slots.research_capital = 1000
+        await self.seed()
+        await self.command(add("one", 100))
+        await self.feed("research_protection", [f"X{i}" for i in range(49)])
+        self.assertIn("A", self.slots.desired)
+        self.assertNotIn("B", self.slots.desired)
+        await self.book("B", 1)
+        await self.book("A", 2)
+        await self.feed("research_protection", [], 3)
+        await self.book("B", 4)
+        restored = self.coordinator(self.journal)
+        restored.research_capital = 1000
+        self.addAsyncCleanup(restored.close)
+        await restored.restore()
+        self.assertEqual(restored.protected(), self.slots.protected())
+        self.assertEqual(restored.desired, self.slots.desired)
+        self.assertEqual(
+            restored.slots["one"].runtime.checkpoint(),
+            self.slots.slots["one"].runtime.checkpoint(),
+        )
+
     async def command(self, command: SlotCommand, offset: int = 0) -> None:
         self.controls.submit(command, end_epoch=time.time() + 60)
         await self.feed("slot_command", asdict(command), offset)
