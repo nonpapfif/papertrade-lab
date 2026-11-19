@@ -309,6 +309,8 @@ def _codex_command(settings: CodexSettings, working: Path, schema: Path) -> list
 class CodexModel:
     """A LangChain-compatible adapter for this graph's text and schema invocations."""
 
+    _instructions = SYSTEM_INSTRUCTIONS
+
     def __init__(
         self,
         settings: CodexSettings,
@@ -322,7 +324,7 @@ class CodexModel:
         self.blocked = blocked if blocked is not None else threading.Event()
 
     def with_structured_output(self, schema: Any) -> CodexModel:
-        return CodexModel(self.settings, schema, self.stopped, self.blocked)
+        return type(self)(self.settings, schema, self.stopped, self.blocked)
 
     def _communicate(self, process: subprocess.Popen[bytes], payload: bytes) -> bytes:
         expires = time.monotonic() + self.settings.timeout
@@ -354,7 +356,7 @@ class CodexModel:
         if isinstance(prompt, list):
             prompt = "\n".join(str(getattr(item, "content", item)) for item in prompt)
         definition = _schema_for(self.schema)
-        payload = SYSTEM_INSTRUCTIONS + "\n\n" + json_text({"agent_prompt": str(prompt)})
+        payload = self._instructions + "\n\n" + json_text({"agent_prompt": str(prompt)})
         with tempfile.TemporaryDirectory(prefix="papertrade-research-") as temporary:
             working = Path(temporary)
             schema_path = working / "response.schema.json"
