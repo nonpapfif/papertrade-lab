@@ -87,13 +87,14 @@ def money(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
 
-def costs(price: float, qty: int, side: str) -> tuple[Decimal, dict[str, float]]:
+def costs(price: float | Decimal, qty: int, side: str) -> tuple[Decimal, dict[str, float]]:
     gross = Decimal(str(price)) * qty
     fees = transaction_fees(float(gross), qty, side, FEES)
     # Preserve the shared model's unrounded commission without float arithmetic in the ledger.
-    fees["commission_usd"] = float(gross * Decimal(str(FEES["commission_rate"])))
-    fees["total_usd"] = sum(fees[name] for name in ("commission_usd", "sec_usd", "taf_usd"))
-    net_fees = sum(Decimal(str(fees[name])) for name in ("commission_usd", "sec_usd", "taf_usd"))
+    commission = gross * Decimal(str(FEES["commission_rate"]))
+    fees["commission_usd"] = float(commission)
+    net_fees = commission + Decimal(str(fees["sec_usd"])) + Decimal(str(fees["taf_usd"]))
+    fees["total_usd"] = float(net_fees)
     return (gross + net_fees if side == "BUY" else gross - net_fees), fees
 
 
@@ -157,21 +158,26 @@ class Account:
 
     def _size(
         self, signal: Signal, quote: Quote, available: Decimal, *, cap: int | None = None
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, Decimal]:
         sizing = self.source.budget.size_trade(
             signal.plan, self.config, cash=float(available), price=quote.ask, today=self.day
         )
         order = self.source.budget.bracket_order(sizing)
         if order is None:
-            return sizing, None
-        # Depth, prior approved size and the separately modelled fee restrict executable
-        # quantity. The stock, side, native risk budget and bracket stay source-owned.
+            return sizing, None, Decimal(0)
+        # Native sizing rounds the reference to cents. The paper debit uses the full ask
+        # and unrounded per-share commission, so reserve at the higher of the two prices.
         available_after_buffer = available - Decimal(str(sizing["cash_buffer"]))
-        per_share, _ = costs(sizing["entry"], 1, "BUY")
+        reserve_price = max(Decimal(str(quote.ask)), Decimal(str(sizing["entry"])))
+        per_share, _ = costs(reserve_price, 1, "BUY")
         affordable = max(0, int(available_after_buffer // per_share))
         qty = min(sizing["qty"], affordable, *([cap] if cap is not None else []))
         if not qty:
-            return {**sizing, "execution_refusal": "insufficient_cash_after_costs"}, None
+            return (
+                {**sizing, "execution_refusal": "insufficient_cash_after_costs"},
+                None,
+                Decimal(0),
+            )
         if qty != sizing["qty"]:
             order = self.source.budget.bracket_order(
                 {
@@ -181,7 +187,7 @@ class Account:
                     "max_loss": round(sizing["risk_per_share"] * qty, 2),
                 }
             )
-        return sizing, order
+        return sizing, order, per_share * qty
 
     def _record_order(self, symbol: str, side: str, risk: dict[str, Any]) -> int:
         number = len(self.orders) + 1
@@ -204,7 +210,7 @@ class Account:
     ) -> dict[str, Any]:
         base = {"kind": "entry_decision", "symbol": symbol, "trigger": iso(signal.trigger)}
         try:
-            sizing, order = self._size(signal, quote, self._available())
+            sizing, order, reserved = self._size(signal, quote, self._available())
         except self.source.budget.SizeError as error:
             return {**base, "status": "blocked", "source_reason": str(error)}
         if order is None:
@@ -213,7 +219,6 @@ class Account:
         if not risk["pass"]:
             return {**base, "status": "blocked", "sizing": sizing, "risk": risk}
         qty = int(order["qty"])
-        reserved, _ = costs(sizing["entry"], qty, "BUY")
         number = self._record_order(symbol, "buy", risk)
         self.buys[symbol] = Intent(
             quote.processed,
@@ -242,7 +247,7 @@ class Account:
         base = {"kind": "entry_confirmation", "symbol": symbol, "number": current.order_number}
         signal = Signal(current.at, current.at, current.plan, current.expires)
         try:
-            sizing, order = self._size(
+            sizing, order, _ = self._size(
                 signal, quote, self._available(), cap=min(current.quantity, quote.ask_qty)
             )
         except self.source.budget.SizeError as error:

@@ -4,13 +4,14 @@ import os
 import tempfile
 import unittest
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from papertrade.jsonio import atomic_json
 from tools.adaptive_journal import AdaptiveJournal, read_status
 from tools.session_research import ResearchReplay
-from tools.upstream_paper_accounts import PROFILES, Comparison
+from tools.upstream_paper_accounts import PROFILES, Account, Comparison, Quote, Signal
 from tools.upstream_paper_session import _replay, _summary
 from tools.upstream_strategy import Upstream, epoch, iso
 
@@ -283,6 +284,50 @@ class UpstreamPaperTests(unittest.TestCase):
                 "research_unavailable_during_capture",
             ],
         )
+
+    def test_subcent_buy_preserves_cash_and_native_cash_buffer(self) -> None:
+        for buffer, capital in ((0, 10.01), (10, 1000)):
+            for initial_ask, affordable, status in (
+                (10.004, "10.01", "blocked"),
+                (10, "10.01", "cancelled"),
+                (10.004, "10.014004", "filled"),
+            ):
+                with self.subTest(buffer=buffer, initial_ask=initial_ask, status=status):
+                    config = {
+                        **self.config,
+                        "cash_buffer_pct": buffer,
+                        "budget": capital,
+                        "max_position_pct": 100,
+                    }
+                    account = Account(self.source, config, "2026-10-19")
+                    cash_buffer = Decimal("100" if buffer else "0")
+                    starting_cash = cash_buffer + Decimal(affordable)
+                    account.cash = starting_cash
+                    account.candidates["TSLA"] = Signal(
+                        TRIGGER,
+                        TRIGGER,
+                        {
+                            "symbol": "TSLA",
+                            "date": "2026-10-19",
+                            "entry": 10,
+                            "stop": 9,
+                            "target": 12,
+                        },
+                        TRIGGER + 300,
+                    )
+                    initial = Quote(TRIGGER + 1, TRIGGER + 1, TRIGGER + 1, 10, 1, initial_ask, 1)
+                    decision = account.observe_book("TSLA", initial, {"TSLA": initial})[0]
+                    if status == "blocked":
+                        self.assertEqual(decision["status"], status)
+                    else:
+                        self.assertEqual(decision["status"], "approved")
+                        self.assertEqual(decision["reserved_usd"], affordable)
+                        later = Quote(TRIGGER + 2, TRIGGER + 2, TRIGGER + 2, 10, 1, 10.004, 1)
+                        confirmation = account.observe_book("TSLA", later, {"TSLA": later})[0]
+                        self.assertEqual(confirmation["status"], status)
+                    self.assertEqual(
+                        account.cash, cash_buffer if status == "filled" else starting_cash
+                    )
 
 
 if __name__ == "__main__":
