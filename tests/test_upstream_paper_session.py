@@ -53,6 +53,7 @@ class UpstreamPaperTests(unittest.TestCase):
             "end": iso(CLOSE),
             "entry_cutoff": iso(CLOSE - 30 * 60),
             "symbols": ["TSLA"],
+            "premarket_scan": {"universe": 1, "scanned": 1, "failed": 0, "hits": 1},
         }
         fixture = self.source.root / "tests/fixtures/trader-entry/TSLA-2026-10-19-5m.json"
         self.raw = fixture.read_text()
@@ -255,6 +256,33 @@ class UpstreamPaperTests(unittest.TestCase):
             self.assertFalse(summary["counts"].get("native_entry_signals"))
             if not available:
                 self.assertIn("no_usable_native_scan_inputs", summary["limitations"])
+
+    def test_premarket_and_research_failures_remain_visible_with_no_signal(self) -> None:
+        premarket = {"universe": 2, "scanned": 1, "failed": 1, "hits": 1}
+        self.plan["premarket_scan"] = premarket
+        comp = self.comparison()
+        comp.process({"kind": "capture_started", "at": iso(OPEN - 1)})
+        comp.process(
+            {
+                "kind": "research_unavailable",
+                "at": iso(OPEN),
+                "payload": {"code": "codex_login_or_binary_unavailable"},
+            }
+        )
+        cut = OPEN + 20 * 60
+        comp.process({"kind": "scan", "at": iso(cut + 2), "payload": self.scan(cut)})
+        comp.process({"kind": "close", "at": iso(CLOSE)})
+        with AdaptiveJournal.open(self.out / "failed.sqlite3", self.plan, resume=False) as journal:
+            summary = _summary(comp, journal)
+        self.assertEqual(summary["premarket_scan"], premarket)
+        self.assertEqual(summary["comparison_quality"], "incomplete")
+        self.assertEqual(
+            summary["limitations"],
+            [
+                "some_native_premarket_scan_requests_failed",
+                "research_unavailable_during_capture",
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -66,6 +66,10 @@ def _plan(
         raise ValueError("A watchlist symbol does not match the provider symbol contract")
     if len(symbols) != len(set(symbols)):
         raise ValueError("The watchlist repeats a symbol")
+    premarket = {key: watchlist[key] for key in ("universe", "scanned", "failed")}
+    if any(type(count) is not int or count < 0 for count in premarket.values()):
+        raise ValueError("Invalid native premarket scan counts")
+    premarket["hits"] = len(symbols)
     entry_cutoff = source.cutoff(args.day, config)
     if not start.timestamp() < entry_cutoff < end.timestamp():
         raise ValueError("Native entry cutoff is outside the Toss regular session")
@@ -83,6 +87,7 @@ def _plan(
             "calendar": calendar,
             "config": config,
             "symbols": symbols,
+            "premarket_scan": premarket,
             "watchlist_sha256": hashlib.sha256(canonical_json(watchlist).encode()).hexdigest(),
             "day_trader_root": str(source.root),
             "day_trader_revision": REVISION,
@@ -518,7 +523,12 @@ def _replay(comparison: Comparison, journal: AdaptiveJournal) -> None:
 def _summary(comparison: Comparison, journal: AdaptiveJournal) -> dict[str, Any]:
     observed = comparison.stats
     publications = comparison.research.publications()
+    premarket = comparison.plan["premarket_scan"]
     limitations = []
+    if premarket["failed"]:
+        limitations.append("some_native_premarket_scan_requests_failed")
+    if observed["research_unavailable"]:
+        limitations.append("research_unavailable_during_capture")
     if comparison.plan["symbols"] and not observed["scanner_scanned"]:
         limitations.append("no_usable_native_scan_inputs")
     if observed["scanner_spark_failures"] or observed["scanner_confirmation_failures"]:
@@ -542,6 +552,7 @@ def _summary(comparison: Comparison, journal: AdaptiveJournal) -> dict[str, Any]
         "state": "closed_incomplete" if limitations else "closed",
         "comparison_quality": "incomplete" if limitations else "observed",
         "limitations": limitations,
+        "premarket_scan": premarket,
         "research_publications_sha256": hashlib.sha256(
             canonical_json(publications).encode()
         ).hexdigest(),
