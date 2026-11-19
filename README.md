@@ -20,6 +20,11 @@ its ledger history. Historical v1/v2 implementations remain for comparison.
 The objective is virtual profit through active experiments. Concentration, frequent trades,
 failed hypotheses, and losing a ledger are allowed. New starting capital is not profit.
 
+## US sessions with upstream strategies
+
+[Run the original Day Trader rules with and without published TradingAgents research](docs/upstream-paper-session.md).
+Both accounts simulate orders locally on Toss market data.
+
 ## Shared-feed research sessions
 
 [Run, recover, or replay a KR or US research session](docs/research-session.md). One Toss
