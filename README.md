@@ -1,67 +1,64 @@
 # Papertrade Lab
 
-Papertrade Lab is the validation precursor to Autotrade Lab, an intended real-money automated
-trading system. The agreed direction is rule-based execution with AI analysis and strategy
-improvement. Target requirements and unresolved decisions are in
-[Project direction](docs/project-direction.md); they are not a claim of implemented behavior.
+Papertrade Lab is an **active** KR and US paper-trading project. It reviews trading losses,
+tests a rule change against the incumbent on shared observations, and records the next decision.
+It is the validation precursor to Autotrade Lab. The current execution contract permits paper
+fills and allowlisted Toss market data. See [project direction](docs/project-direction.md).
 
-The current repository includes market-data collection, historical experiments, virtual trading
-with event-triggered AI reviews, and a separate rule-based layered experiment.
-Python 3.12 or later is required; the project has no mandatory third-party Python dependencies.
-The isolated predictors and background service examples use macOS.
+## Execution
 
-The user has set two boundaries:
+The canonical source is [nonpapfif/papertrade-lab](https://github.com/nonpapfif/papertrade-lab)
+on `master`. Run commands from the relevant checkout root with Python 3.12 or later. The base
+package uses the standard library. Live streaming uses the `websocket-probe` extra. Optional
+TradingAgents sessions use the `research` extra and the configured Codex CLI. Local isolated
+predictors and the deployed background jobs use macOS.
 
-1. Do not run AI continuously just because time has passed. Use it for useful decisions.
-2. Never execute real trades.
+| Task | How to run |
+| --- | --- |
+| KR loss review and next-session comparison | Run `tools.strategy_review_cycle` with `--market KR` and the audited rebound evidence. |
+| US loss review and next-session comparison | Run the same CLI with `--market US`, the sealed loss session and the pinned Day Trader checkout. |
+| Recurring KR/US campaign | The deployed macOS LaunchAgent runs the campaign controller from its frozen checkout. |
+| Refactor supervisor | A separate LaunchAgent runs validation and reviews. |
+| Free-simulation worker | Five independent launchd roles share the free-simulation ledger. |
+| Other live and offline tasks | The execution inventory lists the entry points and their inputs. |
 
-The default simulation profile is `free-simulation-v3`. It starts from USD 1,000 and preserves
-its ledger history. Historical v1/v2 implementations remain for comparison.
-The objective is virtual profit through active experiments. Concentration, frequent trades,
-failed hypotheses, and losing a ledger are allowed. New starting capital is not profit.
+See [paired strategy review](docs/strategy-review-cycle.md) for commands and
+[execution and recovery](docs/execution.md) for actual launchers, task status, and recovery.
 
-## US sessions with upstream strategies
+## Code entry points
 
-[Run the original Day Trader rules with and without published TradingAgents research](docs/upstream-paper-session.md).
-Both accounts simulate orders locally on Toss market data.
+- [Loss review and next-session decision](tools/strategy_review_cycle.py) uses the
+  [KR scheduler](tools/schedule_async_live_validation.py) and
+  [US Day Trader runner](tools/upstream_paper_session.py).
+- [Shared research sessions](tools/research_session.py) compare three virtual accounts.
+- [Recurring campaign](tools/run_paper_campaign.py),
+  [refactor supervisor](tools/autotest_supervisor.py), and
+  [free-simulation CLI and workers](papertrade/__main__.py) have independent entry points.
+- [Offline paper engine](paper_engine/README.md) implements the deterministic account and
+  execution model for recorded or injected observations.
 
-## Shared-feed research sessions
+## Results and recovery
 
-[Run, recover, or replay a KR or US research session](docs/research-session.md). One Toss
-feed supplies three independent paper accounts. Each research publication retains role reports.
+Local state lives under ignored `state/`. Current strategy comparisons store their plans,
+journals, and post-session decisions in `state/strategy-review/<date>/<market>/`. The separate
+`<market>-job/` directory holds launcher status and logs. Preserve the original source identity,
+inputs, journals, and reports to reproduce an earlier session. For external storage, legacy
+ledgers, and the deployed campaign, see [execution and recovery](docs/execution.md).
 
-## Offline research workflow
+## Verification
 
-[Compare existing and TossTradingLab research selection](docs/research-selection-comparison.md) on one recorded US stream using independent paper accounts.
+From a checkout with the WebSocket dependency available, run the focused offline example:
 
-Run commands from the repository root. Downloading uses the authenticated market-data client.
-Replays and rule searches use the saved dataset and make no AI or market-data requests.
-
-```zsh
-python3 -m tools.download_market_day --date 2026-10-30
-python3 -m tools.download_market_day --date 2026-10-30 --status
-
-python3 -m tools.replay_market_day \
-  --dataset state/datasets/2026-10-30/market.sqlite3 \
-  --output state/replays/2026-10-30-first
-
-python3 -m tools.search_up_candles \
-  --dataset state/datasets/2026-10-30/market.sqlite3 \
-  --output state/searches/2026-10-30-grid-v1
-python3 -m tools.search_up_candles \
-  --output state/searches/2026-10-30-grid-v1 --status
-
-python3 -m tools.search_portfolios \
-  --dataset state/datasets/2026-10-30/market.sqlite3 \
-  --features state/searches/2026-10-30-grid-v1/search.sqlite3 \
-  --output state/portfolios/2026-10-30-diverse-v1
-python3 -m tools.search_portfolios \
-  --output state/portfolios/2026-10-30-diverse-v1 --status
+```sh
+python3.12 -m unittest tests.test_strategy_review_cycle tests.test_slot_control
 ```
 
-Use a new replay directory for each replay. The downloader and rule search can resume an
-unchanged run. Their status commands require the corresponding local dataset or run to exist.
-No offline command starts the continuous trading workers.
+Expect an `OK` summary. The checks cover a matched comparison, a missing-evidence disposition,
+and slot command handling. The full regression command is `python3.12 -m unittest discover -s tests`.
+Set `PAPERTRADE_DAY_TRADER_SOURCE` to the pinned Day Trader checkout to include the upstream
+fixture tests. See [execution and recovery](docs/execution.md) for the next operational check.
+
+## Reference guides
 
 | Guide | Purpose |
 |---|---|
@@ -71,7 +68,7 @@ No offline command starts the continuous trading workers.
 | [Domain glossary](GLOSSARY.md) | Shared project terminology |
 | [Shared observation design](docs/shared-observation-design.md) | Live/replay preparation, actual timing, and parity acceptance criteria |
 | [Autotrade operating design](docs/autotrade-system-design.md) | Recovery, risk, versions, promotion, orders, reconciliation, data, evaluation and controls |
-| [Current scope and backlog](docs/autotrade-implementation-plan.md) | Minimal live-comparison milestone, stop criteria and conditional future work |
+| [Current scope and backlog](docs/autotrade-implementation-plan.md) | Milestones, stop criteria and conditional future work |
 | [Asynchronous layered execution](docs/async-layered-paper.md) | Rule-based decisions, cash reservation, and delayed paper fills |
 | [Finite live-data validation](docs/async-live-validation.md) | Market-data integration and observed execution evidence |
 | [Event-driven validation supervisor](docs/autotest-supervisor.md) | Existing automated test and publication workflow |

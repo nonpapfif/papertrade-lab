@@ -1,5 +1,11 @@
 # Papertrade Lab
 
+Apply `$project-standards` before project work. Keep the README and execution inventory aligned
+with the actual launcher, checkout, runtime, and state. Run
+`python3.12 -m unittest tests.test_strategy_review_cycle tests.test_slot_control` for the
+paired-review smoke check. Use `python3.12 -m unittest discover -s tests` for full regression
+with the WebSocket dependency installed.
+
 ## Project direction
 
 Papertrade Lab is the validation precursor to Autotrade Lab, whose final goal is real-money
