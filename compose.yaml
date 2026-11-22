@@ -1,0 +1,49 @@
+name: finance-strategy-cycle
+x-cycle: &cycle
+  image: finance-strategy-cycle:${FINANCE_COMMIT:-unbuilt}
+  build:
+    context: .
+    args:
+      FINANCE_COMMIT: ${FINANCE_COMMIT:-}
+  init: true
+  restart: "no"
+  user: "${FINANCE_UID:-501}:${FINANCE_GID:-20}"
+  read_only: true
+  tmpfs:
+    - /tmp
+  volumes:
+    - type: bind
+      source: ${FINANCE_PRIOR_ROOT:?Set FINANCE_PRIOR_ROOT}
+      target: /prior
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FINANCE_RUN_ROOT:?Set FINANCE_RUN_ROOT}
+      target: /runs
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FINANCE_TOSS_DIR:?Set FINANCE_TOSS_DIR}
+      target: /runner/.config/secrets
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FINANCE_TOSS_ID_FILE:?Set FINANCE_TOSS_ID_FILE}
+      target: /runner/.config/secrets/TOSS_CLIENT_ID
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${FINANCE_TOSS_SECRET_FILE:?Set FINANCE_TOSS_SECRET_FILE}
+      target: /runner/.config/secrets/TOSS_CLIENT_SECRET
+      read_only: true
+      bind:
+        create_host_path: false
+services:
+  kr:
+    <<: *cycle
+    command: ["--market", "KR", "--prior", "/prior/KR", "--output", "/runs"]
+  us:
+    <<: *cycle
+    command: ["--market", "US", "--prior", "/prior/US", "--output", "/runs"]

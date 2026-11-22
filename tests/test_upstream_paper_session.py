@@ -230,20 +230,37 @@ class UpstreamPaperTests(unittest.TestCase):
                 "hits": [{"symbol": "TSLA"}],
             },
         )
-        plan, _ = _plan(
-            Namespace(
-                config=None,
-                capital=1000,
-                calendar=calendar,
-                watchlist=watchlist_file,
-                day=date(2026, 10, 19),
-                compare_reward_risk=True,
-            ),
-            self.source,
-            OPEN - 60,
+        arguments = Namespace(
+            config=None,
+            capital=1000,
+            calendar=calendar,
+            watchlist=watchlist_file,
+            day=date(2026, 10, 19),
+            compare_reward_risk=True,
+            reward_risk_pair=None,
         )
+        plan, _ = _plan(arguments, self.source, OPEN - 60)
         self.assertEqual(plan["research_policy"], "disabled")
         self.assertEqual(plan["min_reward_risk_by_profile"], REWARD_RISK_PROFILES)
+        arguments.compare_reward_risk = False
+        arguments.reward_risk_pair = [1.0, 1.5]
+        followup, _ = _plan(arguments, self.source, OPEN - 60)
+        self.assertEqual(followup["research_policy"], "disabled")
+        self.assertEqual(followup["min_reward_risk_by_profile"], {
+            "source_min_reward_risk_1": 1.0, "source_min_reward_risk_1.5": 1.5,
+        })
+        revised = Comparison(self.source, followup, self.config_file, None)
+        revised.process({"kind": "capture_started", "at": iso(OPEN - 10)})
+        revised.process({"kind": "scan", "at": iso(TRIGGER + 2), "payload": self.scan()})
+        revised_actions = revised.process({
+            "kind": "book", "at": iso(TRIGGER + 3),
+            "payload": self.book(TRIGGER + 3, TRIGGER + 3, ask=364.28),
+        })
+        candidate = revised_actions["accounts"]["source_min_reward_risk_1.5"][0]
+        self.assertEqual(candidate["status"], "approved")
+        self.assertGreaterEqual(candidate["sizing"]["reward_risk"], 1.5)
+        self.assertLess(candidate["sizing"]["reward_risk"], 2.0)
+
         atomic_json(self.out / "plan.json", plan)
         config = self.out / "source-config.json"
         atomic_json(config, plan["config"])

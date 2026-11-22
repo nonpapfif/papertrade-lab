@@ -21,12 +21,27 @@ from papertrade.api import ApiError, MarketClient
 from papertrade.core import SafetyError, Settings
 from papertrade.jsonio import atomic_json, read_json
 from tools.paper_campaign.evidence import compact_rows
-from tools.paper_market import KR, US
+from tools.paper_market import KR, US, PaperMarket
 from tools.source_identity import command, file_digest, tree_digest
+from tools.strategy_review_handoff import load_next_plan, write_handoff
+from tools.upstream_paper_accounts import REWARD_RISK_PROFILES, reward_risk_profiles
 
 ROOT = Path(__file__).resolve().parents[1]
 SLOT = "rebound-entry-cost"
-US_ACCOUNTS = ("source_min_reward_risk_1", "source_min_reward_risk_2")
+US_ACCOUNTS = tuple(REWARD_RISK_PROFILES)
+
+
+def next_market_session(
+    market: PaperMarket, day: str, calendar: dict[str, Any]
+) -> tuple[str, datetime]:
+    following = calendar["nextBusinessDay"]
+    next_day = date.fromisoformat(following["date"]).isoformat()
+    if next_day <= day:
+        raise ValueError("The next business date must follow the comparison date")
+    start, _ = market.session({"today": following}, next_day)
+    if datetime.now(UTC) >= start:
+        raise ValueError("The next market session has already opened")
+    return next_day, start
 
 
 def review_loss(market: str, evidence: Path) -> dict[str, Any]:
@@ -169,9 +184,16 @@ def run_us(output: Path, plan: dict[str, Any], source: Path) -> tuple[int, Path]
     if tree_digest(ROOT) != plan["source_digest"]:
         raise RuntimeError("Approved repository source changed before the US session")
     session = output / "session"
+    pair = plan["strategies"]
+    comparison = ["--compare-reward-risk"]
+    if plan.get("next_plan") is not None:
+        comparison = [
+            "--reward-risk-pair", str(pair["incumbent"]["min_reward_risk"]),
+            str(pair["candidate"]["min_reward_risk"]),
+        ]
     result = subprocess.run([
         sys.executable, "-m", "tools.upstream_paper_session", "run",
-        "--compare-reward-risk", "--day", plan["day"], "--source", str(source),
+        *comparison, "--day", plan["day"], "--source", str(source),
         "--calendar", str(output / "calendar.json"), "--watchlist", str(watchlist),
         "--output", str(session), "--capital", str(plan["capital"]),
     ], cwd=ROOT, check=False)
@@ -183,7 +205,9 @@ def run_us(output: Path, plan: dict[str, Any], source: Path) -> tuple[int, Path]
     return result.returncode, session / "comparison.json"
 
 
-def evaluate(market: str, report: dict[str, Any], ok: bool) -> dict[str, Any]:
+def evaluate(
+    market: str, report: dict[str, Any], ok: bool, *, us_accounts: tuple[str, ...] = US_ACCOUNTS
+) -> dict[str, Any]:
     if market == "KR":
         slots = report.get("shared_slots", [])
         pair = slots[0].get("comparison", {}).get("accounts", {}) if len(slots) == 1 else {}
@@ -200,7 +224,7 @@ def evaluate(market: str, report: dict[str, Any], ok: bool) -> dict[str, Any]:
         traded = any(row.get("closed", 0) > 0 for row in (a, b))
     else:
         accounts = report.get("accounts", {})
-        a, b = (accounts.get(key, {}) for key in US_ACCOUNTS)
+        a, b = (accounts.get(key, {}) for key in us_accounts)
         complete = (
             ok and report.get("state") == "closed"
             and report.get("comparison_quality") == "observed"
@@ -218,27 +242,55 @@ def evaluate(market: str, report: dict[str, Any], ok: bool) -> dict[str, Any]:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--market", required=True, choices=("KR", "US"))
     parser.add_argument("--day", required=True, type=date.fromisoformat)
-    parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--evidence", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source", type=Path, help="Pinned Day Trader checkout for US")
     parser.add_argument("--capital", type=float)
-    parser.add_argument("--previous-decision", type=Path, help="Link a retest to a prior decision")
-    args = parser.parse_args()
+    lineage = parser.add_mutually_exclusive_group()
+    lineage.add_argument("--previous-decision", type=Path, help="Link a retest to a prior decision")
+    lineage.add_argument("--next-plan", type=Path, help="Consume a frozen next-session plan")
+    parser.add_argument("--handoff", action="store_true", help="Review and freeze the next session")
+    args = parser.parse_args(argv)
     if args.market == "US" and args.source is None:
         parser.error("--source is required for the US comparison")
+    day = args.day.isoformat()
     default_capital = 1_000_000 if args.market == "KR" else 1000
     capital = args.capital if args.capital is not None else default_capital
+    evidence = args.evidence
+    next_plan = None
+    next_plan_link = None
+    if args.next_plan is not None:
+        try:
+            next_plan_path = args.next_plan.resolve()
+            next_plan_digest = file_digest(next_plan_path)
+            next_plan = load_next_plan(next_plan_path, args.market, day)
+            if file_digest(next_plan_path) != next_plan_digest:
+                raise ValueError("The frozen next-session plan changed while it was being read")
+            next_plan_link = {"path": str(next_plan_path), "sha256": next_plan_digest}
+            if args.capital is not None and next_plan["capital"] != args.capital:
+                raise ValueError("Capital differs from the frozen next-session plan")
+            capital = next_plan["capital"]
+            review = next_plan["review"]
+            if evidence is None:
+                evidence = next_plan_path.with_name(review["path"])
+            if file_digest(evidence) != review["sha256"]:
+                raise ValueError("Review evidence differs from the frozen next-session plan")
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            parser.error(f"Cannot use the next-session plan: {error}")
+    if evidence is None:
+        parser.error("--evidence is required without a next-session plan")
     if not math.isfinite(capital) or capital <= 0:
         parser.error("Capital must be positive and finite")
-    loss = review_loss(args.market, args.evidence)
-    if args.day.isoformat() <= loss["day"]:
-        parser.error("The comparison day must follow the archived loss")
-    previous = None
+    loss = review_loss(args.market, evidence) if next_plan is None else read_json(evidence)
+    if day <= loss["day"]:
+        message = "archived loss" if next_plan is None else "reviewed session"
+        parser.error(f"The comparison day must follow the {message}")
+    previous_link = next_plan["previous_decision"] if next_plan is not None else None
     if args.previous_decision is not None:
         previous = read_json(args.previous_decision)
         if (
@@ -250,14 +302,21 @@ def main() -> int:
         if file_digest(prior_path) != previous["plan_sha256"]:
             parser.error("Previous decision does not match its frozen plan")
         prior = read_json(prior_path)
-        if prior["capital"] != capital or prior["evidence_sha256"] != file_digest(args.evidence):
+        if prior["capital"] != capital or prior["evidence_sha256"] != file_digest(evidence):
             parser.error("The retest must use the same capital and loss evidence")
+        previous_link = {
+            "path": str(args.previous_decision.resolve()),
+            "sha256": file_digest(args.previous_decision),
+        }
     market = KR if args.market == "KR" else US
-    day = args.day.isoformat()
     try:
         calendar = MarketClient(Settings.load(ROOT)).calendar(market.code, day)
         start, end = market.session(calendar, day)
-    except (ApiError, SafetyError, OSError, ValueError, KeyError) as error:
+        if next_plan is not None and (start, end) != (
+            datetime.fromisoformat(next_plan["start"]), datetime.fromisoformat(next_plan["end"]),
+        ):
+            raise ValueError("Market window differs from the frozen next-session plan")
+    except (ApiError, SafetyError, OSError, ValueError, TypeError, KeyError) as error:
         parser.error(f"Cannot establish the requested market window: {error}")
     if datetime.now(UTC) >= start:
         parser.error("The comparison must be frozen before the session opens")
@@ -273,26 +332,33 @@ def main() -> int:
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     with (out / "run.lock").open("x") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        strategies = (
+        strategies: dict[str, dict[str, Any]] = (
             {name: {"policy": policy, "selection": "all", "allocation": "equal"}
              for name, policy in (("incumbent", "rebound"), ("candidate", "rebound_net_target"))}
             if args.market == "KR" else
             {"incumbent": {"min_reward_risk": 1.0}, "candidate": {"min_reward_risk": 2.0}}
         )
+        if next_plan is not None:
+            strategies = next_plan["strategies"]
+        us_accounts = US_ACCOUNTS
+        if args.market == "US":
+            us_accounts = tuple(reward_risk_profiles(
+                strategies["incumbent"]["min_reward_risk"],
+                strategies["candidate"]["min_reward_risk"],
+            ))
         plan = {
             "market": market.code, "day": day, "start": start.isoformat(), "end": end.isoformat(),
             "capital": capital, "strategies": strategies, "loss_review": loss,
-            "previous_decision": None if args.previous_decision is None else {
-                "path": str(args.previous_decision.resolve()),
-                "sha256": file_digest(args.previous_decision),
-            },
-            "evidence": str(args.evidence.resolve()), "evidence_sha256": file_digest(args.evidence),
+            "previous_decision": previous_link,
+            "evidence": str(evidence.resolve()), "evidence_sha256": file_digest(evidence),
             "day_trader_source": str(source) if source is not None else None,
             "source_commit": command(["git", "rev-parse", "HEAD"], ROOT),
             "source_digest": tree_digest(ROOT),
             "decision_rule": "Missing evidence: repair. Nonnegative delta: retest. "
             "Negative qualified delta: review and revise. A single session cannot promote.",
         }
+        if next_plan_link is not None:
+            plan["next_plan"] = next_plan_link
         plan_path = out / "plan.json"
         atomic_json(plan_path, plan)
         atomic_json(out / "calendar.json", calendar)
@@ -303,7 +369,8 @@ def main() -> int:
                 assert source is not None
                 exit_code, result_path = run_us(out, plan, source)
             result = evaluate(
-                args.market, read_json(result_path) if result_path.is_file() else {}, exit_code == 0
+                args.market, read_json(result_path) if result_path.is_file() else {},
+                exit_code == 0, us_accounts=us_accounts,
             )
             result.update(result_path=str(result_path), runner_exit=exit_code)
             if result_path.is_file():
@@ -317,6 +384,15 @@ def main() -> int:
         atomic_json(out / "decision.json", {
             "market": market.code, "day": day, "plan_sha256": file_digest(plan_path), **result,
         })
+        if args.handoff:
+            try:
+                next_day, next_start = next_market_session(market, day, calendar)
+                executable = write_handoff(out, next_day, next_start)
+                if not executable:
+                    return exit_code or 1
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                print(f"Cannot write the next-session handoff: {error}", file=sys.stderr)
+                return 1
         return exit_code
 
 

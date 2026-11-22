@@ -20,7 +20,13 @@ from tools.adaptive_journal import AdaptiveJournal, JournalError, read_status
 from tools.paper_market import US
 from tools.session_research import Candidate, ResearchReplay, ResearchService, SessionResearch
 from tools.source_identity import tree_digest
-from tools.upstream_paper_accounts import FEES, PROFILES, REWARD_RISK_PROFILES, Comparison
+from tools.upstream_paper_accounts import (
+    FEES,
+    PROFILES,
+    REWARD_RISK_PROFILES,
+    Comparison,
+    reward_risk_profiles,
+)
 from tools.upstream_strategy import (
     RANGE_MINUTES,
     RESEARCH_REVISION,
@@ -74,9 +80,12 @@ def _plan(
     if not start.timestamp() < entry_cutoff < end.timestamp():
         raise ValueError("Native entry cutoff is outside the Toss regular session")
     comparison: dict[str, Any]
-    if args.compare_reward_risk:
+    pair = args.reward_risk_pair
+    if args.compare_reward_risk or pair is not None:
         comparison = {
-            "min_reward_risk_by_profile": REWARD_RISK_PROFILES.copy(),
+            "min_reward_risk_by_profile": (
+                REWARD_RISK_PROFILES.copy() if pair is None else reward_risk_profiles(*pair)
+            ),
             "research_policy": "disabled",
         }
     else:
@@ -674,9 +683,14 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--codex")
     run.add_argument("--research-workers", type=int, default=2)
     run.add_argument("--history-dir", type=Path)
-    run.add_argument(
+    reward_risk = run.add_mutually_exclusive_group()
+    reward_risk.add_argument(
         "--compare-reward-risk", action="store_true",
         help="Compare minimum reward:risk of 1 and 2 without TradingAgents research",
+    )
+    reward_risk.add_argument(
+        "--reward-risk-pair", nargs=2, type=float, metavar=("INCUMBENT", "CANDIDATE"),
+        help="Run the specified minimum reward:risk pair without TradingAgents research",
     )
     run.add_argument("--resume", action="store_true")
     verify = modes.add_parser("verify")
