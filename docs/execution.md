@@ -146,6 +146,33 @@ available.
   session according to its recovery procedure. Confirm external volumes are mounted before
   restoring or reading their files. Credentials stay under the user's private secrets directory.
 
+## Monitoring
+
+The Mac collector is deployed from `~/Projects/project-monitoring/finance_status.py` with
+`~/.local/bin/python3.12`. Its LaunchAgent
+`com.elsholtzia.project-monitoring.finance` runs at load and every 30 seconds. It reads the
+Finance plans, statuses and launcher evidence, then atomically writes a limited snapshot to
+`project-monitoring/.local/finance-source/status.json`. Prometheus scrapes the existing
+exporter, which mounts the snapshot directory read-only. The Finance checkout, ledgers, and
+credentials are outside the mount.
+
+- **Start and stop.** From `~/Projects/project-monitoring`, use the existing Compose services.
+  The collector is managed separately with `launchctl bootstrap "gui/$(id -u)"
+  "$HOME/Library/LaunchAgents/com.elsholtzia.project-monitoring.finance.plist"` and
+  `launchctl bootout "gui/$(id -u)/com.elsholtzia.project-monitoring.finance"`. Stopping
+  monitoring leaves the experiment runners active. The next collector interval refreshes
+  the snapshot after a failed invocation.
+- **Status and logs.** Use `launchctl print "gui/$(id -u)/com.elsholtzia.project-monitoring.finance"`
+  and the collector logs beside the snapshot. At
+  [Grafana](http://127.0.0.1:3000/d/finance), phase, process state and last source update
+  appear separately. A missing or stale collector snapshot reports source-down and omits
+  runtime and phase values. A pre-open plan can legitimately have an old update timestamp.
+- **Verification.** In [Prometheus](http://127.0.0.1:9090), query
+  `project_status_source_up{project="finance"}` and
+  `project_progress_phase_info{project="finance"}`. Compare the labels and timestamps with
+  the Mac snapshot. The current paired runs have no known positive total for percentage
+  progress. The original reports and journals remain the source for analysis and recovery.
+
 ## Next operational check
 
 Verify the November 23 KR and US paired reviews through their saved decisions. Completion
