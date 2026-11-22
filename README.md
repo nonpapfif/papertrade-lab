@@ -45,6 +45,12 @@ journals, and post-session decisions in `state/strategy-review/<date>/<market>/`
 inputs, journals, and reports to reproduce an earlier session. For external storage, legacy
 ledgers, and the deployed campaign, see [execution and recovery](docs/execution.md).
 
+## Monitoring
+
+The [Finance Grafana dashboard](http://127.0.0.1:3000/d/finance) displays paired reviews,
+recurring campaign market states, and the validation supervisor. The host collector reads
+the existing state and checks process or launcher evidence. See [monitoring operation](docs/execution.md#monitoring).
+
 ## Verification
 
 From a checkout with the WebSocket dependency available, run the focused offline example:
