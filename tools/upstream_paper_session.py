@@ -20,7 +20,7 @@ from tools.adaptive_journal import AdaptiveJournal, JournalError, read_status
 from tools.paper_market import US
 from tools.session_research import Candidate, ResearchReplay, ResearchService, SessionResearch
 from tools.source_identity import tree_digest
-from tools.upstream_paper_accounts import FEES, PROFILES, Comparison
+from tools.upstream_paper_accounts import FEES, PROFILES, REWARD_RISK_PROFILES, Comparison
 from tools.upstream_strategy import (
     RANGE_MINUTES,
     RESEARCH_REVISION,
@@ -73,6 +73,21 @@ def _plan(
     entry_cutoff = source.cutoff(args.day, config)
     if not start.timestamp() < entry_cutoff < end.timestamp():
         raise ValueError("Native entry cutoff is outside the Toss regular session")
+    comparison: dict[str, Any]
+    if args.compare_reward_risk:
+        comparison = {
+            "min_reward_risk_by_profile": REWARD_RISK_PROFILES.copy(),
+            "research_policy": "disabled",
+        }
+    else:
+        comparison = {
+            "tradingagents_revision": RESEARCH_REVISION,
+            "research_workers": args.research_workers,
+            "has_research_history_directory": args.history_dir is not None,
+            "research_policy": (
+                "native_daily_hit once, Buy or Overweight published by the ORB bar close"
+            ),
+        }
     return (
         {
             "schema": 1,
@@ -93,12 +108,7 @@ def _plan(
             "day_trader_revision": REVISION,
             "day_trader_files_sha256": source.hashes,
             "runner_tree_sha256": tree_digest(ROOT),
-            "tradingagents_revision": RESEARCH_REVISION,
-            "research_workers": args.research_workers,
-            "has_research_history_directory": args.history_dir is not None,
-            "research_policy": (
-                "native_daily_hit once, Buy or Overweight published by the ORB bar close"
-            ),
+            **comparison,
             "strategy": {
                 "source": "Yahoo 5-minute ORB within the pinned daily watchlist",
                 "opening_range_minutes": RANGE_MINUTES,
@@ -213,7 +223,7 @@ class ResearchGuard:
             raise RuntimeError("Research provider is disabled")
         try:
             result = await self.service.analyze(snapshot, inputs)
-        except Exception as error:  # noqa: BLE001 - propagate original worker evidence
+        except Exception as error:  # propagate original worker evidence
             reason = getattr(error, "reason", None)
             exit_code = getattr(error, "exit_code", None)
             if reason == "cli_unavailable" or (
@@ -259,7 +269,7 @@ class Capture:
         self.watchlist = watchlist
         self.research: SessionResearch | None = None
         self.research_stop = asyncio.Event()
-        self.research_status = "starting"
+        self.research_status = "starting" if comparison.research is not None else "disabled"
         self.next_status = 0.0
         self.pending_research_invalidations: set[str] = set()
         self.expired_symbols = asyncio.Event()
@@ -271,13 +281,14 @@ class Capture:
         completed_at = time.time()
         self.comparison.complete_decisions(result, completed_at)
         self.journal.append({**event, "completed_at": iso(completed_at), "outputs": result})
-        if kind == "scan":
-            self.pending_research_invalidations.update(
-                signal["symbol"] for signal in result["public"]["new_signals"]
-            )
-            self.expired_symbols.set()
-        if self.comparison.accounts[PROFILES[1]].entry_limit_reached():
-            self.research_stop.set()
+        if self.comparison.research is not None:
+            if kind == "scan":
+                self.pending_research_invalidations.update(
+                    signal["symbol"] for signal in result["public"]["new_signals"]
+                )
+                self.expired_symbols.set()
+            if self.comparison.accounts[PROFILES[1]].entry_limit_reached():
+                self.research_stop.set()
         return result
 
     def status(self, state: str, *, force: bool = False) -> dict[str, Any]:
@@ -480,20 +491,25 @@ class Capture:
 
     async def run(self, args: argparse.Namespace, settings: Settings) -> None:
         comp = self.comparison
-        research_task = asyncio.create_task(self.research_worker(args, settings))
-        active: list[asyncio.Task[None]] = [research_task]
+        research_task = (
+            asyncio.create_task(self.research_worker(args, settings))
+            if comp.research is not None
+            else None
+        )
+        market_tasks: list[asyncio.Task[None]] = []
         try:
             self.event("capture_started")
             self.status("waiting_for_regular_session", force=True)
             while time.time() < comp.start:
-                if research_task.done():
+                if research_task is not None and research_task.done():
                     research_task.result()
                 self.status("waiting_for_regular_session")
                 await asyncio.sleep(min(STATUS_SECONDS, max(0, comp.start - time.time())))
-            active += [
+            market_tasks += [
                 asyncio.create_task(self.scans()),
                 asyncio.create_task(self.books(MarketClient(settings))),
             ]
+            active = market_tasks if research_task is None else [research_task, *market_tasks]
             while time.time() < comp.end:
                 for task in active:
                     if task.done():
@@ -506,10 +522,11 @@ class Capture:
             self.event("close")
         finally:
             self.research_stop.set()
-            for task in active[1:]:
+            for task in market_tasks:
                 task.cancel()
-            await asyncio.gather(*active[1:], return_exceptions=True)
-            await research_task
+            await asyncio.gather(*market_tasks, return_exceptions=True)
+            if research_task is not None:
+                await research_task
 
 
 def _replay(comparison: Comparison, journal: AdaptiveJournal) -> None:
@@ -522,7 +539,7 @@ def _replay(comparison: Comparison, journal: AdaptiveJournal) -> None:
 
 def _summary(comparison: Comparison, journal: AdaptiveJournal) -> dict[str, Any]:
     observed = comparison.stats
-    publications = comparison.research.publications()
+    publications = comparison.research.publications() if comparison.research is not None else []
     premarket = comparison.plan["premarket_scan"]
     limitations = []
     if premarket["failed"]:
@@ -583,7 +600,7 @@ async def _run(args: argparse.Namespace) -> int:
         atomic_json(output / "plan.json", plan)
         atomic_json(output / "watchlist.json", watchlist)
         atomic_json(output / "source-config.json", plan["config"])
-    replay = ResearchReplay(output / "research")
+    replay = None if "min_reward_risk_by_profile" in plan else ResearchReplay(output / "research")
     comparison = Comparison(source, plan, output / "source-config.json", replay)
     with AdaptiveJournal.open(output / "journal.sqlite3", plan, resume=args.resume) as journal:
         if args.resume:
@@ -627,7 +644,8 @@ def _verify(args: argparse.Namespace) -> int:
     watchlist_hash = hashlib.sha256(canonical_json(watchlist).encode()).hexdigest()
     if read_json(config) != plan["config"] or watchlist_hash != plan["watchlist_sha256"]:
         raise ValueError("The archived config or watchlist changed")
-    comparison = Comparison(source, plan, config, ResearchReplay(output / "research"))
+    replay = None if "min_reward_risk_by_profile" in plan else ResearchReplay(output / "research")
+    comparison = Comparison(source, plan, config, replay)
     journal_path = output / "journal.sqlite3"
     status = read_status(journal_path)
     if status["identity"] != plan:
@@ -656,6 +674,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--codex")
     run.add_argument("--research-workers", type=int, default=2)
     run.add_argument("--history-dir", type=Path)
+    run.add_argument(
+        "--compare-reward-risk", action="store_true",
+        help="Compare minimum reward:risk of 1 and 2 without TradingAgents research",
+    )
     run.add_argument("--resume", action="store_true")
     verify = modes.add_parser("verify")
     verify.add_argument("--session", type=Path, required=True)
