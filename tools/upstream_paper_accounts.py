@@ -19,6 +19,17 @@ REWARD_RISK_PROFILES = {"source_min_reward_risk_1": 1.0, "source_min_reward_risk
 FEES = {**DEFAULT_FEES, "commission_exemption_usd": 0.0}
 
 
+def reward_risk_profiles(incumbent: float, candidate: float) -> dict[str, float]:
+    if not all(math.isfinite(value) and value > 0 for value in (incumbent, candidate)):
+        raise ValueError("Reward/risk thresholds must be positive and finite")
+    if incumbent == candidate:
+        raise ValueError("Reward/risk thresholds must differ")
+    return {
+        "source_min_reward_risk_" + str(float(value)).removesuffix(".0"): value
+        for value in (incumbent, candidate)
+    }
+
+
 @dataclass(frozen=True)
 class Quote:
     source: float

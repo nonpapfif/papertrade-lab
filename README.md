@@ -25,6 +25,9 @@ predictors and the deployed background jobs use macOS.
 See [paired strategy review](docs/strategy-review-cycle.md) for commands and
 [execution and recovery](docs/execution.md) for actual launchers, task status, and recovery.
 
+For the post-close review and next-session Docker path, see
+[Docker strategy cycle](docs/docker-strategy-cycle.md).
+
 ## Code entry points
 
 - [Loss review and next-session decision](tools/strategy_review_cycle.py) uses the

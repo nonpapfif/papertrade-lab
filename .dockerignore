@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!state
+!state/docker-build
+!state/docker-build/finance.bundle
+!state/docker-build/day-trader.bundle

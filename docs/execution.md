@@ -94,6 +94,9 @@ required. The normal market client reads the private credential files directly.
 | Task | Entry point | Representative input and saved evidence |
 | --- | --- | --- |
 | Free ledger operations | `papertrade` | `--help` lists commands. For ledger inspection, use `--root /path/to/Finance status` with the existing state. Worker roles are above. |
+| Post-close loss review and next plan | `tools.strategy_review_handoff` | Dated predecessor and verified next market calendar. Inspect review, next plan, and lifecycle. [Guide](docker-strategy-cycle.md) |
+| Docker market cycle | `tools.docker_strategy_cycle` | Compose market service with a sealed predecessor and dedicated output. Check its lifecycle, dated session, and handoff. [Guide](docker-strategy-cycle.md) |
+| Mac Docker cutover | `tools.start_docker_strategy_cycle` | Host launch command with previous job receipts, image environment and new results root. Check the cutover receipt and Compose state. [Guide](docker-strategy-cycle.md) |
 | Paired loss review | `tools.strategy_review_cycle` | Audited loss evidence, market and future day. Check the frozen plan and linked decision. [Guide](strategy-review-cycle.md) |
 | Shared-feed research | `tools.research_session` | Run with market and date or replay a saved session. Check `comparison.json` and replay evidence. [Guide](research-session.md) |
 | US Day Trader | `tools.upstream_paper_session` | Run with source, calendar and watchlist or verify a sealed session. Check the comparison and journal hash. [Guide](upstream-paper-session.md) |
