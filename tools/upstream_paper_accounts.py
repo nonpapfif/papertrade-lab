@@ -15,6 +15,7 @@ from tools.session_research import ResearchReplay
 from tools.upstream_strategy import STEP, Upstream, epoch, iso, utc
 
 PROFILES = ("source_only", "source_plus_tradingagents")
+REWARD_RISK_PROFILES = {"source_min_reward_risk_1": 1.0, "source_min_reward_risk_2": 2.0}
 FEES = {**DEFAULT_FEES, "commission_exemption_usd": 0.0}
 
 
@@ -362,14 +363,15 @@ class Account:
             self.buys.get(symbol),
             self.sells.get(symbol),
         )
-        if position is not None and quote.later_than(position.opened_at):
-            if (
-                sell
-                and quote.later_than(sell.at)
-                and quote.source > position.last_exit_source
-                and (sell.reason != "plan-target" or quote.bid >= sell.plan["target"])
-            ):
-                return [self._fill_sell(symbol, position, sell, quote)]
+        if (
+            position is not None
+            and quote.later_than(position.opened_at)
+            and sell
+            and quote.later_than(sell.at)
+            and quote.source > position.last_exit_source
+            and (sell.reason != "plan-target" or quote.bid >= sell.plan["target"])
+        ):
+            return [self._fill_sell(symbol, position, sell, quote)]
         if buy is not None:
             if quote.processed >= buy.expires:
                 del self.buys[symbol]
@@ -480,7 +482,7 @@ class Comparison:
         source: Upstream,
         plan: dict[str, Any],
         config_file: Path,
-        research: ResearchReplay,
+        research: ResearchReplay | None,
     ) -> None:
         self.source, self.plan, self.config_file, self.research = (
             source,
@@ -492,7 +494,14 @@ class Comparison:
         self.day = dt.date.fromisoformat(plan["day"])
         self.start, self.end = epoch(plan["start"]), epoch(plan["end"])
         self.entry_end = min(self.end, epoch(plan["entry_cutoff"]) + 60)
-        self.accounts = {name: Account(source, self.config, plan["day"]) for name in PROFILES}
+        thresholds = plan.get("min_reward_risk_by_profile")
+        if thresholds is None:
+            self.accounts = {name: Account(source, self.config, plan["day"]) for name in PROFILES}
+        else:
+            self.accounts = {
+                name: Account(source, {**self.config, "min_reward_risk": minimum}, plan["day"])
+                for name, minimum in thresholds.items()
+            }
         self.quotes: dict[str, Quote] = {}
         self.trade_times: dict[str, float] = {}
         self.seen: set[str] = set()
@@ -628,7 +637,7 @@ class Comparison:
             self.seen.add(symbol)
             self.signal_order.append(symbol)
             self.stats["native_entry_signals"] += 1
-            rated = symbol in self.research.at(trigger, "US")
+            rated = self.research is not None and symbol in self.research.at(trigger, "US")
             expires = min(self.entry_end, trigger + STEP)
             native_plan, unavailable = {}, None
             try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from argparse import Namespace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -11,8 +12,15 @@ from typing import Any
 from papertrade.jsonio import atomic_json
 from tools.adaptive_journal import AdaptiveJournal, read_status
 from tools.session_research import ResearchReplay
-from tools.upstream_paper_accounts import PROFILES, Account, Comparison, Quote, Signal
-from tools.upstream_paper_session import _replay, _summary
+from tools.upstream_paper_accounts import (
+    PROFILES,
+    REWARD_RISK_PROFILES,
+    Account,
+    Comparison,
+    Quote,
+    Signal,
+)
+from tools.upstream_paper_session import _plan, _replay, _summary, _verify
 from tools.upstream_strategy import Upstream, epoch, iso
 
 SOURCE = os.environ.get("PAPERTRADE_DAY_TRADER_SOURCE")
@@ -194,6 +202,77 @@ class UpstreamPaperTests(unittest.TestCase):
         with AdaptiveJournal.read_completed(log_path, chain) as journal:
             _replay(replay, journal)
             self.assertEqual(sealed, _summary(replay, journal))
+
+    def test_reward_risk_comparison_freezes_thresholds_and_replays_without_research(self) -> None:
+        calendar = self.out / "calendar.json"
+        atomic_json(
+            calendar,
+            {
+                "today": {
+                    "date": self.plan["day"],
+                    "regularMarket": {"startTime": iso(OPEN), "endTime": iso(CLOSE)},
+                },
+                "previousBusinessDay": {"date": "2026-10-16"},
+            },
+        )
+        watchlist_file = self.out / "watchlist.json"
+        atomic_json(
+            watchlist_file,
+            {
+                "created_at": iso(OPEN - 120),
+                "created_by": "trader-scanner",
+                "mode": "daily",
+                "source": "yahoo",
+                "as_of": "2026-10-16 close",
+                "universe": 1,
+                "scanned": 1,
+                "failed": 0,
+                "hits": [{"symbol": "TSLA"}],
+            },
+        )
+        plan, _ = _plan(
+            Namespace(
+                config=None,
+                capital=1000,
+                calendar=calendar,
+                watchlist=watchlist_file,
+                day=date(2026, 10, 19),
+                compare_reward_risk=True,
+            ),
+            self.source,
+            OPEN - 60,
+        )
+        self.assertEqual(plan["research_policy"], "disabled")
+        self.assertEqual(plan["min_reward_risk_by_profile"], REWARD_RISK_PROFILES)
+        atomic_json(self.out / "plan.json", plan)
+        config = self.out / "source-config.json"
+        atomic_json(config, plan["config"])
+        comp = Comparison(self.source, plan, config, None)
+        with AdaptiveJournal.open(self.out / "journal.sqlite3", plan, resume=False) as journal:
+            for kind, at, payload in [
+                ("capture_started", OPEN - 10, None),
+                ("scan", TRIGGER + 2, self.scan()),
+                ("book", TRIGGER + 3, self.book(TRIGGER + 3, TRIGGER + 3, ask=364.28)),
+                ("book", TRIGGER + 4, self.book(TRIGGER + 4, TRIGGER + 4, ask=364.28)),
+                ("close", CLOSE, None),
+            ]:
+                event = {"kind": kind, "at": iso(at), "payload": payload}
+                outputs = comp.process(event)
+                comp.complete_decisions(outputs, at)
+                journal.append({**event, "completed_at": iso(at), "outputs": outputs})
+                if kind == "book" and at == TRIGGER + 3:
+                    baseline = outputs["accounts"]["source_min_reward_risk_1"][0]
+                    candidate = outputs["accounts"]["source_min_reward_risk_2"][0]
+                    self.assertEqual(baseline["status"], "approved")
+                    self.assertEqual(candidate["status"], "blocked")
+                    self.assertIn("under your minimum 2", candidate["sizing"]["refusal"])
+            self.assertIn("TSLA", comp.accounts["source_min_reward_risk_1"].positions)
+            self.assertFalse(comp.accounts["source_min_reward_risk_2"].positions)
+            summary = _summary(comp, journal)
+            self.assertEqual(summary["research_attempts"], 0)
+            atomic_json(self.out / "comparison.json", summary)
+            journal.complete()
+        self.assertEqual(_verify(Namespace(session=self.out, source=None)), 0)
 
     def test_late_rating_and_expired_source_bar_never_open_position(self) -> None:
         comp = self.comparison(published=TRIGGER + 1)
