@@ -43,8 +43,9 @@ one-off jobs have separate output directories.
 - **Results.** `decision.json` is the decision linked to the frozen plan and observed result
   when the paired runner finishes. For KR keep the schedule journal, attempt status, and slot
   state. For US keep the session journal, watchlist, source configuration, and comparison.
-  The original audited KR report and US loss journal are inputs. Retest or evidence-repair
-  decisions can be linked with `--previous-decision`.
+  Pass the audited KR report or the archived US `comparison.json` as `--evidence`. Keep
+  the US comparison beside its sealed `journal.sqlite3` for loss attribution. Retest or
+  evidence-repair decisions can be linked with `--previous-decision`.
 
 ### Recurring campaign and refactor supervisor
 
