@@ -217,6 +217,8 @@ def _kr_review(
                     if outcome.get("status") in ("filled", "partial")
                 ],
                 "net_target_blocked_entries": paper.get("net_target_blocked_entries", []),
+                "spread_guard_counts": paper.get("spread_guard_counts", {}),
+                "exit_reason_counts": paper.get("exit_reason_counts", {}),
                 "realized_fills": [],
             }
         )
