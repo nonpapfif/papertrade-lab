@@ -424,15 +424,17 @@ class Capture:
         while next_cut <= self.cutoff:
             await asyncio.sleep(max(0, next_cut + 2 - time.time()))
             now = time.time()
-            if now >= min(comp.end, self.cutoff + 60):
+            if now >= comp.entry_end:
                 return
             cut = min(self.cutoff, max(next_cut, float(int(now) // STEP * STEP)))
+            until = min(cut + STEP, comp.entry_end)
             data = await asyncio.to_thread(
                 comp.source.capture,
                 comp.plan["symbols"],
                 comp.day,
                 cut,
-                min(cut + STEP, comp.entry_end),
+                until,
+                final_entry_window=until == comp.entry_end,
             )
             if time.time() < comp.end:
                 self.event("scan", data)

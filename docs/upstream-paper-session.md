@@ -55,6 +55,10 @@ A signal can be filtered, arrive too late, exceed available cash, or fail to get
 quote. Compare orders and fills separately. A session with zero research-qualified fills has
 no trade sample for assessing research selection.
 
+Requests skipped when the final entry window closes are recorded separately in the journal
+and comparison counts. Those counts show which parts of the final scan lost coverage.
+Earlier scan deadlines and upstream data failures still contribute to an incomplete comparison.
+
 The session saves its source identities and frozen inputs in `plan.json`, `watchlist.json`
 and `source-config.json`. Read `status.json` for progress and `research/reports/` for the
 role reports. The final account comparison is `comparison.json`. The verify command

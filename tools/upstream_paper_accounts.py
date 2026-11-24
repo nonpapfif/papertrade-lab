@@ -640,6 +640,10 @@ class Comparison:
             self.stats[f"scanner_{name}"] += count
         self.stats["scanner_spark_failures"] += len(payload["spark_failures"])
         self.stats["scanner_confirmation_failures"] += len(payload["confirmation_failures"])
+        for stage in ("spark", "confirmation"):
+            key = f"{stage}_entry_window_expired"
+            if expired := payload.get(key):
+                self.stats[f"scanner_{key}"] += len(expired)
         entries = self.source.evaluate_scan(payload, self.plan["symbols"], self.day, self.config)
         for hit, entry, trigger in entries:
             symbol = entry["symbol"]
