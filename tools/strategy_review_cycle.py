@@ -23,6 +23,7 @@ from papertrade.jsonio import atomic_json, read_json
 from tools.paper_campaign.evidence import compact_rows
 from tools.paper_market import KR, US, PaperMarket
 from tools.source_identity import command, file_digest, tree_digest
+from tools.strategy_catalog import ENTRY_OPTIONS, REBOUND_NET_TARGET
 from tools.strategy_review_handoff import load_next_plan, write_handoff
 from tools.upstream_paper_accounts import REWARD_RISK_PROFILES, reward_risk_profiles
 
@@ -264,6 +265,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source", type=Path, help="Pinned Day Trader checkout for US")
     parser.add_argument("--capital", type=float)
+    parser.add_argument(
+        "--kr-incumbent-policy",
+        choices=ENTRY_OPTIONS["policy"],
+        help="Override the KR incumbent policy for a fresh comparison (default: rebound)",
+    )
+    parser.add_argument(
+        "--kr-candidate-policy",
+        choices=ENTRY_OPTIONS["policy"],
+        help=(
+            "Override the KR candidate policy for a fresh comparison "
+            f"(default: {REBOUND_NET_TARGET})"
+        ),
+    )
     lineage = parser.add_mutually_exclusive_group()
     lineage.add_argument("--previous-decision", type=Path, help="Link a retest to a prior decision")
     lineage.add_argument("--next-plan", type=Path, help="Consume a frozen next-session plan")
@@ -271,6 +285,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.market == "US" and args.source is None:
         parser.error("--source is required for the US comparison")
+    if (args.kr_incumbent_policy or args.kr_candidate_policy) and (
+        args.market != "KR" or args.next_plan is not None or args.previous_decision is not None
+    ):
+        parser.error(
+            "--kr-incumbent-policy and --kr-candidate-policy apply only to a fresh KR comparison"
+        )
     day = args.day.isoformat()
     default_capital = 1_000_000 if args.market == "KR" else 1000
     capital = args.capital if args.capital is not None else default_capital
@@ -341,13 +361,17 @@ def main(argv: list[str] | None = None) -> int:
             or command(["git", "status", "--porcelain", "--untracked-files=no"], source)
         ):
             parser.error("Expected the clean pinned Day Trader source used by the loss review")
+    kr_incumbent = args.kr_incumbent_policy or "rebound"
+    kr_candidate = args.kr_candidate_policy or REBOUND_NET_TARGET
+    if args.market == "KR" and next_plan is None and kr_incumbent == kr_candidate:
+        parser.error("KR incumbent and candidate policies must differ")
     out = args.output.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     with (out / "run.lock").open("x") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         strategies: dict[str, dict[str, Any]] = (
             {name: {"policy": policy, "selection": "all", "allocation": "equal"}
-             for name, policy in (("incumbent", "rebound"), ("candidate", "rebound_net_target"))}
+             for name, policy in (("incumbent", kr_incumbent), ("candidate", kr_candidate))}
             if args.market == "KR" else
             {"incumbent": {"min_reward_risk": 1.0}, "candidate": {"min_reward_risk": 2.0}}
         )

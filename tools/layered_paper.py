@@ -13,6 +13,8 @@ from tools.paper_market import US, PaperMarket
 from tools.strategy_catalog import REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED
 
 FAMILIES = ("trend", "breakout", "rebound")
+REBOUND_GUARDED_STOP_LOSS_PCT = 0.015
+REBOUND_GUARDED_MAX_HOLD_SECONDS = 1800.0
 
 
 def eligible_stock(row: dict[str, Any]) -> bool:
@@ -125,12 +127,19 @@ def assign(f: Feature, policy: str = "router") -> str | None:
     return next((s for s in families if entry_valid(s, f)), None)
 
 
+def _held_seconds(f: Feature, entry: Feature) -> float:
+    return (
+        datetime.fromisoformat(f.bar_end).timestamp()
+        - datetime.fromisoformat(entry.bar_end).timestamp()
+    )
+
+
 def holding_exit_reason(strategy: str, f: Feature, entry: Feature) -> str | None:
     if strategy == "breakout":
         return None if f.price >= entry.prior_high * 0.998 else "breakout_below_prior_high"
     if strategy == "trend":
         return None if f.r15 >= 0 else "trend_r15_negative"
-    if strategy in ("rebound", REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED):
+    if strategy in ("rebound", REBOUND_NET_TARGET):
         target_hit = f.price >= entry.mean
         r5_drop = f.r5 < -0.003
         if target_hit and r5_drop:
@@ -139,6 +148,14 @@ def holding_exit_reason(strategy: str, f: Feature, entry: Feature) -> str | None
             return "rebound_target_reached"
         if r5_drop:
             return "rebound_r5_drop"
+        return None
+    if strategy == REBOUND_SPREAD_GUARDED:
+        if f.price >= entry.mean:
+            return "rebound_target_reached"
+        if f.price <= entry.price * (1.0 - REBOUND_GUARDED_STOP_LOSS_PCT):
+            return "rebound_stop_loss"
+        if _held_seconds(f, entry) >= REBOUND_GUARDED_MAX_HOLD_SECONDS:
+            return "rebound_time_stop"
         return None
     raise ValueError("Unknown strategy")
 

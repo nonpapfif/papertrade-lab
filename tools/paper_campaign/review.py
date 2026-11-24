@@ -45,7 +45,10 @@ are not actual liquidation proceeds. Separate the native currency accounts. Do n
 edge or remove a strategy from one session. Explain any proposed selection with evidence.
 rebound_net_target retains rebound signals and holding rules, and skips new buys when the
 original mean after modeled sell fees does not cover the entry cost at intent or confirmation.
-The mean is an analytical reference. Actual exits still use the rebound holding rule and
+rebound_spread_guarded applies a 50 bps entry spread cap, a half-spread adjusted net-target
+check, a 200 bps exit spread deferral, and exits at the original mean, a 1.5% stop below
+entry price, or a 30-minute maximum hold.
+The mean is an analytical reference. Actual exits still use the holding rule and
 observed depth. Equal allocation counts signal matches before the cost check.
 The baseline is present in every original pair. Preserve exposure and give newcomers enough
 sessions to be evaluated. Use both accounts for a matched comparison. If either account

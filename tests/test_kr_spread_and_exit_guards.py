@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from papertrade.jsonio import atomic_json, read_json
 from tools.async_layered_paper import (
     ENTRY_SPREAD_BLOCKED,
     EXIT_SPREAD_DEFERRED,
@@ -15,7 +19,7 @@ from tools.async_layered_paper import (
 from tools.layered_paper import Feature, holding_exit_reason, holding_valid
 from tools.paper_market import KR
 from tools.strategy_catalog import REBOUND_SPREAD_GUARDED
-from tools.strategy_review_cycle import decide
+from tools.strategy_review_cycle import decide, main as run_cycle_main
 from tools.strategy_review_handoff import _recommend
 
 
@@ -93,6 +97,30 @@ class TestExitReasonsAndSpreadGuards(unittest.IsolatedAsyncioTestCase):
             "breakout_below_prior_high",
         )
 
+    def test_spread_guarded_uses_entry_stop_and_time_stop_instead_of_r5_whipsaw(self) -> None:
+        entry = _feature(price=1500.0, r5=0.01, r15=-0.02, mean=1540.0)
+        # Trailing r5 drop without an actual -1.5% drop from entry does not exit.
+        r5_noise = replace(entry, price=1498.0, r5=-0.006, bar_end="2026-11-23T00:11:00+00:00")
+        self.assertIsNone(holding_exit_reason(REBOUND_SPREAD_GUARDED, r5_noise, entry))
+        # Target hit exits cleanly.
+        target_hit = replace(entry, price=1540.0, bar_end="2026-11-23T00:12:00+00:00")
+        self.assertEqual(
+            holding_exit_reason(REBOUND_SPREAD_GUARDED, target_hit, entry),
+            "rebound_target_reached",
+        )
+        # -1.5% drop below entry price triggers entry-relative stop loss.
+        stop_hit = replace(entry, price=1477.0, r5=0.001, bar_end="2026-11-23T00:13:00+00:00")
+        self.assertEqual(
+            holding_exit_reason(REBOUND_SPREAD_GUARDED, stop_hit, entry),
+            "rebound_stop_loss",
+        )
+        # Holding >= 30 minutes triggers time stop.
+        time_hit = replace(entry, price=1505.0, r5=0.001, bar_end="2026-11-23T00:40:00+00:00")
+        self.assertEqual(
+            holding_exit_reason(REBOUND_SPREAD_GUARDED, time_hit, entry),
+            "rebound_time_stop",
+        )
+
     def test_book_spread_bps_computes_top_of_book_spread(self) -> None:
         ev = _kr_event(1, 1500, 1524)
         spread = book_spread_bps(ev["book"])
@@ -117,20 +145,26 @@ class TestExitReasonsAndSpreadGuards(unittest.IsolatedAsyncioTestCase):
         self.assertIn(1, account.book.positions)
 
         # Momentarily empty bid book (2712 bps, like KR 373200) defers exit instead of dumping.
-        drop_feat = replace(entry_feat, price=5050, r5=-0.005)
+        drop_feat = replace(entry_feat, price=5000, r5=-0.005)
         await account.submit(_kr_event(6, 1485, 1951, drop_feat))
         self.assertNotIn(1, account.pending)
         self.assertIn(1, account.book.positions)
         self.assertEqual(account.decisions[-1]["blocked_reason"], EXIT_SPREAD_DEFERRED)
-        self.assertEqual(account.decisions[-1]["exit_reason"], "rebound_r5_drop")
+        self.assertEqual(account.decisions[-1]["exit_reason"], "rebound_stop_loss")
 
         # Once spread recovers (20 bps), exit proceeds and records exact exit reason on the trade.
-        await account.submit(_kr_event(8, 5050, 5060, drop_feat))
-        self.assertEqual(account.pending[1].exit_reason, "rebound_r5_drop")
-        await account.submit(_kr_event(10, 5050, 5060, drop_feat))
+        await account.submit(_kr_event(8, 5000, 5010, drop_feat))
+        self.assertEqual(account.pending[1].exit_reason, "rebound_stop_loss")
+        await account.submit(_kr_event(10, 5000, 5010, drop_feat))
         self.assertNotIn(1, account.book.positions)
-        self.assertEqual(account.book.trades[-1]["reason"], "rebound_r5_drop")
-        self.assertEqual(account.summary()["intents"][-1]["exit_reason"], "rebound_r5_drop")
+        self.assertEqual(account.book.trades[-1]["reason"], "rebound_stop_loss")
+        summary = account.summary()
+        self.assertEqual(summary["intents"][-1]["exit_reason"], "rebound_stop_loss")
+        self.assertEqual(
+            summary["spread_guard_counts"],
+            {ENTRY_SPREAD_BLOCKED: 1, EXIT_SPREAD_DEFERRED: 1},
+        )
+        self.assertEqual(summary["exit_reason_counts"], {"rebound_stop_loss": 1})
 
     async def test_spread_guarded_rechecks_spread_on_confirmation_and_half_spread_target(
         self,
@@ -174,6 +208,60 @@ class TestExitReasonsAndSpreadGuards(unittest.IsolatedAsyncioTestCase):
         # Mild negative candidate above floor (-0.2%) still allows retest.
         mild = decide(-2.0, -0.2, complete=True, traded=True)
         self.assertEqual(mild["decision"], "retest")
+
+    def test_strategy_review_cycle_accepts_kr_candidate_policy_override(self) -> None:
+        day = "2099-11-24"
+        regular = {
+            "startTime": day + "T09:00:00+09:00",
+            "singlePriceAuctionStartTime": day + "T15:20:00+09:00",
+            "endTime": day + "T15:30:00+09:00",
+        }
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "loss.json"
+            output = root / "run"
+            atomic_json(evidence, {"strict_snapshot_attribution_reconciled": True})
+            with (
+                patch("tools.strategy_review_cycle.os.umask"),
+                patch(
+                    "tools.strategy_review_cycle.review_loss",
+                    return_value={"day": "2099-11-23", "finding": "test"},
+                ),
+                patch("tools.strategy_review_cycle.Settings"),
+                patch("tools.strategy_review_cycle.MarketClient") as client,
+                patch("tools.strategy_review_cycle.command", return_value="commit"),
+                patch("tools.strategy_review_cycle.tree_digest", return_value="tree"),
+                patch("tools.strategy_review_cycle.run_kr") as scheduler,
+            ):
+                client.return_value.calendar.return_value = {
+                    "today": {"date": day, "integrated": {"regularMarket": regular}}
+                }
+
+                def inspect_plan(out: Path, plan: dict) -> tuple[int, Path]:
+                    self.assertEqual(
+                        plan["strategies"]["candidate"]["policy"], REBOUND_SPREAD_GUARDED
+                    )
+                    self.assertEqual(plan["strategies"]["incumbent"]["policy"], "rebound")
+                    self.assertEqual(read_json(out / "plan.json"), plan)
+                    return 0, out / "result.json"
+
+                scheduler.side_effect = inspect_plan
+                code = run_cycle_main(
+                    [
+                        "--market",
+                        "KR",
+                        "--day",
+                        day,
+                        "--evidence",
+                        str(evidence),
+                        "--output",
+                        str(output),
+                        "--kr-candidate-policy",
+                        REBOUND_SPREAD_GUARDED,
+                    ]
+                )
+                self.assertEqual(code, 0)
+                scheduler.assert_called_once()
 
 
 if __name__ == "__main__":

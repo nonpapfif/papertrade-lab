@@ -33,6 +33,9 @@ positive 5-minute return, negative 15-minute return and close below the prior me
 rebound_net_target uses the same signals and holding rule. It requires proceeds at the
 original mean after modeled sell fees to exceed the fee-inclusive entry cost at both the
 requested quantity and the confirmed quantity and price. The mean is a reference price.
+rebound_spread_guarded uses rebound entries with a 50 bps entry spread cap, a half-spread
+adjusted net-target check, a 200 bps exit spread deferral, and exits at the original mean,
+a 1.5% stop below entry price, or a 30-minute maximum hold.
 Active selection requires absolute 5-minute return >= 0.1% or absolute 15-minute return
 >= 0.3%. All uses no extra filter. Equal allocation divides available cash across current
 eligible, unowned signal matches before the cost check. Priority can spend available cash

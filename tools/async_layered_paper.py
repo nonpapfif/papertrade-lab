@@ -750,4 +750,18 @@ class AsyncLayeredPaper(LayeredPaper):
         ]
         if blocked_entries:
             result["net_target_blocked_entries"] = copy.deepcopy(blocked_entries)
+        spread_counts: dict[str, int] = {}
+        for row in (*self.decisions, *self.outcomes):
+            reason = row.get("blocked_reason")
+            if reason in (ENTRY_SPREAD_BLOCKED, EXIT_SPREAD_DEFERRED):
+                spread_counts[reason] = spread_counts.get(reason, 0) + 1
+        if spread_counts:
+            result["spread_guard_counts"] = spread_counts
+        exit_counts: dict[str, int] = {}
+        for trade in self.book.trades:
+            if trade.get("quantity_normalized", 0) < 0:
+                reason = str(trade.get("reason") or "unknown")
+                exit_counts[reason] = exit_counts.get(reason, 0) + 1
+        if exit_counts:
+            result["exit_reason_counts"] = exit_counts
         return result
