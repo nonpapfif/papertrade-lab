@@ -37,6 +37,7 @@ from tools.async_layered_paper import (
 from tools.kr_broker_profile import eligible as eligible_kr_stock
 from tools.layered_paper import (
     REBOUND_NET_TARGET,
+    REBOUND_SPREAD_GUARDED,
     Feature,
     assign,
     eligible_stock,
@@ -623,7 +624,11 @@ class Runtime:
         opportunities: list[dict[str, Any]] = []
         allocation_became_blocked = False
         cash = candidate.available_cash
-        signal_policy = "rebound" if candidate.policy == REBOUND_NET_TARGET else candidate.policy
+        signal_policy = (
+            "rebound"
+            if candidate.policy in (REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED)
+            else candidate.policy
+        )
         for family in ("trend", "rebound"):
             signals = {
                 symbol: feature

@@ -11,11 +11,35 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from tools.layered_paper import REBOUND_NET_TARGET, Feature, LayeredPaper, assign, holding_valid
+from tools.layered_paper import (
+    REBOUND_NET_TARGET,
+    REBOUND_SPREAD_GUARDED,
+    Feature,
+    LayeredPaper,
+    assign,
+    holding_exit_reason,
+)
 from tools.paper_market import KR, US
 from tools.toss_order_contract import whole_share_limit
 
 NET_TARGET_BLOCKED = "nonpositive_rebound_net_target"
+ENTRY_SPREAD_BLOCKED = "entry_spread_too_wide"
+EXIT_SPREAD_DEFERRED = "exit_spread_too_wide"
+DEFAULT_MAX_ENTRY_SPREAD_BPS = 50.0
+DEFAULT_MAX_EXIT_SPREAD_BPS = 200.0
+
+
+def book_spread_bps(book: dict[str, Any]) -> float | None:
+    """Return top-of-book bid-ask spread in basis points over midpoint."""
+    asks = [float(row["price"]) for row in book.get("asks", ()) if float(row["volume"]) >= 1]
+    bids = [float(row["price"]) for row in book.get("bids", ()) if float(row["volume"]) >= 1]
+    if not asks or not bids:
+        return None
+    best_ask, best_bid = min(asks), max(bids)
+    midpoint = (best_ask + best_bid) / 2
+    if midpoint <= 0 or best_bid > best_ask:
+        return None
+    return (best_ask - best_bid) / midpoint * 10_000.0
 
 
 def seconds(at: str) -> float:
@@ -63,6 +87,7 @@ class Intent:
     initial: dict[str, Any]
     policy_version: int = 0
     order_request: dict[str, str] | None = None
+    exit_reason: str | None = None
 
 
 class AsyncLayeredPaper(LayeredPaper):
@@ -73,12 +98,28 @@ class AsyncLayeredPaper(LayeredPaper):
     Equal allocation uses a caller-supplied, decision-time candidate count.
     """
 
-    entry_policies = (*LayeredPaper.entry_policies, REBOUND_NET_TARGET)
+    entry_policies = (*LayeredPaper.entry_policies, REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED)
 
-    def __init__(self, capital: float, *, delay: float = 1, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        capital: float,
+        *,
+        delay: float = 1,
+        max_entry_spread_bps: float | None = None,
+        max_exit_spread_bps: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(capital, **kwargs)
         if not math.isfinite(delay) or delay <= 0:
             raise ValueError("Positive confirmation delay required")
+        for name, value in (
+            ("max_entry_spread_bps", max_entry_spread_bps),
+            ("max_exit_spread_bps", max_exit_spread_bps),
+        ):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be positive and finite")
+        self.max_entry_spread_bps = max_entry_spread_bps
+        self.max_exit_spread_bps = max_exit_spread_bps
         self.entry_policy_version = 0
         self.owner_policy_versions: dict[int, int] = {}
         self.delay = delay
@@ -332,8 +373,9 @@ class AsyncLayeredPaper(LayeredPaper):
         if fresh and f is not None and symbol not in self.pending:
             if symbol in self.book.positions:
                 owner, original = self.owners[symbol]
-                if not holding_valid(owner, f, original):
-                    self._intent(event, f, owner, "SELL")
+                exit_reason = holding_exit_reason(owner, f, original)
+                if exit_reason is not None:
+                    self._intent(event, f, owner, "SELL", exit_reason=exit_reason)
             elif event.get("entries", True) and event.get("eligible", False):
                 active = self.selection != "active" or abs(f.r5) >= 0.001 or abs(f.r15) >= 0.003
                 strategy = assign(f, self.policy) if active else None
@@ -344,7 +386,35 @@ class AsyncLayeredPaper(LayeredPaper):
         if self.reserved_cash > self.book.cash + 1e-9:
             raise RuntimeError("Reservations exceed account cash")
 
-    def _intent(self, event: dict, f: Feature, strategy: str, side: str) -> None:
+    def _entry_spread_limit(self, strategy: str) -> float | None:
+        if self.max_entry_spread_bps is not None:
+            return self.max_entry_spread_bps
+        return DEFAULT_MAX_ENTRY_SPREAD_BPS if strategy == REBOUND_SPREAD_GUARDED else None
+
+    def _exit_spread_limit(self, strategy: str) -> float | None:
+        if self.max_exit_spread_bps is not None:
+            return self.max_exit_spread_bps
+        return DEFAULT_MAX_EXIT_SPREAD_BPS if strategy == REBOUND_SPREAD_GUARDED else None
+
+    def _effective_target(self, strategy: str, target: float, book: dict[str, Any]) -> float:
+        if strategy != REBOUND_SPREAD_GUARDED:
+            return target
+        asks = [float(row["price"]) for row in book.get("asks", ()) if float(row["volume"]) >= 1]
+        bids = [float(row["price"]) for row in book.get("bids", ()) if float(row["volume"]) >= 1]
+        if not asks or not bids:
+            return target
+        half_spread = max(0.0, (min(asks) - max(bids)) / 2)
+        return target - half_spread
+
+    def _intent(
+        self,
+        event: dict,
+        f: Feature,
+        strategy: str,
+        side: str,
+        *,
+        exit_reason: str | None = None,
+    ) -> None:
         symbol = event["symbol"]
         prices = [
             float(row["price"])
@@ -366,21 +436,43 @@ class AsyncLayeredPaper(LayeredPaper):
             reserve = self.book.entry_cost(quantity, limit)
         else:
             quantity, reserve = int(self.book.positions[symbol].quantity), 0.0
-        self.decisions.append(
-            {
-                "at": event["received_at"],
-                "symbol": symbol,
-                "strategy": strategy,
-                "action": side.lower(),
-                "quantity": quantity,
-            }
-        )
+        decision_row: dict[str, Any] = {
+            "at": event["received_at"],
+            "symbol": symbol,
+            "strategy": strategy,
+            "action": side.lower(),
+            "quantity": quantity,
+        }
+        if exit_reason is not None:
+            decision_row["exit_reason"] = exit_reason
+        self.decisions.append(decision_row)
         if not quantity:
             return
-        if side == "BUY" and strategy == REBOUND_NET_TARGET:
-            blocked = self._net_target_block(quantity, f.mean, reserve)
-            if blocked:
-                self.decisions[-1].update(blocked, entry_price=limit)
+        spread_bps = book_spread_bps(event["book"])
+        if side == "BUY":
+            spread_limit = self._entry_spread_limit(strategy)
+            if spread_limit is not None and (spread_bps is None or spread_bps > spread_limit):
+                self.decisions[-1].update(
+                    blocked_reason=ENTRY_SPREAD_BLOCKED,
+                    spread_bps=spread_bps,
+                    max_entry_spread_bps=spread_limit,
+                    entry_price=limit,
+                )
+                return
+            if strategy in (REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED):
+                target = self._effective_target(strategy, f.mean, event["book"])
+                blocked = self._net_target_block(quantity, target, reserve)
+                if blocked:
+                    self.decisions[-1].update(blocked, entry_price=limit)
+                    return
+        else:
+            spread_limit = self._exit_spread_limit(strategy)
+            if spread_limit is not None and (spread_bps is None or spread_bps > spread_limit):
+                self.decisions[-1].update(
+                    blocked_reason=EXIT_SPREAD_DEFERRED,
+                    spread_bps=spread_bps,
+                    max_exit_spread_bps=spread_limit,
+                )
                 return
         order_request = None
         if "provider_symbol" in event:
@@ -410,6 +502,7 @@ class AsyncLayeredPaper(LayeredPaper):
             copy.deepcopy(event["book"]),
             self.entry_policy_version if side == "BUY" else self.owner_policy_versions[symbol],
             order_request,
+            exit_reason,
         )
         self.pending[symbol] = intent
         self.intents.append(intent)
@@ -450,12 +543,29 @@ class AsyncLayeredPaper(LayeredPaper):
             levels = self.book._quote(symbol, "BUY", self.prices[symbol])
             capacity = sum(v for _, v in levels[0]) if levels else 0
             count = min(requested, capacity)
-            if count and intent.strategy == REBOUND_NET_TARGET:
+            spread_limit = self._entry_spread_limit(intent.strategy)
+            spread_bps = book_spread_bps(quote)
+            if count and spread_limit is not None and (spread_bps is None or spread_bps > spread_limit):
+                self.book._attempt(symbol, "BUY", requested, 0)
+                self.outcomes.append(
+                    {
+                        "intent_id": intent.id,
+                        **self.book.order_attempts[-1],
+                        "blocked_reason": ENTRY_SPREAD_BLOCKED,
+                        "spread_bps": spread_bps,
+                        "max_entry_spread_bps": spread_limit,
+                        "evaluated_quantity": count,
+                    }
+                )
+                del self.pending[symbol]
+                return
+            if count and intent.strategy in (REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED):
                 execution = self.book._execution(symbol, "BUY", count, self.prices[symbol])
                 if execution is not None:
                     price, fees, _ = execution
                     cost = count * price + fees[self.book.total_fee_key]
-                    blocked = self._net_target_block(count, intent.feature.mean, cost)
+                    target = self._effective_target(intent.strategy, intent.feature.mean, quote)
+                    blocked = self._net_target_block(count, target, cost)
                     if blocked:
                         self.book._attempt(symbol, "BUY", requested, 0)
                         self.outcomes.append(
@@ -481,6 +591,22 @@ class AsyncLayeredPaper(LayeredPaper):
             else:
                 self.book._attempt(symbol, "BUY", requested, 0)
         else:
+            spread_limit = self._exit_spread_limit(intent.strategy)
+            spread_bps = book_spread_bps(quote)
+            if spread_limit is not None and (spread_bps is None or spread_bps > spread_limit):
+                self.book._attempt(symbol, "SELL", requested, 0)
+                self.outcomes.append(
+                    {
+                        "intent_id": intent.id,
+                        **self.book.order_attempts[-1],
+                        "blocked_reason": EXIT_SPREAD_DEFERRED,
+                        "spread_bps": spread_bps,
+                        "max_exit_spread_bps": spread_limit,
+                        **({"exit_reason": intent.exit_reason} if intent.exit_reason else {}),
+                    }
+                )
+                del self.pending[symbol]
+                return
             levels = self.book._quote(symbol, "SELL", self.prices[symbol])
             capacity = sum(v for _, v in levels[0]) if levels else 0
             count = min(requested, capacity)
@@ -505,7 +631,12 @@ class AsyncLayeredPaper(LayeredPaper):
                 del self.pending[symbol]
                 return
             self.book.fill(
-                symbol, -count, self.prices[symbol], at, int(seconds(at) * 1000), "invalidated"
+                symbol,
+                -count,
+                self.prices[symbol],
+                at,
+                int(seconds(at) * 1000),
+                intent.exit_reason or "invalidated",
             )
             attempt = self.book.order_attempts[-1]
             attempt["requested_quantity"] = requested
@@ -595,17 +726,20 @@ class AsyncLayeredPaper(LayeredPaper):
             intent_count=len(self.intents),
             intents=[
                 {
-                    key: getattr(intent, key)
-                    for key in (
-                        "id",
-                        "symbol",
-                        "side",
-                        "quantity",
-                        "limit",
-                        "reserved",
-                        "decision_at",
-                        "strategy",
-                    )
+                    **{
+                        key: getattr(intent, key)
+                        for key in (
+                            "id",
+                            "symbol",
+                            "side",
+                            "quantity",
+                            "limit",
+                            "reserved",
+                            "decision_at",
+                            "strategy",
+                        )
+                    },
+                    **({"exit_reason": intent.exit_reason} if intent.exit_reason is not None else {}),
                 }
                 for intent in self.intents
             ],
