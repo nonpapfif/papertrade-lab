@@ -90,7 +90,15 @@ class Experiment(AsyncLayeredPaper):
         self.excluded_at_dispatch = self.pending.keys() | self.book.positions.keys()
         super()._process(event)
 
-    def _intent(self, event: dict, f: Feature, strategy: str, side: str) -> None:
+    def _intent(
+        self,
+        event: dict,
+        f: Feature,
+        strategy: str,
+        side: str,
+        *,
+        exit_reason: str | None = None,
+    ) -> None:
         bid, ask = quote_bounds(event["book"])
         veto = False
         if side == "BUY":
@@ -112,7 +120,7 @@ class Experiment(AsyncLayeredPaper):
             candidates = self.eligible(self.policy, self.selection, event["received_at"])
             count = max(1, len(set(candidates) - self.excluded_at_dispatch))
             event = {**event, "candidate_count": count}
-        super()._intent(event, f, strategy, side)
+        super()._intent(event, f, strategy, side, exit_reason=exit_reason)
 
 
 class LossRuntime(Runtime):

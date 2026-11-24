@@ -21,6 +21,7 @@ from tools.upstream_paper_accounts import reward_risk_profiles
 
 SLOT = "rebound-entry-cost"
 ROLES = ("incumbent", "candidate")
+MAX_RETEST_LOSS_PCT = 5.0
 
 
 def _artifact(path: Path, root: Path) -> dict[str, str]:
@@ -264,6 +265,26 @@ def _recommend(
             ),
         )
     if delta > 0:
+        cand = review["accounts"]["candidate"]
+        cand_return = (
+            cand.get("fee_inclusive_return_pct")
+            if market == "KR"
+            else (
+                None
+                if cand.get("net_pnl_usd") is None or not cand.get("seed_usd")
+                else float(_money(cand["net_pnl_usd"]) / _money(cand["seed_usd"]) * 100)
+            )
+        )
+        if cand_return is not None and cand_return <= -MAX_RETEST_LOSS_PCT:
+            return (
+                "hold_for_new_hypothesis",
+                (
+                    f"Candidate outperformed incumbent by {delta:.2f} pct, "
+                    f"but closed with a {cand_return:.2f}% net return "
+                    f"(below the -{MAX_RETEST_LOSS_PCT:.1f}% auto-retest floor). "
+                    "Hold for a new hypothesis instead of repeating the losing strategy."
+                ),
+            )
         return "retest", "Repeat the frozen pair on the next unseen market session."
     if (
         market == "US"

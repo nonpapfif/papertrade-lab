@@ -10,7 +10,7 @@ from typing import Any
 
 from tools.live_execution import DEFAULT_FEES, KR_FEES, ExecutionBook, ExecutionContext
 from tools.paper_market import US, PaperMarket
-from tools.strategy_catalog import REBOUND_NET_TARGET
+from tools.strategy_catalog import REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED
 
 FAMILIES = ("trend", "breakout", "rebound")
 
@@ -115,7 +115,7 @@ def entry_valid(strategy: str, f: Feature) -> bool:
         return f.r5 > 0 and f.price > f.prior_high
     if strategy == "trend":
         return f.r5 > 0 and f.r15 > 0 and f.efficiency >= 0.5
-    if strategy in ("rebound", REBOUND_NET_TARGET):
+    if strategy in ("rebound", REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED):
         return f.r5 > 0 and f.r15 < 0 and f.price < f.mean
     raise ValueError("Unknown strategy")
 
@@ -125,14 +125,26 @@ def assign(f: Feature, policy: str = "router") -> str | None:
     return next((s for s in families if entry_valid(s, f)), None)
 
 
-def holding_valid(strategy: str, f: Feature, entry: Feature) -> bool:
+def holding_exit_reason(strategy: str, f: Feature, entry: Feature) -> str | None:
     if strategy == "breakout":
-        return f.price >= entry.prior_high * 0.998
+        return None if f.price >= entry.prior_high * 0.998 else "breakout_below_prior_high"
     if strategy == "trend":
-        return f.r15 >= 0
-    if strategy in ("rebound", REBOUND_NET_TARGET):
-        return f.r5 >= -0.003 and f.price < entry.mean
+        return None if f.r15 >= 0 else "trend_r15_negative"
+    if strategy in ("rebound", REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED):
+        target_hit = f.price >= entry.mean
+        r5_drop = f.r5 < -0.003
+        if target_hit and r5_drop:
+            return "rebound_target_and_r5_drop"
+        if target_hit:
+            return "rebound_target_reached"
+        if r5_drop:
+            return "rebound_r5_drop"
+        return None
     raise ValueError("Unknown strategy")
+
+
+def holding_valid(strategy: str, f: Feature, entry: Feature) -> bool:
+    return holding_exit_reason(strategy, f, entry) is None
 
 
 class LayeredPaper:
@@ -220,7 +232,8 @@ class LayeredPaper:
                 self.decisions.append({"at": at, "symbol": symbol, "action": "unknown"})
                 continue
             owner, original = self.owners[symbol]
-            if not holding_valid(owner, fresh[symbol], original):
+            exit_reason = holding_exit_reason(owner, fresh[symbol], original)
+            if exit_reason is not None:
                 before = self.book.realized
                 self.book.fill(
                     symbol,
@@ -228,7 +241,7 @@ class LayeredPaper:
                     self.prices[symbol],
                     at,
                     frame["tick"],
-                    "invalidated",
+                    exit_reason,
                 )
                 self.realized_by_strategy[owner] += self.book.realized - before
                 if symbol not in self.book.positions:

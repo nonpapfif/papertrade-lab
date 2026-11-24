@@ -104,6 +104,9 @@ def review_loss(market: str, evidence: Path) -> dict[str, Any]:
     }
 
 
+MAX_RETEST_LOSS_PCT = 5.0
+
+
 def decide(
     incumbent: float | None, candidate: float | None, *, complete: bool, traded: bool
 ) -> dict[str, Any]:
@@ -117,6 +120,16 @@ def decide(
         return {
             "decision": "retest",
             "reason": "No observed improvement or deterioration to evaluate",
+            "candidate_minus_incumbent_pct": delta,
+        }
+    if delta > 0 and candidate <= -MAX_RETEST_LOSS_PCT:
+        return {
+            "decision": "revise",
+            "reason": (
+                f"Candidate outperformed incumbent by {delta:.2f} pct, "
+                f"but closed at {candidate:.2f}% (below the -{MAX_RETEST_LOSS_PCT:.1f}% "
+                "auto-retest floor); revise before scheduling another session"
+            ),
             "candidate_minus_incumbent_pct": delta,
         }
     return {

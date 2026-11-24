@@ -5,9 +5,10 @@ from __future__ import annotations
 from itertools import product
 
 REBOUND_NET_TARGET = "rebound_net_target"
+REBOUND_SPREAD_GUARDED = "rebound_spread_guarded"
 # Candle highs are excluded from the supported strategy set for this experiment.
 ENTRY_OPTIONS = {
-    "policy": ("trend", "rebound", REBOUND_NET_TARGET),
+    "policy": ("trend", "rebound", REBOUND_NET_TARGET, REBOUND_SPREAD_GUARDED),
     "selection": ("all", "active"),
     "allocation": ("equal", "priority"),
 }

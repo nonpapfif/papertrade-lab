@@ -274,5 +274,5 @@ class CapacityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(values), len({tuple(sorted(item.items())) for item in values}))
         self.assertEqual(
             [item["policy"] for item in values],
-            ["trend"] * 4 + ["rebound"] * 4 + ["rebound_net_target"] * 4,
+            ["trend"] * 4 + ["rebound"] * 4 + ["rebound_net_target"] * 4 + ["rebound_spread_guarded"] * 4,
         )
