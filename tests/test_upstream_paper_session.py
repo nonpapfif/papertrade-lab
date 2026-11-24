@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -7,7 +8,9 @@ from argparse import Namespace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from papertrade.jsonio import atomic_json
 from tools.adaptive_journal import AdaptiveJournal, read_status
@@ -20,8 +23,8 @@ from tools.upstream_paper_accounts import (
     Quote,
     Signal,
 )
-from tools.upstream_paper_session import _plan, _replay, _summary, _verify
-from tools.upstream_strategy import Upstream, epoch, iso
+from tools.upstream_paper_session import Capture, _plan, _replay, _summary, _verify
+from tools.upstream_strategy import STEP, Upstream, epoch, iso
 
 SOURCE = os.environ.get("PAPERTRADE_DAY_TRADER_SOURCE")
 OPEN = epoch("2026-10-19T09:30:00-04:00")
@@ -353,6 +356,140 @@ class UpstreamPaperTests(unittest.TestCase):
             self.assertFalse(summary["counts"].get("native_entry_signals"))
             if not available:
                 self.assertIn("no_usable_native_scan_inputs", summary["limitations"])
+
+    def test_final_scan_deadline_skips_preserve_real_confirmation_failures_and_replay(self) -> None:
+        scanner = self.source.scanner
+        series = scanner.parse_chart(self.raw, "TSLA")
+        for case in ("on_time", "expired", "provider_failure"):
+            with self.subTest(case=case):
+                self.plan["entry_cutoff"] = iso(TRIGGER)
+                symbols = ["TSLA"]
+                if case == "provider_failure":
+                    symbols.append("AMD")
+                if case != "on_time":
+                    symbols.append("AAPL")
+                self.plan["symbols"] = symbols
+                comp = self.comparison()
+                now = OPEN - 1
+
+                def pause(seconds: float) -> None:
+                    nonlocal now
+                    now = round(now + seconds, 6)
+
+                def chart(path: str) -> str:
+                    nonlocal now
+                    if path == scanner.chart_path("AMD", "1d", "5m"):
+                        now = comp.entry_end
+                        raise scanner.ScanError("Yahoo unavailable")
+                    self.assertEqual(path, scanner.chart_path("TSLA", "1d", "5m"))
+                    if case == "expired":
+                        now = comp.entry_end - scanner.PAUSE / 2
+                    return self.raw
+
+                stage_one = {symbol: series for symbol in symbols}
+                path = self.out / f"final-scan-{case}.sqlite3"
+                clock = SimpleNamespace(time=lambda: now, sleep=pause)
+                with (
+                    AdaptiveJournal.open(path, self.plan, resume=False) as journal,
+                    patch("tools.upstream_paper_session.time", clock),
+                    patch("tools.upstream_strategy.time", clock),
+                    patch.object(scanner, "fetch_spark", return_value=(stage_one, {})),
+                    patch.object(scanner, "yahoo_get", side_effect=chart),
+                ):
+                    capture = Capture(comp, journal, self.out, {})
+                    capture.event("capture_started")
+                    now = TRIGGER + 2
+                    asyncio.run(capture.scans())
+                    now = CLOSE
+                    capture.event("close")
+                    summary = _summary(comp, journal)
+                    _, scan, _ = journal.events()
+                    errors = ["AMD"] if case == "provider_failure" else []
+                    payload = scan["payload"]
+                    expired = payload.get("confirmation_entry_window_expired", [])
+                    self.assertEqual(payload["confirmation_failures"], errors)
+                    self.assertEqual(expired, [] if case == "on_time" else ["AAPL"])
+                    counts = summary["counts"]
+                    self.assertEqual(
+                        counts.get("scanner_confirmation_entry_window_expired", 0), len(expired)
+                    )
+                    self.assertEqual(counts["scanner_confirmation_failures"], len(errors))
+                    self.assertEqual(summary["state"], "closed_incomplete" if errors else "closed")
+                    limitations = ["some_native_scan_requests_failed"] if errors else []
+                    self.assertEqual(summary["limitations"], limitations)
+                    signal_status = "awaiting_book" if case == "on_time" else "skipped"
+                    for actions in scan["outputs"]["accounts"].values():
+                        self.assertEqual([action["status"] for action in actions], [signal_status])
+                    replay = self.comparison()
+                    _replay(replay, journal)
+                    self.assertEqual(_summary(replay, journal), summary)
+
+                    if not expired:
+                        continue
+                    legacy = self.comparison()
+                    for event in journal.events():
+                        if event["kind"] == "scan":
+                            payload = event["payload"]
+                            expired = payload.pop("confirmation_entry_window_expired")
+                            payload["confirmation_failures"] = sorted(errors + expired)
+                        outputs = legacy.process(event)
+                        self.assertEqual(outputs, event["outputs"])
+                        legacy.complete_decisions(outputs, epoch(event["completed_at"]))
+                    legacy_summary = _summary(legacy, journal)
+                    self.assertEqual(legacy_summary["state"], "closed_incomplete")
+                    self.assertEqual(
+                        legacy_summary["counts"]["scanner_confirmation_failures"], len(errors) + 1
+                    )
+
+    def test_spark_batch_deadline_preserves_earlier_scan_coverage_failure(self) -> None:
+        scanner = self.source.scanner
+        cut = OPEN + 20 * 60
+        series = scanner.parse_chart(self.raw, "TSLA")
+        symbols = [f"SYM{i}" for i in range(scanner.SPARK_MAX + 1)]
+        self.plan["symbols"] = symbols
+        for final in (False, True):
+            with self.subTest(final=final):
+                if final:
+                    self.plan["entry_cutoff"] = iso(cut)
+                comp = self.comparison()
+                until = min(cut + STEP, comp.entry_end)
+                now = cut + 2
+
+                def pause(seconds: float) -> None:
+                    nonlocal now
+                    now = round(now + seconds, 6)
+
+                def spark(batch: list[str], *_: Any) -> tuple[dict[str, Any], dict[str, str]]:
+                    nonlocal now
+                    now = until - scanner.PAUSE / 2
+                    return {symbol: series for symbol in batch}, {}
+
+                clock = SimpleNamespace(time=lambda: now, sleep=pause)
+                with (
+                    patch("tools.upstream_strategy.time", clock),
+                    patch.object(scanner, "fetch_spark", side_effect=spark) as fetch,
+                ):
+                    data = self.source.capture(
+                        symbols, comp.day, cut, until, final_entry_window=final
+                    )
+                fetch.assert_called_once()
+                self.assertEqual(data["spark_failures"], [] if final else symbols[-1:])
+                self.assertEqual(
+                    data.get("spark_entry_window_expired", []), symbols[-1:] if final else []
+                )
+                comp.process({"kind": "capture_started", "at": iso(OPEN - 1)})
+                comp.process({"kind": "scan", "at": iso(now), "payload": data})
+                comp.process({"kind": "close", "at": iso(CLOSE)})
+                path = self.out / f"spark-deadline-{final}.sqlite3"
+                with AdaptiveJournal.open(path, self.plan, resume=False) as journal:
+                    summary = _summary(comp, journal)
+                counts = summary["counts"]
+                self.assertEqual(counts.get("scanner_spark_entry_window_expired", 0), int(final))
+                self.assertEqual(counts["scanner_spark_failures"], int(not final))
+                self.assertEqual(summary["state"], "closed" if final else "closed_incomplete")
+                self.assertEqual(
+                    summary["limitations"], [] if final else ["some_native_scan_requests_failed"]
+                )
 
     def test_premarket_and_research_failures_remain_visible_with_no_signal(self) -> None:
         premarket = {"universe": 2, "scanned": 1, "failed": 1, "hits": 1}

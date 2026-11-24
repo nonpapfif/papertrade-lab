@@ -7,6 +7,7 @@ import hashlib
 import subprocess
 import time
 from argparse import Namespace
+from heapq import merge
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -102,29 +103,43 @@ class Upstream:
         return self.entry.eastern_to_utc(cutoff).replace(tzinfo=dt.UTC).timestamp()
 
     def capture(
-        self, symbols: list[str], day: dt.date, cutoff: float, until: float
+        self,
+        symbols: list[str],
+        day: dt.date,
+        cutoff: float,
+        until: float,
+        *,
+        final_entry_window: bool = False,
     ) -> dict[str, Any]:
         scan = self.scanner
         stage_one: dict[str, Any] = {}
         failed: dict[str, Any] = {}
+        spark_entry_window_expired: list[str] = []
         for offset in range(0, len(symbols), scan.SPARK_MAX):
-            if time.time() >= until:
-                failed.update({symbol: "scan_window_expired" for symbol in symbols[offset:]})
-                break
-            if offset:
+            if offset and time.time() < until:
                 time.sleep(scan.PAUSE)
+            if time.time() >= until:
+                if final_entry_window:
+                    spark_entry_window_expired = sorted(symbols[offset:])
+                else:
+                    failed.update({symbol: "scan_window_expired" for symbol in symbols[offset:]})
+                break
             data, errors = scan.fetch_spark(
                 symbols[offset : offset + scan.SPARK_MAX], "1d", "5m", scan.PAUSE
             )
             stage_one.update(data)
             failed.update(errors)
         confirmed: dict[str, Any] = {}
+        confirmation_entry_window_expired: set[str] = set()
         eastern = scan.to_eastern(utc(cutoff))
 
         def confirm(symbol: str) -> dict[str, Any]:
+            if time.time() < until:
+                time.sleep(scan.PAUSE)
             if time.time() >= until:
+                if final_entry_window:
+                    confirmation_entry_window_expired.add(symbol)
                 raise scan.ScanError("Scan exceeded its decision window")
-            time.sleep(scan.PAUSE)
             try:
                 raw = scan.yahoo_get(scan.chart_path(symbol, "1d", "5m"))
                 series = scan.parse_chart(raw, symbol)
@@ -144,15 +159,22 @@ class Upstream:
         hits, counts, confirmation_fail = scan.scan_orb(
             stage_one, symbols, day, eastern, RANGE_MINUTES, 5.0, 0, confirm, scan.MAX_CONFIRM
         )
-        return {
+        result = {
             "cutoff": cutoff,
             "stage_one": stage_one,
             "confirmed": confirmed,
             "hits": hits,
             "counts": counts,
             "spark_failures": sorted(failed),
-            "confirmation_failures": sorted(confirmation_fail),
+            "confirmation_failures": sorted(
+                confirmation_fail.keys() - confirmation_entry_window_expired
+            ),
         }
+        if spark_entry_window_expired:
+            result["spark_entry_window_expired"] = spark_entry_window_expired
+        if confirmation_entry_window_expired:
+            result["confirmation_entry_window_expired"] = sorted(confirmation_entry_window_expired)
+        return result
 
     def evaluate_scan(
         self, scan: dict[str, Any], symbols: list[str], day: dt.date, config: dict[str, Any]
@@ -175,10 +197,13 @@ class Upstream:
             confirmation,
             source.MAX_CONFIRM,
         )
+        recorded_failures = scan["confirmation_failures"]
+        if expired := scan.get("confirmation_entry_window_expired"):
+            recorded_failures = list(merge(recorded_failures, expired))
         if (hits, counts, sorted(fails)) != (
             scan["hits"],
             scan["counts"],
-            scan["confirmation_failures"],
+            recorded_failures,
         ):
             raise ValueError("Recorded scan does not reproduce with pinned source")
         entries = []
